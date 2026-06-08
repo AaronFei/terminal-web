@@ -1,7 +1,7 @@
 :root {
   --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
     "Liberation Mono", "Courier New", monospace;
-  --topbar-h: 44px;
+  --topbar-h: 38px;
   --keybar-h: 0px; /* set to the real height by JS when the key bar is shown */
   --kb-offset: 0px; /* iOS soft-keyboard offset, tracked via visualViewport */
 }
@@ -148,21 +148,22 @@ body {
   color: #e5e5e5;
   border: 1px solid #4a4a4c;
   border-radius: 6px;
-  padding: 6px 12px;
-  font-size: 14px;
+  padding: 4px 10px;
+  font-size: 12px;
   line-height: 1;
   font-family: inherit;
-  min-height: 34px;
+  min-height: 28px;
   cursor: pointer;
   touch-action: manipulation;
   flex: 0 0 auto;
 }
 
-/* icon-glyph buttons (⌨ ⟳ ⤢) need a larger glyph + a bigger tap target */
+/* icon-glyph buttons (⌨ ⟳ ⤢): bigger glyph, same button footprint.
+   Zero vertical padding + tight horizontal padding keep the box the same size
+   as the text buttons while the symbol itself is much larger. */
 .tb-icon {
   font-size: 20px;
-  min-width: 40px;
-  padding: 4px 10px;
+  padding: 0 6px;
 }
 
 .tb-btn:active {
