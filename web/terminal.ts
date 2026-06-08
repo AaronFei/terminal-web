@@ -12,7 +12,11 @@ const MAX_DELAY = 5000;
 const MIN_FONT = 8;
 const MAX_FONT = 28;
 const KEYBAR_HEIGHT = 48; // px when shown
-const IME_DEDUP_MS = 100; // window to drop a duplicated IME emission
+// Window to drop a duplicated IME emission. The CapsLock-switch double-send
+// arrives ~100-120ms apart (keydown-finalize then compositionend-finalize), so
+// 100ms was just too tight; 300ms covers it with margin while staying far below
+// the interval of any legitimate re-typing of the same characters.
+const IME_DEDUP_MS = 300;
 
 const params = new URLSearchParams(window.location.search);
 const IME_DEBUG = (params.get('debug') ?? '').includes('ime');
