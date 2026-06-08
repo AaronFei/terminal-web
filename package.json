@@ -1,0 +1,37 @@
+{
+  "name": "terminal-web",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A web-based terminal (xterm.js + node-pty) that runs your shell inside tmux for resumable sessions.",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "dev": "bash scripts/dev.sh",
+    "build": "node esbuild.mjs",
+    "start": "tsx src/server.ts",
+    "postinstall": "node scripts/fix-pty-perms.mjs"
+  },
+  "dependencies": {
+    "node-pty": "^1.0.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/ws": "^8.5.10",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/addon-web-links": "^0.11.0",
+    "@xterm/addon-webgl": "^0.18.0",
+    "@xterm/xterm": "^5.5.0",
+    "esbuild": "^0.21.5",
+    "tsx": "^4.15.0",
+    "typescript": "^5.4.5"
+  },
+  "allowScripts": {
+    "esbuild@0.21.5": true,
+    "esbuild@0.28.0": true,
+    "node-pty@1.1.0": true,
+    "fsevents@2.3.3": true
+  }
+}

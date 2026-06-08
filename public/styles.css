@@ -1,0 +1,215 @@
+:root {
+  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+  --topbar-h: 38px;
+  --keybar-h: 0px; /* set to the real height by JS when the key bar is shown */
+  --kb-offset: 0px; /* iOS soft-keyboard offset, tracked via visualViewport */
+}
+
+html,
+body {
+  height: 100%;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  background: #1e1e1e;
+  color: #d4d4d4;
+  overflow: hidden;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+/* --------------------------------------------------------------------------
+   Top control bar
+   -------------------------------------------------------------------------- */
+#topbar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: var(--topbar-h);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px;
+  padding-left: max(8px, env(safe-area-inset-left));
+  padding-right: max(8px, env(safe-area-inset-right));
+  background: #252526;
+  border-bottom: 1px solid #333;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: #d4d4d4;
+  z-index: 20;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+#topbar .tb-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+#topbar .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #e0a23b; /* amber = not connected / reconnecting */
+  flex: 0 0 auto;
+}
+
+#topbar .dot.connected {
+  background: #23d18b; /* green = connected */
+}
+
+#topbar .tb-session {
+  opacity: 0.85;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#topbar .spacer {
+  flex: 1 1 auto;
+}
+
+.tb-btn {
+  appearance: none;
+  -webkit-appearance: none;
+  background: #3a3a3c;
+  color: #e5e5e5;
+  border: 1px solid #4a4a4c;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  line-height: 1;
+  font-family: inherit;
+  min-height: 28px;
+  cursor: pointer;
+  touch-action: manipulation;
+  flex: 0 0 auto;
+}
+
+.tb-btn:active {
+  background: #4a4a4c;
+}
+
+.tb-btn.active {
+  background: #2472c8;
+  border-color: #3b8eea;
+  color: #fff;
+}
+
+/* --------------------------------------------------------------------------
+   Terminal: sits between the top bar and the (optional) key bar
+   -------------------------------------------------------------------------- */
+#terminal {
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: var(--topbar-h);
+  bottom: calc(var(--keybar-h) + var(--kb-offset));
+  padding: 4px;
+  background: #1e1e1e;
+}
+
+/* xterm fills its container */
+.xterm,
+.xterm .xterm-viewport,
+.xterm .xterm-screen {
+  height: 100%;
+}
+
+/* --------------------------------------------------------------------------
+   Bottom virtual key bar (arrows + terminal keys, for iPad/touch)
+   -------------------------------------------------------------------------- */
+#keybar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: var(--kb-offset);
+  height: var(--keybar-h);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  padding-left: max(8px, env(safe-area-inset-left));
+  padding-right: max(8px, env(safe-area-inset-right));
+  background: #252526;
+  border-top: 1px solid #333;
+  overflow-x: auto;
+  overflow-y: hidden;
+  white-space: nowrap;
+  -webkit-overflow-scrolling: touch;
+  z-index: 20;
+}
+
+#keybar.hidden {
+  display: none;
+}
+
+#keybar::-webkit-scrollbar {
+  height: 0;
+}
+
+.kb-key {
+  flex: 0 0 auto;
+  background: #3a3a3c;
+  color: #e5e5e5;
+  border: 1px solid #4a4a4c;
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 14px;
+  line-height: 1;
+  font-family: var(--mono);
+  min-width: 42px;
+  text-align: center;
+  cursor: pointer;
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.kb-key:active {
+  background: #4a4a4c;
+}
+
+/* sticky modifier (Ctrl/Alt) currently armed */
+.kb-key.armed {
+  background: #2472c8;
+  border-color: #3b8eea;
+  color: #fff;
+}
+
+/* --------------------------------------------------------------------------
+   Reconnecting overlay (kept; sits just below the top bar)
+   -------------------------------------------------------------------------- */
+#status {
+  position: fixed;
+  top: calc(var(--topbar-h) + 8px);
+  right: 12px;
+  z-index: 15;
+  padding: 6px 12px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1;
+  color: #d4d4d4;
+  background: rgba(40, 40, 40, 0.9);
+  border: 1px solid #3a3a3a;
+  border-radius: 6px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 0.15s ease-in-out, visibility 0.15s ease-in-out;
+}
+
+#status.visible {
+  opacity: 1;
+  visibility: visible;
+}
