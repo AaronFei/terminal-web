@@ -5,268 +5,512 @@ import { WebLinksAddon } from '@xterm/addon-web-links';
 import { WebglAddon } from '@xterm/addon-webgl';
 
 // ---------------------------------------------------------------------------
-// Session selection from URL: ?session=NAME (default "web"), sanitized to
-// match the server's expectation: [A-Za-z0-9_-]{1,64}, fallback "web".
+// Constants & helpers
 // ---------------------------------------------------------------------------
-function resolveSession(): string {
-  const raw = new URLSearchParams(window.location.search).get('session') ?? 'web';
-  const cleaned = raw.replace(/[^A-Za-z0-9_-]/g, '');
-  if (cleaned.length >= 1 && cleaned.length <= 64) return cleaned;
-  return 'web';
+const MIN_DELAY = 500;
+const MAX_DELAY = 5000;
+const MIN_FONT = 8;
+const MAX_FONT = 28;
+const KEYBAR_HEIGHT = 48; // px when shown
+const IME_DEDUP_MS = 100; // window to drop a duplicated IME emission
+
+const params = new URLSearchParams(window.location.search);
+const IME_DEBUG = (params.get('debug') ?? '').includes('ime');
+
+const encoder = new TextEncoder();
+
+/** Sanitize a session name to [A-Za-z0-9_-]{1,64}; null if nothing usable. */
+function sanitizeName(raw: string | null | undefined): string | null {
+  if (typeof raw !== 'string') return null;
+  const cleaned = raw.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64);
+  return cleaned.length ? cleaned : null;
 }
 
-const SESSION = resolveSession();
+const THEME = {
+  background: '#1e1e1e',
+  foreground: '#d4d4d4',
+  cursor: '#d4d4d4',
+  cursorAccent: '#1e1e1e',
+  selectionBackground: '#264f78',
+  black: '#000000',
+  red: '#cd3131',
+  green: '#0dbc79',
+  yellow: '#e5e510',
+  blue: '#2472c8',
+  magenta: '#bc3fbc',
+  cyan: '#11a8cd',
+  white: '#e5e5e5',
+  brightBlack: '#666666',
+  brightRed: '#f14c4c',
+  brightGreen: '#23d18b',
+  brightYellow: '#f5f543',
+  brightBlue: '#3b8eea',
+  brightMagenta: '#d670d6',
+  brightCyan: '#29b8db',
+  brightWhite: '#ffffff',
+};
+
+const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
 
 // ---------------------------------------------------------------------------
-// Terminal setup
+// DOM
 // ---------------------------------------------------------------------------
-const term = new Terminal({
-  cursorBlink: true,
-  fontFamily:
-    'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
-  fontSize: 14,
-  scrollback: 100000,
-  allowProposedApi: true,
-  theme: {
-    background: '#1e1e1e',
-    foreground: '#d4d4d4',
-    cursor: '#d4d4d4',
-    cursorAccent: '#1e1e1e',
-    selectionBackground: '#264f78',
-    black: '#000000',
-    red: '#cd3131',
-    green: '#0dbc79',
-    yellow: '#e5e510',
-    blue: '#2472c8',
-    magenta: '#bc3fbc',
-    cyan: '#11a8cd',
-    white: '#e5e5e5',
-    brightBlack: '#666666',
-    brightRed: '#f14c4c',
-    brightGreen: '#23d18b',
-    brightYellow: '#f5f543',
-    brightBlue: '#3b8eea',
-    brightMagenta: '#d670d6',
-    brightCyan: '#29b8db',
-    brightWhite: '#ffffff',
-  },
-});
-
-const fitAddon = new FitAddon();
-term.loadAddon(fitAddon);
-term.loadAddon(new WebLinksAddon());
-
-const container = document.getElementById('terminal') as HTMLElement;
-term.open(container);
-
-// WebGL renderer is best-effort; ignore failures (e.g. no GPU/context).
-try {
-  const webgl = new WebglAddon();
-  webgl.onContextLoss(() => {
-    webgl.dispose();
-  });
-  term.loadAddon(webgl);
-} catch {
-  // ignore: fall back to the canvas/DOM renderer.
-}
-
+const root = document.documentElement;
+const topbar = document.getElementById('topbar') as HTMLElement;
+const termArea = document.getElementById('terminal') as HTMLElement;
+const keybarEl = document.getElementById('keybar') as HTMLElement;
 const statusEl = document.getElementById('status');
+
+// Top bar layout: [ tabs (scrollable) ... + ] [ controls ]
+const tabsEl = document.createElement('div');
+tabsEl.id = 'tabs';
+const addBtn = document.createElement('button');
+addBtn.className = 'tab-add';
+addBtn.type = 'button';
+addBtn.textContent = '+';
+addBtn.title = 'New session';
+tabsEl.append(addBtn);
+
+const controlsEl = document.createElement('div');
+controlsEl.id = 'controls';
+
+topbar.append(tabsEl, controlsEl);
+
+let currentFont = (() => {
+  try {
+    const n = parseInt(localStorage.getItem('tw.fontSize') ?? '', 10);
+    if (!Number.isNaN(n)) return Math.min(MAX_FONT, Math.max(MIN_FONT, n));
+  } catch {
+    /* ignore */
+  }
+  return 14;
+})();
 
 function showStatus(text: string): void {
   if (!statusEl) return;
   statusEl.textContent = text;
   statusEl.classList.add('visible');
 }
-
 function hideStatus(): void {
-  if (!statusEl) return;
-  statusEl.classList.remove('visible');
+  statusEl?.classList.remove('visible');
 }
 
 // ---------------------------------------------------------------------------
-// WebSocket connection with capped exponential backoff reconnect.
+// Session: one terminal + one WebSocket + reconnect, rendered in its own pane.
 // ---------------------------------------------------------------------------
-const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-const WS_URL = `${wsProto}://${window.location.host}/ws?session=${encodeURIComponent(SESSION)}`;
+class Session {
+  readonly name: string;
+  readonly term: Terminal;
+  readonly el: HTMLElement;
+  tabEl: HTMLElement | null = null;
+  tabDot: HTMLElement | null = null;
+  connected = false;
 
-let ws: WebSocket | null = null;
-let reconnectDelay = 500; // ms, grows up to MAX_DELAY
-const MIN_DELAY = 500;
-const MAX_DELAY = 5000;
-let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-let pingTimer: ReturnType<typeof setInterval> | null = null;
-let closed = false;
+  private readonly fitAddon = new FitAddon();
+  private ws: WebSocket | null = null;
+  private reconnectDelay = MIN_DELAY;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private pingTimer: ReturnType<typeof setInterval> | null = null;
+  private disposed = false;
 
-function sendResize(): void {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(
-      JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }),
-    );
-  }
-}
+  // IME double-input guard (order-independent, content-scoped).
+  private lastData = '';
+  private lastDataAt = 0;
 
-function fit(): void {
-  try {
-    fitAddon.fit();
-  } catch {
-    // container may not be laid out yet; ignore.
-  }
-  sendResize();
-}
+  constructor(name: string) {
+    this.name = name;
+    this.term = new Terminal({
+      cursorBlink: true,
+      fontFamily:
+        'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+      fontSize: currentFont,
+      scrollback: 100000,
+      allowProposedApi: true,
+      theme: THEME,
+    });
+    this.term.loadAddon(this.fitAddon);
+    this.term.loadAddon(new WebLinksAddon());
 
-function startPing(): void {
-  stopPing();
-  pingTimer = setInterval(() => {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'ping' }));
+    this.el = document.createElement('div');
+    this.el.className = 'term-pane hidden';
+    termArea.append(this.el);
+    this.term.open(this.el);
+
+    try {
+      const webgl = new WebglAddon();
+      webgl.onContextLoss(() => webgl.dispose());
+      this.term.loadAddon(webgl);
+    } catch {
+      /* fall back to canvas/DOM renderer */
     }
-  }, 20000);
-}
 
-function stopPing(): void {
-  if (pingTimer !== null) {
-    clearInterval(pingTimer);
-    pingTimer = null;
+    this.wireInput();
+    this.connect();
   }
-}
 
-function scheduleReconnect(): void {
-  if (closed) return;
-  if (reconnectTimer !== null) return;
-  showStatus('reconnecting…');
-  const delay = reconnectDelay;
-  reconnectDelay = Math.min(reconnectDelay * 2, MAX_DELAY);
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    connect();
-  }, delay);
-}
-
-function connect(): void {
-  if (closed) return;
-
-  const socket = new WebSocket(WS_URL);
-  socket.binaryType = 'arraybuffer';
-  ws = socket;
-
-  socket.onopen = () => {
-    reconnectDelay = MIN_DELAY;
-    hideStatus();
-    setConnected(true);
-    // Send an initial resize right after open so the pty matches our viewport.
-    // Do NOT term.reset() here: tmux repaints and we want to preserve scrollback.
-    fit();
-    startPing();
-    term.focus();
-  };
-
-  socket.onmessage = (ev: MessageEvent) => {
-    if (ev.data instanceof ArrayBuffer) {
-      term.write(new Uint8Array(ev.data));
-      return;
+  private debug(event: string, data?: string): void {
+    if (!IME_DEBUG) return;
+    // eslint-disable-next-line no-console
+    console.log('[ime]', this.name, event, JSON.stringify(data ?? ''));
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(
+        JSON.stringify({
+          type: 'debug',
+          event,
+          data: String(data ?? ''),
+          at: Math.round(performance.now()),
+        }),
+      );
     }
-    if (typeof ev.data === 'string') {
-      try {
-        const msg = JSON.parse(ev.data) as { type?: string };
-        if (msg.type === 'pong') {
-          // heartbeat acknowledged; nothing to do.
-        }
-        // {type:"info"} and others are silently ignored for now.
-      } catch {
-        // ignore malformed control frames.
+  }
+
+  private wireInput(): void {
+    const ta = this.term.textarea;
+    if (IME_DEBUG && ta) {
+      for (const ev of ['compositionstart', 'compositionupdate', 'compositionend']) {
+        ta.addEventListener(ev, (e) => this.debug(ev, (e as CompositionEvent).data));
       }
+      ta.addEventListener('keydown', (e) => {
+        const ke = e as KeyboardEvent;
+        if (ke.isComposing || ke.keyCode === 229 || ke.keyCode === 20) {
+          this.debug('keydown', `${ke.key}/${ke.keyCode}`);
+        }
+      });
     }
-  };
 
-  socket.onclose = () => {
-    stopPing();
-    if (ws === socket) ws = null;
-    setConnected(false);
-    scheduleReconnect();
-  };
+    this.term.onData((data: string) => {
+      this.debug('onData', data);
+      const now = performance.now();
+      // Only dedupe multibyte (IME) content; ASCII/control input is never touched.
+      if (
+        /[^\x00-\x7F]/.test(data) &&
+        data === this.lastData &&
+        now - this.lastDataAt < IME_DEDUP_MS
+      ) {
+        this.lastData = ''; // suppress exactly one duplicate
+        this.debug('onData-DROP', data);
+        return;
+      }
+      this.lastData = data;
+      this.lastDataAt = now;
+      this.send(data);
+    });
+  }
 
-  socket.onerror = () => {
-    // onclose will follow and trigger reconnect; close proactively.
+  private send(data: string): void {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(encoder.encode(data));
+    }
+  }
+
+  /** Send a raw key sequence (used by the on-screen key bar for the active session). */
+  sendSeq(seq: string): void {
+    this.send(seq);
+  }
+
+  private sendResize(): void {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(
+        JSON.stringify({ type: 'resize', cols: this.term.cols, rows: this.term.rows }),
+      );
+    }
+  }
+
+  fit(): void {
+    if (this.el.classList.contains('hidden')) return; // don't fit a hidden pane
     try {
-      socket.close();
+      this.fitAddon.fit();
     } catch {
-      // ignore.
+      /* not laid out yet */
     }
-  };
-}
-
-// User input -> server (raw bytes, UTF-8 encoded).
-const encoder = new TextEncoder();
-term.onData((data: string) => {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(encoder.encode(data));
+    this.sendResize();
   }
-});
 
-// ---------------------------------------------------------------------------
-// Resize handling: window resize + ResizeObserver + initial fit on load.
-// ---------------------------------------------------------------------------
-window.addEventListener('resize', () => fit());
-
-if (typeof ResizeObserver !== 'undefined') {
-  const ro = new ResizeObserver(() => fit());
-  ro.observe(container);
-}
-
-window.addEventListener('beforeunload', () => {
-  closed = true;
-  stopPing();
-  if (reconnectTimer !== null) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
+  setFont(px: number): void {
+    this.term.options.fontSize = px;
+    this.fit();
   }
-  if (ws) {
+
+  setActive(active: boolean): void {
+    this.el.classList.toggle('hidden', !active);
+    if (active) {
+      requestAnimationFrame(() => {
+        this.fit();
+        this.term.focus();
+      });
+    }
+  }
+
+  focus(): void {
+    this.term.focus();
+  }
+
+  restart(): void {
+    this.term.reset();
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: 'restart' }));
+    }
+  }
+
+  private startPing(): void {
+    this.stopPing();
+    this.pingTimer = setInterval(() => {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({ type: 'ping' }));
+      }
+    }, 20000);
+  }
+  private stopPing(): void {
+    if (this.pingTimer !== null) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
+  }
+
+  private setConnected(state: boolean): void {
+    this.connected = state;
+    updateTabDot(this);
+    if (isActive(this)) reflectActiveStatus();
+  }
+
+  private scheduleReconnect(): void {
+    if (this.disposed) return;
+    if (this.reconnectTimer !== null) return;
+    if (isActive(this)) showStatus('reconnecting…');
+    const delay = this.reconnectDelay;
+    this.reconnectDelay = Math.min(this.reconnectDelay * 2, MAX_DELAY);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect();
+    }, delay);
+  }
+
+  private connect(): void {
+    if (this.disposed) return;
+    const url = `${wsProto}://${window.location.host}/ws?session=${encodeURIComponent(this.name)}`;
+    const socket = new WebSocket(url);
+    socket.binaryType = 'arraybuffer';
+    this.ws = socket;
+
+    socket.onopen = () => {
+      this.reconnectDelay = MIN_DELAY;
+      this.setConnected(true);
+      this.fit();
+      this.startPing();
+      if (isActive(this)) this.term.focus();
+    };
+
+    socket.onmessage = (ev: MessageEvent) => {
+      if (ev.data instanceof ArrayBuffer) {
+        this.term.write(new Uint8Array(ev.data));
+        return;
+      }
+      if (typeof ev.data === 'string') {
+        try {
+          JSON.parse(ev.data);
+        } catch {
+          /* ignore */
+        }
+      }
+    };
+
+    socket.onclose = () => {
+      this.stopPing();
+      if (this.ws === socket) this.ws = null;
+      this.setConnected(false);
+      this.scheduleReconnect();
+    };
+
+    socket.onerror = () => {
+      try {
+        socket.close();
+      } catch {
+        /* ignore */
+      }
+    };
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.stopPing();
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.ws) {
+      try {
+        this.ws.close();
+      } catch {
+        /* ignore */
+      }
+      this.ws = null;
+    }
     try {
-      ws.close();
+      this.term.dispose();
     } catch {
-      // ignore.
+      /* ignore */
     }
-  }
-});
-
-// ---------------------------------------------------------------------------
-// UI: top control bar + bottom virtual key bar (arrows & terminal keys).
-// ---------------------------------------------------------------------------
-const root = document.documentElement;
-
-// Send a raw key sequence to the pty (same path as term.onData).
-function sendSeq(seq: string): void {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(encoder.encode(seq));
+    this.el.remove();
   }
 }
 
-// Connection indicator (green dot) in the top bar.
-let statusDot: HTMLElement | null = null;
-function setConnected(connected: boolean): void {
-  if (statusDot) statusDot.classList.toggle('connected', connected);
+// ---------------------------------------------------------------------------
+// Tab / session manager
+// ---------------------------------------------------------------------------
+const sessions: Session[] = [];
+let activeSession: Session | null = null;
+
+function isActive(s: Session): boolean {
+  return activeSession === s;
 }
 
-const topbar = document.getElementById('topbar') as HTMLElement;
-const keybarEl = document.getElementById('keybar') as HTMLElement;
-const KEYBAR_HEIGHT = 48; // px, must visually contain .kb-key buttons
+function reflectActiveStatus(): void {
+  if (activeSession && activeSession.connected) hideStatus();
+  else showStatus('reconnecting…');
+}
 
-// --- top bar: status + buttons --------------------------------------------
-const statusWrap = document.createElement('div');
-statusWrap.className = 'tb-status';
-statusDot = document.createElement('span');
-statusDot.className = 'dot';
-const sessionLabel = document.createElement('span');
-sessionLabel.className = 'tb-session';
-sessionLabel.textContent = SESSION;
-statusWrap.append(statusDot, sessionLabel);
+function updateTabDot(s: Session): void {
+  s.tabDot?.classList.toggle('connected', s.connected);
+}
 
-const spacer = document.createElement('div');
-spacer.className = 'spacer';
+function buildTab(s: Session): void {
+  const tab = document.createElement('div');
+  tab.className = 'tab';
+  const dot = document.createElement('span');
+  dot.className = 'tab-dot';
+  const label = document.createElement('span');
+  label.className = 'tab-label';
+  label.textContent = s.name;
+  const close = document.createElement('span');
+  close.className = 'tab-close';
+  close.textContent = '×';
+  close.title = 'Close tab';
+  tab.append(dot, label, close);
 
-// pointerdown + preventDefault keeps focus on the terminal so the iPad soft
-// keyboard does not dismiss; the action runs on pointerdown for a snappy feel.
+  tab.addEventListener('pointerdown', (e) => {
+    if (e.target === close) return;
+    e.preventDefault();
+    activateSession(s);
+  });
+  close.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    closeSession(s);
+  });
+
+  s.tabEl = tab;
+  s.tabDot = dot;
+  tabsEl.insertBefore(tab, addBtn); // keep the "+" button last
+  updateTabDot(s);
+}
+
+function addSession(name: string, makeActive: boolean): Session {
+  let s = sessions.find((x) => x.name === name);
+  if (!s) {
+    s = new Session(name);
+    sessions.push(s);
+    buildTab(s);
+  }
+  if (makeActive) activateSession(s);
+  saveTabs();
+  return s;
+}
+
+function activateSession(s: Session): void {
+  if (activeSession && activeSession !== s) activeSession.setActive(false);
+  activeSession = s;
+  s.setActive(true);
+  for (const x of sessions) x.tabEl?.classList.toggle('active', x === s);
+  reflectActiveStatus();
+  saveTabs();
+}
+
+function closeSession(s: Session): void {
+  const idx = sessions.indexOf(s);
+  if (idx < 0) return;
+  // Closing a tab only detaches: the tmux session keeps running server-side and
+  // resumes if you reopen the same name. (Use ⟳ Restart to discard a session.)
+  sessions.splice(idx, 1);
+  s.tabEl?.remove();
+  s.dispose();
+  if (activeSession === s) {
+    activeSession = null;
+    const next = sessions[idx] ?? sessions[idx - 1] ?? null;
+    if (next) activateSession(next);
+  }
+  if (sessions.length === 0) addSession(defaultSessionName, true);
+  saveTabs();
+}
+
+function nextSessionName(): string {
+  const used = new Set(sessions.map((s) => s.name));
+  for (const c of ['web', 'work', 'dev', 'scratch']) if (!used.has(c)) return c;
+  let i = 2;
+  while (used.has(`s${i}`)) i += 1;
+  return `s${i}`;
+}
+
+function promptAddSession(): void {
+  const suggestion = nextSessionName();
+  const raw = window.prompt('New session name:', suggestion);
+  if (raw === null) return; // cancelled
+  addSession(sanitizeName(raw) ?? suggestion, true);
+}
+
+function saveTabs(): void {
+  try {
+    localStorage.setItem('tw.tabs', JSON.stringify(sessions.map((s) => s.name)));
+    if (activeSession) localStorage.setItem('tw.activeTab', activeSession.name);
+  } catch {
+    /* ignore */
+  }
+}
+
+function loadTabs(): { names: string[]; active: string | null } {
+  try {
+    const parsed = JSON.parse(localStorage.getItem('tw.tabs') ?? '[]');
+    const active = localStorage.getItem('tw.activeTab');
+    if (Array.isArray(parsed)) {
+      const names = parsed.filter((x): x is string => typeof x === 'string');
+      return { names, active };
+    }
+  } catch {
+    /* ignore */
+  }
+  return { names: [], active: null };
+}
+
+// ---------------------------------------------------------------------------
+// Layout: key bar height + iOS keyboard offset; fit the active session.
+// ---------------------------------------------------------------------------
+function fitActive(): void {
+  activeSession?.fit();
+}
+
+function setKeybarVisible(visible: boolean): void {
+  keybarEl.classList.toggle('hidden', !visible);
+  root.style.setProperty('--keybar-h', visible ? `${KEYBAR_HEIGHT}px` : '0px');
+  keysBtn.classList.toggle('active', visible);
+  try {
+    localStorage.setItem('tw.keybar', visible ? '1' : '0');
+  } catch {
+    /* ignore */
+  }
+  requestAnimationFrame(() => fitActive());
+}
+
+function updateKeyboardOffset(): void {
+  const vv = window.visualViewport;
+  const offset = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) : 0;
+  root.style.setProperty('--kb-offset', `${offset}px`);
+  fitActive();
+}
+
+// ---------------------------------------------------------------------------
+// Top-bar controls + on-screen key bar
+// ---------------------------------------------------------------------------
 function makeButton(
+  parent: HTMLElement,
   cls: string,
   label: string,
   title: string,
@@ -278,26 +522,25 @@ function makeButton(
   b.textContent = label;
   b.title = title;
   b.setAttribute('aria-label', title);
+  // pointerdown + preventDefault keeps focus on the terminal so the iPad soft
+  // keyboard doesn't dismiss; the action runs here for a snappy feel.
   b.addEventListener('pointerdown', (e) => {
     e.preventDefault();
     onTap();
   });
+  parent.append(b);
   return b;
 }
 
-const MIN_FONT = 8;
-const MAX_FONT = 28;
 function changeFont(delta: number): void {
-  const cur = term.options.fontSize ?? 14;
-  const next = Math.min(MAX_FONT, Math.max(MIN_FONT, cur + delta));
-  term.options.fontSize = next;
+  currentFont = Math.min(MAX_FONT, Math.max(MIN_FONT, currentFont + delta));
   try {
-    localStorage.setItem('tw.fontSize', String(next));
+    localStorage.setItem('tw.fontSize', String(currentFont));
   } catch {
     /* ignore */
   }
-  fit();
-  term.focus();
+  for (const s of sessions) s.setFont(currentFont);
+  activeSession?.focus();
 }
 
 function toggleFullscreen(): void {
@@ -311,38 +554,32 @@ function toggleFullscreen(): void {
   } else {
     (document.exitFullscreen ?? d.webkitExitFullscreen)?.call(document);
   }
-  setTimeout(() => fit(), 100);
+  setTimeout(() => fitActive(), 100);
 }
 
-function setKeybarVisible(visible: boolean): void {
-  keybarEl.classList.toggle('hidden', !visible);
-  root.style.setProperty('--keybar-h', visible ? `${KEYBAR_HEIGHT}px` : '0px');
-  keysBtn.classList.toggle('active', visible);
-  try {
-    localStorage.setItem('tw.keybar', visible ? '1' : '0');
-  } catch {
-    /* ignore */
-  }
-  requestAnimationFrame(() => fit());
-}
-
-const fontDecBtn = makeButton('tb-btn', 'A−', 'Smaller font', () => changeFont(-1));
-const fontIncBtn = makeButton('tb-btn', 'A+', 'Larger font', () => changeFont(1));
-const keysBtn = makeButton('tb-btn', '⌨ Keys', 'Toggle on-screen keys', () => {
-  setKeybarVisible(keybarEl.classList.contains('hidden'));
-  term.focus();
+addBtn.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  promptAddSession();
 });
-const fsBtn = makeButton('tb-btn', '⤢', 'Toggle fullscreen', toggleFullscreen);
 
-topbar.append(statusWrap, spacer, fontDecBtn, fontIncBtn, keysBtn, fsBtn);
+makeButton(controlsEl, 'tb-btn', 'A−', 'Smaller font', () => changeFont(-1));
+makeButton(controlsEl, 'tb-btn', 'A+', 'Larger font', () => changeFont(1));
+const keysBtn = makeButton(controlsEl, 'tb-btn', '⌨', 'Toggle on-screen keys', () => {
+  setKeybarVisible(keybarEl.classList.contains('hidden'));
+  activeSession?.focus();
+});
+makeButton(controlsEl, 'tb-btn', '⟳', 'Restart this session', () => {
+  activeSession?.restart();
+  activeSession?.focus();
+});
+makeButton(controlsEl, 'tb-btn', '⤢', 'Toggle fullscreen', toggleFullscreen);
 
-// --- bottom key bar: data-driven keys with sticky Ctrl/Alt -----------------
+// --- on-screen key bar (sends to the active session) -----------------------
 interface KeyDef {
   label: string;
   seq?: string;
   mod?: 'ctrl' | 'alt';
 }
-
 const KEYS: KeyDef[] = [
   { label: 'Esc', seq: '\x1b' },
   { label: 'Tab', seq: '\t' },
@@ -372,12 +609,9 @@ function refreshModVisuals(): void {
   modButtons.alt?.classList.toggle('armed', altArmed);
 }
 
-// Fold any armed Ctrl/Alt into the outgoing sequence.
 function applyMods(seq: string): string {
   if (!ctrlArmed && !altArmed) return seq;
-  const isArrow = /^\x1b\[[ABCD]$/.test(seq);
-  if (isArrow) {
-    // xterm modifier param: 1 + (shift?1) + (alt?2) + (ctrl?4)
+  if (/^\x1b\[[ABCD]$/.test(seq)) {
     const mod = 1 + (altArmed ? 2 : 0) + (ctrlArmed ? 4 : 0);
     return `\x1b[1;${mod}${seq[seq.length - 1]}`;
   }
@@ -390,11 +624,10 @@ function applyMods(seq: string): string {
     if (altArmed) ch = '\x1b' + ch;
     return ch;
   }
-  // Multi-char non-arrow keys (Home/End/PgUp/PgDn) are sent unmodified.
   return seq;
 }
 
-function makeKey(def: KeyDef): HTMLElement {
+for (const def of KEYS) {
   const b = document.createElement('button');
   b.className = 'kb-key';
   b.type = 'button';
@@ -409,45 +642,48 @@ function makeKey(def: KeyDef): HTMLElement {
       refreshModVisuals();
       return;
     }
-    if (def.seq !== undefined) sendSeq(applyMods(def.seq));
+    if (def.seq !== undefined) activeSession?.sendSeq(applyMods(def.seq));
     if (ctrlArmed || altArmed) {
       ctrlArmed = false;
       altArmed = false;
       refreshModVisuals();
     }
-    term.focus();
+    activeSession?.focus();
   });
-  return b;
+  keybarEl.append(b);
 }
 
-for (const def of KEYS) keybarEl.append(makeKey(def));
-
-// --- iOS soft-keyboard handling: lift the bottom bar above the keyboard -----
-function updateKeyboardOffset(): void {
-  const vv = window.visualViewport;
-  const offset = vv
-    ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop)
-    : 0;
-  root.style.setProperty('--kb-offset', `${offset}px`);
-  fit();
+// ---------------------------------------------------------------------------
+// Global resize handling
+// ---------------------------------------------------------------------------
+window.addEventListener('resize', () => fitActive());
+let areaObserver: ResizeObserver | null = null;
+if (typeof ResizeObserver !== 'undefined') {
+  areaObserver = new ResizeObserver(() => fitActive());
+  areaObserver.observe(termArea);
 }
 if (window.visualViewport) {
   window.visualViewport.addEventListener('resize', updateKeyboardOffset);
   window.visualViewport.addEventListener('scroll', updateKeyboardOffset);
 }
+window.addEventListener('beforeunload', () => {
+  for (const s of sessions) s.dispose();
+});
 
-// --- restore persisted preferences -----------------------------------------
-try {
-  const savedFont = localStorage.getItem('tw.fontSize');
-  if (savedFont) {
-    const n = parseInt(savedFont, 10);
-    if (!Number.isNaN(n)) {
-      term.options.fontSize = Math.min(MAX_FONT, Math.max(MIN_FONT, n));
-    }
-  }
-} catch {
-  /* ignore */
-}
+// ---------------------------------------------------------------------------
+// Init: restore tabs (or start one), restore prefs, activate.
+// ---------------------------------------------------------------------------
+const urlSession = sanitizeName(params.get('session'));
+const restored = loadTabs();
+const defaultSessionName = urlSession ?? restored.names[0] ?? 'web';
+
+let initialNames = restored.names.length ? restored.names.slice() : [defaultSessionName];
+if (urlSession && !initialNames.includes(urlSession)) initialNames = [urlSession, ...initialNames];
+
+for (const name of initialNames) addSession(name, false);
+
+const activeName = urlSession ?? restored.active ?? initialNames[0];
+activateSession(sessions.find((s) => s.name === activeName) ?? sessions[0]);
 
 // Default: show the key bar on touch devices, hidden on desktop (unless saved).
 const keybarDefault = (() => {
@@ -460,8 +696,3 @@ const keybarDefault = (() => {
   return window.matchMedia('(pointer: coarse)').matches;
 })();
 setKeybarVisible(keybarDefault);
-
-// Initial layout + connect + focus.
-fit();
-connect();
-term.focus();

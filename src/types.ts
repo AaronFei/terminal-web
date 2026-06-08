@@ -17,6 +17,15 @@ export interface PingMessage {
   type: "ping";
 }
 
+/**
+ * Client -> Server: kill this connection's tmux session so it restarts fresh.
+ * The pty (tmux client) then exits, the ws closes, and the client reconnects
+ * into a brand-new session via `new-session -A`.
+ */
+export interface RestartMessage {
+  type: "restart";
+}
+
 /** Server -> Client: reply to a PingMessage. */
 export interface PongMessage {
   type: "pong";
@@ -28,8 +37,23 @@ export interface InfoMessage {
   message: string;
 }
 
+/**
+ * Client -> Server: diagnostic trace (only sent when ?debug=ime is set). The
+ * server just logs these; they never affect terminal behavior.
+ */
+export interface DebugMessage {
+  type: "debug";
+  event: string;
+  data?: string;
+  at?: number;
+}
+
 /** Any JSON control message a client may send to the server. */
-export type ClientMessage = ResizeMessage | PingMessage;
+export type ClientMessage =
+  | ResizeMessage
+  | PingMessage
+  | RestartMessage
+  | DebugMessage;
 
 /** Any JSON control message the server may send to a client. */
 export type ServerMessage = PongMessage | InfoMessage;
@@ -42,6 +66,8 @@ export function isClientMessage(value: unknown): value is ClientMessage {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
   if (v.type === "ping") return true;
+  if (v.type === "restart") return true;
+  if (v.type === "debug") return typeof v.event === "string";
   if (v.type === "resize") {
     return typeof v.cols === "number" && typeof v.rows === "number";
   }

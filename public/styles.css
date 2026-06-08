@@ -48,34 +48,94 @@ body {
   -webkit-user-select: none;
 }
 
-#topbar .tb-status {
+/* tabs (left, horizontally scrollable) + the "+" button */
+#tabs {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  white-space: nowrap;
+  -webkit-overflow-scrolling: touch;
+}
+#tabs::-webkit-scrollbar {
+  height: 0;
+}
+
+.tab {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   gap: 6px;
-  min-width: 0;
+  max-width: 180px;
+  padding: 4px 8px;
+  background: #2d2d2d;
+  border: 1px solid #3a3a3a;
+  border-radius: 6px;
+  color: #cfcfcf;
+  cursor: pointer;
 }
-
-#topbar .dot {
-  width: 8px;
-  height: 8px;
+.tab.active {
+  background: #1e1e1e;
+  border-color: #3b8eea;
+  color: #fff;
+}
+.tab .tab-dot {
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
-  background: #e0a23b; /* amber = not connected / reconnecting */
+  background: #e0a23b; /* amber = reconnecting */
   flex: 0 0 auto;
 }
-
-#topbar .dot.connected {
+.tab .tab-dot.connected {
   background: #23d18b; /* green = connected */
 }
-
-#topbar .tb-session {
-  opacity: 0.85;
-  white-space: nowrap;
+.tab .tab-label {
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tab .tab-close {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  line-height: 14px;
+  text-align: center;
+  border-radius: 4px;
+  color: #999;
+}
+.tab .tab-close:hover {
+  background: #4a4a4c;
+  color: #fff;
 }
 
-#topbar .spacer {
-  flex: 1 1 auto;
+.tab-add {
+  flex: 0 0 auto;
+  appearance: none;
+  -webkit-appearance: none;
+  background: #3a3a3c;
+  color: #e5e5e5;
+  border: 1px solid #4a4a4c;
+  border-radius: 6px;
+  width: 28px;
+  height: 28px;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.tab-add:active {
+  background: #4a4a4c;
+}
+
+#controls {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-left: 6px;
 }
 
 .tb-btn {
@@ -114,8 +174,17 @@ body {
   right: 0;
   top: var(--topbar-h);
   bottom: calc(var(--keybar-h) + var(--kb-offset));
-  padding: 4px;
   background: #1e1e1e;
+}
+
+/* one pane per session; only the active pane is shown */
+.term-pane {
+  position: absolute;
+  inset: 0;
+  padding: 4px;
+}
+.term-pane.hidden {
+  display: none;
 }
 
 /* xterm fills its container */

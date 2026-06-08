@@ -3,6 +3,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import { execFile } from "node:child_process";
 import { URL } from "node:url";
 
 import { WebSocketServer, WebSocket } from "ws";
@@ -328,6 +329,24 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
         }
       } else if (parsed.type === "ping") {
         sendJson(ws, { type: "pong" });
+      } else if (parsed.type === "restart") {
+        // Kill this session's tmux session. The attached pty (tmux client)
+        // then exits, the ws closes, and the client reconnects into a fresh
+        // session via `new-session -A`.
+        execFile("tmux", ["kill-session", "-t", session], (err) => {
+          if (err) {
+            console.error(
+              `[ws] restart: kill-session "${session}" failed:`,
+              err.message
+            );
+            sendJson(ws, { type: "info", message: "Restart failed." });
+          }
+        });
+      } else if (parsed.type === "debug") {
+        console.error(
+          `[ime-debug] session=${session} event=${parsed.event} ` +
+            `data=${JSON.stringify(parsed.data ?? "")} at=${parsed.at ?? ""}`
+        );
       }
     } catch (err) {
       console.error("[ws] message handler error:", err);
