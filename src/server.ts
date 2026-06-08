@@ -180,10 +180,21 @@ const HEARTBEAT_MS = 20_000;
 // bind address) would make the prompt show "100" instead of the real hostname.
 const SERVER_ENV_VARS = ["HOST", "PORT", "DEFAULT_SESSION"];
 
+function hasUtf8(value: string | undefined): boolean {
+  return typeof value === "string" && /utf-?8/i.test(value);
+}
+
 function buildChildEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, TERM: "xterm-256color" };
   for (const key of SERVER_ENV_VARS) {
     delete env[key];
+  }
+  // Ensure a UTF-8 locale. Under launchd the environment has no LANG, which
+  // leaves the shell and tmux in a non-UTF-8 (C) locale — CJK/wide characters
+  // then render as "_" and multibyte (IME) input is mangled. Only set a default
+  // if none of the locale vars already request UTF-8.
+  if (!hasUtf8(env.LC_ALL) && !hasUtf8(env.LC_CTYPE) && !hasUtf8(env.LANG)) {
+    env.LANG = "en_US.UTF-8";
   }
   return env;
 }

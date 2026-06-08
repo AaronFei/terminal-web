@@ -19,9 +19,13 @@ export function sanitizeSession(name: string | null | undefined): string {
  * Uses `new-session -A` so it attaches to an existing session of the same name
  * or creates it if missing — the core of the resume behavior. The session is
  * assumed to already be sanitized by the caller.
+ *
+ * `-u` forces tmux to treat the client as UTF-8 capable regardless of the
+ * locale it detects, so CJK/wide characters render correctly instead of being
+ * replaced with "_" placeholders.
  */
 export function tmuxArgs(session: string, confPath: string): string[] {
-  return ["-f", confPath, "new-session", "-A", "-s", session];
+  return ["-u", "-f", confPath, "new-session", "-A", "-s", session];
 }
 
 /**
