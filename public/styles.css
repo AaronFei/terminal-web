@@ -1,7 +1,7 @@
 :root {
   --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
     "Liberation Mono", "Courier New", monospace;
-  --topbar-h: 38px;
+  --topbar-h: 44px;
   --keybar-h: 0px; /* set to the real height by JS when the key bar is shown */
   --kb-offset: 0px; /* iOS soft-keyboard offset, tracked via visualViewport */
 }
@@ -141,18 +141,28 @@ body {
 .tb-btn {
   appearance: none;
   -webkit-appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   background: #3a3a3c;
   color: #e5e5e5;
   border: 1px solid #4a4a4c;
   border-radius: 6px;
-  padding: 4px 10px;
-  font-size: 12px;
+  padding: 6px 12px;
+  font-size: 14px;
   line-height: 1;
   font-family: inherit;
-  min-height: 28px;
+  min-height: 34px;
   cursor: pointer;
   touch-action: manipulation;
   flex: 0 0 auto;
+}
+
+/* icon-glyph buttons (⌨ ⟳ ⤢) need a larger glyph + a bigger tap target */
+.tb-icon {
+  font-size: 20px;
+  min-width: 40px;
+  padding: 4px 10px;
 }
 
 .tb-btn:active {

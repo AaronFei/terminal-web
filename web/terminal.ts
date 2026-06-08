@@ -568,15 +568,15 @@ addBtn.addEventListener('pointerdown', (e) => {
 
 makeButton(controlsEl, 'tb-btn', 'A−', 'Smaller font', () => changeFont(-1));
 makeButton(controlsEl, 'tb-btn', 'A+', 'Larger font', () => changeFont(1));
-const keysBtn = makeButton(controlsEl, 'tb-btn', '⌨', 'Toggle on-screen keys', () => {
+const keysBtn = makeButton(controlsEl, 'tb-btn tb-icon', '⌨', 'Toggle on-screen keys', () => {
   setKeybarVisible(keybarEl.classList.contains('hidden'));
   activeSession?.focus();
 });
-makeButton(controlsEl, 'tb-btn', '⟳', 'Restart this session', () => {
+makeButton(controlsEl, 'tb-btn tb-icon', '⟳', 'Restart this session', () => {
   activeSession?.restart();
   activeSession?.focus();
 });
-makeButton(controlsEl, 'tb-btn', '⤢', 'Toggle fullscreen', toggleFullscreen);
+makeButton(controlsEl, 'tb-btn tb-icon', '⤢', 'Toggle fullscreen', toggleFullscreen);
 
 // --- on-screen key bar (sends to the active session) -----------------------
 interface KeyDef {
