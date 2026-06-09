@@ -126,6 +126,95 @@ async function serveStatic(
 }
 
 // ---------------------------------------------------------------------------
+// Image upload (POST /upload): save a pasted/dropped image to a file so the
+// program in the terminal (e.g. Claude Code) can read it by path. The client
+// sends the raw image bytes as the body with the image's Content-Type.
+// ---------------------------------------------------------------------------
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024; // 25 MB
+
+const IMAGE_EXT: Record<string, string> = {
+  "image/png": ".png",
+  "image/jpeg": ".jpg",
+  "image/gif": ".gif",
+  "image/webp": ".webp",
+  "image/bmp": ".bmp",
+  "image/svg+xml": ".svg",
+  "image/heic": ".heic",
+  "image/heif": ".heif",
+  "image/tiff": ".tiff",
+};
+
+function sendJsonHttp(
+  res: http.ServerResponse,
+  status: number,
+  body: unknown
+): void {
+  const text = JSON.stringify(body);
+  res.writeHead(status, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Content-Length": Buffer.byteLength(text),
+  });
+  res.end(text);
+}
+
+async function handleUpload(
+  req: http.IncomingMessage,
+  res: http.ServerResponse
+): Promise<void> {
+  const ctype = (req.headers["content-type"] ?? "")
+    .split(";")[0]
+    .trim()
+    .toLowerCase();
+  const ext = IMAGE_EXT[ctype];
+  if (!ext) {
+    sendJsonHttp(res, 415, { error: `unsupported content-type: ${ctype}` });
+    return;
+  }
+
+  const chunks: Buffer[] = [];
+  let size = 0;
+  try {
+    for await (const chunk of req) {
+      const buf = chunk as Buffer;
+      size += buf.length;
+      if (size > MAX_UPLOAD_BYTES) {
+        sendJsonHttp(res, 413, { error: "file too large (max 25 MB)" });
+        req.destroy();
+        return;
+      }
+      chunks.push(buf);
+    }
+  } catch (err) {
+    console.error("[upload] read error:", err);
+    if (!res.headersSent) sendJsonHttp(res, 400, { error: "read failed" });
+    return;
+  }
+
+  if (size === 0) {
+    sendJsonHttp(res, 400, { error: "empty body" });
+    return;
+  }
+
+  try {
+    await fsp.mkdir(config.uploadDir, { recursive: true });
+    const stamp = new Date()
+      .toISOString()
+      .replace(/[:]/g, "-")
+      .replace(/\..+$/, "")
+      .replace("T", "_");
+    const rand = Math.random().toString(36).slice(2, 8);
+    const filename = `clip-${stamp}-${rand}${ext}`;
+    const filePath = path.join(config.uploadDir, filename);
+    await fsp.writeFile(filePath, Buffer.concat(chunks), { mode: 0o600 });
+    console.log(`[upload] saved ${filePath} (${size} bytes)`);
+    sendJsonHttp(res, 200, { path: filePath, name: filename, size });
+  } catch (err) {
+    console.error("[upload] write error:", err);
+    sendJsonHttp(res, 500, { error: "could not save file" });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // HTTP server
 // ---------------------------------------------------------------------------
 
@@ -139,6 +228,11 @@ const server = http.createServer((req, res) => {
       }
       const requestUrl = new URL(req.url, "http://localhost");
       const method = req.method ?? "GET";
+
+      if (method === "POST" && requestUrl.pathname === "/upload") {
+        await handleUpload(req, res);
+        return;
+      }
 
       if (method !== "GET" && method !== "HEAD") {
         res.writeHead(405, {

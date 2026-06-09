@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import os from "node:os";
 import path from "node:path";
 
 /**
@@ -20,6 +21,8 @@ export interface Config {
   tmuxConfPath: string;
   /** Absolute path to the public/ directory (static root). */
   publicDir: string;
+  /** Directory where pasted/dropped images are saved (POST /upload). */
+  uploadDir: string;
   /** Detected Tailscale IPv4 address, if any (for nicer startup logging). */
   tailscaleIp: string | null;
 }
@@ -85,6 +88,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       ? env.DEFAULT_SESSION.trim()
       : "web";
 
+  const uploadDir =
+    env.UPLOAD_DIR && env.UPLOAD_DIR.trim() !== ""
+      ? path.resolve(env.UPLOAD_DIR.trim())
+      : path.join(os.homedir(), "terminal-web-uploads");
+
   return {
     port,
     host,
@@ -93,6 +101,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     repoRoot: REPO_ROOT,
     tmuxConfPath: path.join(REPO_ROOT, "tmux", "web.tmux.conf"),
     publicDir: path.join(REPO_ROOT, "public"),
+    uploadDir,
     tailscaleIp,
   };
 }

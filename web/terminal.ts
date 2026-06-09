@@ -675,6 +675,86 @@ window.addEventListener('beforeunload', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Image paste / drag-drop -> upload -> insert the saved path into the active
+// session, so the program running there (e.g. Claude Code) can read the image.
+// ---------------------------------------------------------------------------
+function flashStatus(text: string, ms: number): void {
+  showStatus(text);
+  window.setTimeout(() => {
+    if (statusEl?.textContent === text) hideStatus();
+  }, ms);
+}
+
+async function uploadImage(file: Blob, name?: string): Promise<void> {
+  if (!file || !file.type.startsWith('image/')) return;
+  showStatus('uploading image…');
+  try {
+    const res = await fetch(
+      '/upload' + (name ? `?name=${encodeURIComponent(name)}` : ''),
+      { method: 'POST', headers: { 'Content-Type': file.type }, body: file },
+    );
+    if (!res.ok) {
+      flashStatus('image upload failed', 2500);
+      return;
+    }
+    const data = (await res.json()) as { path?: string };
+    if (data.path && activeSession) {
+      // Quote the path if it contains whitespace; append a space so it reads as
+      // a complete argument at the prompt.
+      const p = /\s/.test(data.path)
+        ? `'${data.path.replace(/'/g, `'\\''`)}'`
+        : data.path;
+      activeSession.sendSeq(p + ' ');
+      activeSession.focus();
+    }
+    flashStatus(`image added: ${data.path ?? ''}`, 2500);
+  } catch {
+    flashStatus('image upload failed', 2500);
+  }
+}
+
+window.addEventListener('paste', (e: ClipboardEvent) => {
+  const items = e.clipboardData?.items;
+  if (!items) return;
+  for (let i = 0; i < items.length; i += 1) {
+    const it = items[i];
+    if (it.kind === 'file' && it.type.startsWith('image/')) {
+      const f = it.getAsFile();
+      if (f) {
+        e.preventDefault(); // image paste: don't let xterm treat it as text
+        void uploadImage(f, f.name);
+      }
+      return;
+    }
+  }
+});
+
+function dragHasImage(dt: DataTransfer | null): boolean {
+  if (!dt) return false;
+  for (let i = 0; i < dt.items.length; i += 1) {
+    if (dt.items[i].type.startsWith('image/')) return true;
+  }
+  return false;
+}
+
+termArea.addEventListener('dragover', (e) => {
+  if (!dragHasImage(e.dataTransfer)) return;
+  e.preventDefault();
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+  termArea.classList.add('dragging');
+});
+termArea.addEventListener('dragleave', () => termArea.classList.remove('dragging'));
+termArea.addEventListener('drop', (e) => {
+  termArea.classList.remove('dragging');
+  const files = e.dataTransfer?.files;
+  if (!files || files.length === 0) return;
+  const imgs = Array.from(files).filter((f) => f.type.startsWith('image/'));
+  if (imgs.length === 0) return;
+  e.preventDefault();
+  for (const f of imgs) void uploadImage(f, f.name);
+});
+
+// ---------------------------------------------------------------------------
 // Init: restore tabs (or start one), restore prefs, activate.
 // ---------------------------------------------------------------------------
 const urlSession = sanitizeName(params.get('session'));

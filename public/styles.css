@@ -198,6 +198,24 @@ body {
   display: none;
 }
 
+/* drag-an-image-here affordance */
+#terminal.dragging::after {
+  content: "Drop image to upload";
+  position: absolute;
+  inset: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px dashed #3b8eea;
+  border-radius: 8px;
+  background: rgba(36, 114, 200, 0.12);
+  color: #cfe3ff;
+  font-family: var(--mono);
+  font-size: 14px;
+  pointer-events: none;
+  z-index: 5;
+}
+
 /* xterm fills its container */
 .xterm,
 .xterm .xterm-viewport,

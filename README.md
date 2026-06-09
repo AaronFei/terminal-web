@@ -237,6 +237,24 @@ your shell instead, e.g. `HOST=100.x.y.z PORT=8090 npm start`.
 | `PORT`            | `8090`                                               | Port the HTTP/WebSocket server listens on.                                  |
 | `HOST`            | Tailscale IPv4 (`tailscale ip -4`), else `0.0.0.0`   | Address to bind. Set explicitly to pin a specific interface/IP.             |
 | `DEFAULT_SESSION` | `web`                                                | tmux session name used when the client doesn't pass `?session=NAME`.        |
+| `UPLOAD_DIR`      | `~/terminal-web-uploads`                             | Where pasted/dropped images are saved (see below).                          |
+
+---
+
+## Pasting images (for Claude Code & other AI CLIs)
+
+A terminal is a text stream, so you can't paste pixels into it. Instead, when
+you **paste** an image (Cmd/Ctrl-V) or **drag-drop** an image file onto the
+terminal, the browser uploads it to the server (`POST /upload`), which saves it
+under `UPLOAD_DIR` (default `~/terminal-web-uploads`) and returns the path. The
+page then **types that absolute path at the prompt**.
+
+So to show an image to Claude Code (or any CLI that reads image paths): paste
+the image, then press Enter — Claude Code picks up the inserted path and reads
+the image. Images are capped at 25 MB and saved `0600`.
+
+> The upload endpoint has no auth beyond the tailnet, same as the terminal —
+> anyone on your tailnet can POST an image into `UPLOAD_DIR`.
 
 ---
 
