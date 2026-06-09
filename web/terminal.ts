@@ -132,6 +132,44 @@ function openPasteBox(): void {
   });
 }
 
+// Quick help overlay: how to copy / paste / attach images. Shown from the "?"
+// button and once automatically on first visit.
+function openHelp(): void {
+  if (document.querySelector('.help-overlay')) return;
+  const isMac = /Mac|iP(hone|ad|od)/.test(navigator.platform || navigator.userAgent);
+  const selKey = isMac ? '⌥ Option' : 'Shift';
+  const pasteKey = isMac ? '⌘V' : 'Ctrl+Shift+V';
+  const overlay = document.createElement('div');
+  overlay.className = 'paste-overlay help-overlay';
+  const box = document.createElement('div');
+  box.className = 'paste-box help-box';
+  box.innerHTML =
+    '<div class="help-title">How to copy / paste / images</div>' +
+    '<ul class="help-list">' +
+    `<li><b>Copy</b> — hold <b>${selKey}</b> and drag to select; it copies automatically. (Or select, then tap <b>Copy</b>.)</li>` +
+    `<li><b>Paste</b> — click the terminal, then <b>${pasteKey}</b>. On a phone/tablet, tap <b>Paste</b> and paste into the box that appears.</li>` +
+    '<li><b>Image</b> (for Claude Code etc.) — tap the image button, or paste / drag an image: it uploads and inserts the file path. Then press Enter.</li>' +
+    '<li><b>Scroll</b> — mouse wheel or two-finger swipe scrolls the history.</li>' +
+    '<li><b>Tabs</b> — <b>+</b> new session, <b>×</b> closes a tab (the session keeps running), <b>⟳</b> restarts it fresh.</li>' +
+    '</ul>' +
+    '<div class="paste-row"><button class="tb-btn" type="button" data-help-close>Got it</button></div>';
+  overlay.append(box);
+  document.body.append(overlay);
+  const close = (): void => {
+    overlay.remove();
+    activeSession?.focus();
+  };
+  box.querySelector('[data-help-close]')?.addEventListener('click', close);
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) close();
+  });
+  try {
+    localStorage.setItem('tw.helpSeen', '1');
+  } catch {
+    /* ignore */
+  }
+}
+
 const THEME = {
   background: '#1e1e1e',
   foreground: '#d4d4d4',
@@ -708,11 +746,26 @@ imageInput.addEventListener('change', () => {
   }
   imageInput.value = '';
 });
-makeButton(controlsEl, 'tb-btn tb-icon', '🖼', 'Attach an image (upload + insert path)', () => {
+// Monochrome line icon (matches the other glyphs; uses currentColor).
+const imgBtn = document.createElement('button');
+imgBtn.className = 'tb-btn tb-icon';
+imgBtn.type = 'button';
+imgBtn.title = 'Attach an image (upload + insert path)';
+imgBtn.setAttribute('aria-label', 'Attach an image');
+imgBtn.innerHTML =
+  '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" ' +
+  'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  '<rect x="3" y="3" width="18" height="18" rx="2"></rect>' +
+  '<circle cx="8.5" cy="8.5" r="1.5"></circle>' +
+  '<path d="M21 15l-5-5L5 21"></path></svg>';
+imgBtn.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
   imageInput.click();
 });
+controlsEl.append(imgBtn);
 
 makeButton(controlsEl, 'tb-btn tb-icon', '⤢', 'Toggle fullscreen', toggleFullscreen);
+makeButton(controlsEl, 'tb-btn tb-icon', '?', 'Help: copy / paste / images', openHelp);
 
 // --- on-screen key bar (sends to the active session) -----------------------
 interface KeyDef {
@@ -943,3 +996,10 @@ const keybarDefault = (() => {
   return window.matchMedia('(pointer: coarse)').matches;
 })();
 setKeybarVisible(keybarDefault);
+
+// First visit: show the copy/paste/image hint once.
+try {
+  if (!localStorage.getItem('tw.helpSeen')) window.setTimeout(openHelp, 700);
+} catch {
+  /* ignore */
+}

@@ -354,3 +354,30 @@ body {
   gap: 8px;
   margin-top: 10px;
 }
+
+/* Help overlay */
+.help-box {
+  width: min(92vw, 600px);
+  max-height: 80vh;
+  overflow-y: auto;
+}
+.help-title {
+  font-family: var(--mono);
+  font-size: 14px;
+  font-weight: 600;
+  color: #fff;
+  margin-bottom: 10px;
+}
+.help-list {
+  margin: 0;
+  padding-left: 18px;
+  color: #d4d4d4;
+  font-size: 13px;
+  line-height: 1.55;
+}
+.help-list li {
+  margin-bottom: 8px;
+}
+.help-list b {
+  color: #fff;
+}
