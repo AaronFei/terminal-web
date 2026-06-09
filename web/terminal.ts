@@ -69,11 +69,67 @@ function pasteFromClipboard(): void {
       .readText()
       .then((t) => {
         if (t) activeSession?.sendSeq(t);
+        else openPasteBox();
       })
-      .catch(() => flashStatus('Paste blocked — use Cmd/Ctrl-V', 2500));
+      .catch(() => openPasteBox());
   } else {
-    flashStatus('Paste needs HTTPS — use Cmd/Ctrl-V instead', 3000);
+    // Plain HTTP can't read the clipboard via JS, so pop a box the user pastes
+    // into (native paste into a real textarea works on HTTP and iPad).
+    openPasteBox();
   }
+}
+
+// A small overlay with a real <textarea> the user pastes into, then we forward
+// the text to the active session. Works without the Clipboard API (HTTP/iPad).
+function openPasteBox(): void {
+  if (document.querySelector('.paste-overlay')) return;
+  const overlay = document.createElement('div');
+  overlay.className = 'paste-overlay';
+  const box = document.createElement('div');
+  box.className = 'paste-box';
+  const label = document.createElement('div');
+  label.className = 'paste-label';
+  label.textContent = 'Paste here (⌘V / long-press → Paste) — sends automatically';
+  const ta = document.createElement('textarea');
+  ta.className = 'paste-ta';
+  ta.setAttribute('autocapitalize', 'off');
+  ta.setAttribute('autocomplete', 'off');
+  ta.spellcheck = false;
+  const row = document.createElement('div');
+  row.className = 'paste-row';
+  const cancel = document.createElement('button');
+  cancel.className = 'tb-btn';
+  cancel.type = 'button';
+  cancel.textContent = 'Cancel';
+  const send = document.createElement('button');
+  send.className = 'tb-btn';
+  send.type = 'button';
+  send.textContent = 'Send';
+  row.append(cancel, send);
+  box.append(label, ta, row);
+  overlay.append(box);
+  document.body.append(overlay);
+  window.setTimeout(() => ta.focus(), 0);
+
+  const close = (): void => {
+    overlay.remove();
+    activeSession?.focus();
+  };
+  const submit = (): void => {
+    const t = ta.value;
+    if (t) activeSession?.sendSeq(t);
+    close();
+  };
+  send.addEventListener('click', submit);
+  cancel.addEventListener('click', close);
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) close();
+  });
+  // One-tap feel: auto-send right after a paste lands in the box.
+  ta.addEventListener('paste', () => window.setTimeout(submit, 0));
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') close();
+  });
 }
 
 const THEME = {

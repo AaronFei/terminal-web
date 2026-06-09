@@ -311,3 +311,46 @@ body {
   opacity: 1;
   visibility: visible;
 }
+
+/* Paste box overlay (HTTP/iPad paste without the Clipboard API) */
+.paste-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+}
+.paste-box {
+  width: min(90vw, 560px);
+  background: #252526;
+  border: 1px solid #3a3a3a;
+  border-radius: 10px;
+  padding: 14px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+}
+.paste-label {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: #cfcfcf;
+  margin-bottom: 8px;
+}
+.paste-ta {
+  width: 100%;
+  height: 120px;
+  resize: vertical;
+  background: #1e1e1e;
+  color: #d4d4d4;
+  border: 1px solid #3a3a3a;
+  border-radius: 6px;
+  padding: 8px;
+  font-family: var(--mono);
+  font-size: 14px;
+}
+.paste-row {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 10px;
+}
