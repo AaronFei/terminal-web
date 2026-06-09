@@ -30,6 +30,52 @@ function sanitizeName(raw: string | null | undefined): string | null {
   return cleaned.length ? cleaned : null;
 }
 
+// Copy text to the clipboard. Uses the async Clipboard API on a secure context
+// (HTTPS), else falls back to a hidden-textarea + execCommand("copy"), which
+// works over plain HTTP within a user gesture.
+async function copyText(text: string): Promise<boolean> {
+  if (!text) return false;
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    /* fall through to the legacy path */
+  }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.top = '-1000px';
+    ta.style.opacity = '0';
+    document.body.append(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+// Read the clipboard and send it to the active session. Reading requires a
+// secure context (HTTPS); over HTTP we can't, so hint the user to use Cmd/Ctrl-V
+// (the native paste event still works when the terminal is focused).
+function pasteFromClipboard(): void {
+  const clip = navigator.clipboard;
+  if (clip && typeof clip.readText === 'function' && window.isSecureContext) {
+    clip
+      .readText()
+      .then((t) => {
+        if (t) activeSession?.sendSeq(t);
+      })
+      .catch(() => flashStatus('Paste blocked — use Cmd/Ctrl-V', 2500));
+  } else {
+    flashStatus('Paste needs HTTPS — use Cmd/Ctrl-V instead', 3000);
+  }
+}
+
 const THEME = {
   background: '#1e1e1e',
   foreground: '#d4d4d4',
@@ -130,6 +176,9 @@ class Session {
       fontSize: currentFont,
       scrollback: 100000,
       allowProposedApi: true,
+      // Hold Option (macOS) / Shift (others) and drag to select text even while
+      // tmux mouse mode is on, so it can be copied.
+      macOptionClickForcesSelection: true,
       theme: THEME,
     });
     this.term.loadAddon(this.fitAddon);
@@ -147,6 +196,18 @@ class Session {
     } catch {
       /* fall back to canvas/DOM renderer */
     }
+
+    // Copy the selection to the clipboard when a drag/touch selection ends.
+    const copySelection = (): void => {
+      const sel = this.term.getSelection();
+      if (sel) {
+        void copyText(sel).then((ok) => {
+          if (ok) flashStatus('copied', 1200);
+        });
+      }
+    };
+    this.el.addEventListener('mouseup', copySelection);
+    this.el.addEventListener('touchend', copySelection);
 
     this.wireInput();
     this.connect();
@@ -583,8 +644,11 @@ interface KeyDef {
   label: string;
   seq?: string;
   mod?: 'ctrl' | 'alt';
+  action?: 'copy' | 'paste';
 }
 const KEYS: KeyDef[] = [
+  { label: 'Copy', action: 'copy' },
+  { label: 'Paste', action: 'paste' },
   { label: 'Esc', seq: '\x1b' },
   { label: 'Tab', seq: '\t' },
   { label: 'Ctrl', mod: 'ctrl' },
@@ -640,6 +704,21 @@ for (const def of KEYS) {
   if (def.mod) modButtons[def.mod] = b;
   b.addEventListener('pointerdown', (e) => {
     e.preventDefault();
+    if (def.action === 'copy') {
+      const sel = activeSession?.term.getSelection() ?? '';
+      if (sel) {
+        void copyText(sel).then((ok) => flashStatus(ok ? 'copied' : 'copy failed', 1200));
+      } else {
+        flashStatus('nothing selected', 1200);
+      }
+      activeSession?.focus();
+      return;
+    }
+    if (def.action === 'paste') {
+      pasteFromClipboard();
+      activeSession?.focus();
+      return;
+    }
     if (def.mod) {
       if (def.mod === 'ctrl') ctrlArmed = !ctrlArmed;
       else altArmed = !altArmed;
