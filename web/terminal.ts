@@ -637,6 +637,25 @@ makeButton(controlsEl, 'tb-btn tb-icon', '⟳', 'Restart this session', () => {
   activeSession?.restart();
   activeSession?.focus();
 });
+
+// Reliable image attach for every platform (incl. iPad) and over plain HTTP —
+// no clipboard needed: pick/take a photo, it uploads and the path is inserted.
+const imageInput = document.createElement('input');
+imageInput.type = 'file';
+imageInput.accept = 'image/*';
+imageInput.multiple = true;
+imageInput.style.display = 'none';
+document.body.append(imageInput);
+imageInput.addEventListener('change', () => {
+  if (imageInput.files) {
+    for (const f of Array.from(imageInput.files)) void uploadImage(f, f.name);
+  }
+  imageInput.value = '';
+});
+makeButton(controlsEl, 'tb-btn tb-icon', '🖼', 'Attach an image (upload + insert path)', () => {
+  imageInput.click();
+});
+
 makeButton(controlsEl, 'tb-btn tb-icon', '⤢', 'Toggle fullscreen', toggleFullscreen);
 
 // --- on-screen key bar (sends to the active session) -----------------------
@@ -792,21 +811,30 @@ async function uploadImage(file: Blob, name?: string): Promise<void> {
   }
 }
 
-window.addEventListener('paste', (e: ClipboardEvent) => {
-  const items = e.clipboardData?.items;
-  if (!items) return;
-  for (let i = 0; i < items.length; i += 1) {
-    const it = items[i];
-    if (it.kind === 'file' && it.type.startsWith('image/')) {
-      const f = it.getAsFile();
-      if (f) {
-        e.preventDefault(); // image paste: don't let xterm treat it as text
-        void uploadImage(f, f.name);
+// Capture phase: xterm's own paste handler calls stopPropagation() on its
+// textarea/element, so a bubble-phase listener would never see pastes made into
+// the focused terminal. Capturing lets us intercept image pastes first.
+window.addEventListener(
+  'paste',
+  (e: ClipboardEvent) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    for (let i = 0; i < items.length; i += 1) {
+      const it = items[i];
+      if (it.kind === 'file' && it.type.startsWith('image/')) {
+        const f = it.getAsFile();
+        if (f) {
+          e.preventDefault();
+          e.stopImmediatePropagation(); // don't let xterm also handle it
+          void uploadImage(f, f.name);
+        }
+        return;
       }
-      return;
     }
-  }
-});
+    // No image item: leave the event alone so xterm handles a normal text paste.
+  },
+  true,
+);
 
 function dragHasImage(dt: DataTransfer | null): boolean {
   if (!dt) return false;
