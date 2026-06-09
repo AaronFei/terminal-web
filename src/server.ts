@@ -487,6 +487,16 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
             sendJson(ws, { type: "info", message: "Restart failed." });
           }
         });
+      } else if (parsed.type === "kill") {
+        // Close-tab: kill the session for good (nothing is recreated).
+        execFile("tmux", ["kill-session", "-t", session], (err) => {
+          if (err) {
+            console.error(
+              `[ws] kill: kill-session "${session}" failed:`,
+              err.message
+            );
+          }
+        });
       } else if (parsed.type === "debug") {
         console.error(
           `[ime-debug] session=${session} event=${parsed.event} ` +

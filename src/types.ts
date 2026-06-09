@@ -26,6 +26,14 @@ export interface RestartMessage {
   type: "restart";
 }
 
+/**
+ * Client -> Server: kill this connection's tmux session for good (used when the
+ * user closes the tab). Unlike restart, nothing is recreated.
+ */
+export interface KillMessage {
+  type: "kill";
+}
+
 /** Server -> Client: reply to a PingMessage. */
 export interface PongMessage {
   type: "pong";
@@ -53,6 +61,7 @@ export type ClientMessage =
   | ResizeMessage
   | PingMessage
   | RestartMessage
+  | KillMessage
   | DebugMessage;
 
 /** Any JSON control message the server may send to a client. */
@@ -67,6 +76,7 @@ export function isClientMessage(value: unknown): value is ClientMessage {
   const v = value as Record<string, unknown>;
   if (v.type === "ping") return true;
   if (v.type === "restart") return true;
+  if (v.type === "kill") return true;
   if (v.type === "debug") return typeof v.event === "string";
   if (v.type === "resize") {
     return typeof v.cols === "number" && typeof v.rows === "number";

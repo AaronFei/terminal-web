@@ -150,7 +150,7 @@ function openHelp(): void {
     `<li><b>Paste</b> — click the terminal, then <b>${pasteKey}</b>. On a phone/tablet, tap <b>Paste</b> and paste into the box that appears.</li>` +
     '<li><b>Image</b> (for Claude Code etc.) — tap the image button, or paste / drag an image: it uploads and inserts the file path. Then press Enter.</li>' +
     '<li><b>Scroll</b> — mouse wheel or two-finger swipe scrolls the history.</li>' +
-    '<li><b>Tabs</b> — <b>+</b> new session, <b>×</b> closes a tab (the session keeps running), <b>⟳</b> restarts it fresh.</li>' +
+    '<li><b>Tabs</b> — <b>+</b> new session, <b>×</b> closes the tab and kills its session, <b>⟳</b> restarts the session fresh.</li>' +
     '</ul>' +
     '<div class="paste-row"><button class="tb-btn" type="button" data-help-close>Got it</button></div>';
   overlay.append(box);
@@ -411,6 +411,13 @@ class Session {
     }
   }
 
+  // Ask the server to kill this tmux session for good (used on tab close).
+  kill(): void {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: 'kill' }));
+    }
+  }
+
   private startPing(): void {
     this.stopPing();
     this.pingTimer = setInterval(() => {
@@ -543,7 +550,7 @@ function buildTab(s: Session): void {
   const close = document.createElement('span');
   close.className = 'tab-close';
   close.textContent = '×';
-  close.title = 'Close tab';
+  close.title = 'Close tab & kill session';
   tab.append(dot, label, close);
 
   tab.addEventListener('pointerdown', (e) => {
@@ -587,8 +594,8 @@ function activateSession(s: Session): void {
 function closeSession(s: Session): void {
   const idx = sessions.indexOf(s);
   if (idx < 0) return;
-  // Closing a tab only detaches: the tmux session keeps running server-side and
-  // resumes if you reopen the same name. (Use ⟳ Restart to discard a session.)
+  // Closing a tab kills its tmux session for good (its programs are terminated).
+  s.kill();
   sessions.splice(idx, 1);
   s.tabEl?.remove();
   s.dispose();
