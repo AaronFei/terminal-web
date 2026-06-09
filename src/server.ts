@@ -20,9 +20,22 @@ import { isClientMessage } from "./types.js";
 
 const config = loadConfig();
 
+// Short hostname of the machine running this server, used to label the page
+// title so several hosts open in different tabs are easy to tell apart. Strip
+// any DNS domain suffix (e.g. "nuc.local" -> "nuc").
+const HOST_LABEL = os.hostname().replace(/\..*$/, "") || os.hostname();
+
 // ---------------------------------------------------------------------------
 // Static file serving
 // ---------------------------------------------------------------------------
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
 
 const CONTENT_TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -71,6 +84,37 @@ function resolveStaticPath(pathname: string): string | null {
   return target;
 }
 
+/**
+ * Serve index.html with the machine's hostname injected into <title>, so each
+ * host shows up as a distinct browser tab. The file is tiny, so reading it per
+ * request is fine (responses are no-cache anyway).
+ */
+async function serveIndexHtml(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  filePath: string
+): Promise<void> {
+  let html: string;
+  try {
+    html = await fsp.readFile(filePath, "utf8");
+  } catch {
+    res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("Not Found");
+    return;
+  }
+
+  const title = `${escapeHtml(HOST_LABEL)} · terminal-web`;
+  html = html.replace(/<title>[^<]*<\/title>/i, `<title>${title}</title>`);
+
+  const body = Buffer.from(html, "utf8");
+  res.writeHead(200, {
+    "Content-Type": "text/html; charset=utf-8",
+    "Content-Length": body.length,
+    "Cache-Control": "no-cache",
+  });
+  res.end(req.method === "HEAD" ? undefined : body);
+}
+
 async function serveStatic(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -85,6 +129,11 @@ async function serveStatic(
   if (!filePath) {
     res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
     res.end("Not Found");
+    return;
+  }
+
+  if (pathname === "/" || pathname === "/index.html") {
+    await serveIndexHtml(req, res, filePath);
     return;
   }
 
