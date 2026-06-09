@@ -135,7 +135,7 @@ function openPasteBox(): void {
   });
 }
 
-// Quick help overlay: how to copy / paste / attach images. Shown from the "?"
+// Quick help overlay: how to copy / paste / attach files. Shown from the "?"
 // button and once automatically on first visit.
 function openHelp(): void {
   if (document.querySelector('.help-overlay')) return;
@@ -147,11 +147,11 @@ function openHelp(): void {
   const box = document.createElement('div');
   box.className = 'paste-box help-box';
   box.innerHTML =
-    '<div class="help-title">How to copy / paste / images</div>' +
+    '<div class="help-title">How to copy / paste / files</div>' +
     '<ul class="help-list">' +
     `<li><b>Copy</b> — hold <b>${selKey}</b> and drag to select; it copies automatically. (Or select, then tap <b>Copy</b>.)</li>` +
     `<li><b>Paste</b> — click the terminal, then <b>${pasteKey}</b>. On a phone/tablet, tap <b>Paste</b> and paste into the box that appears.</li>` +
-    '<li><b>Image</b> (for Claude Code etc.) — tap the image button, or paste / drag an image: it uploads and inserts the file path. Then press Enter.</li>' +
+    '<li><b>Attach a file</b> (for Claude Code etc.) — tap the 📎 button, or paste / drag any file (image, PDF, text…): it uploads and inserts the file path. Then press Enter.</li>' +
     '<li><b>Scroll</b> — mouse wheel or two-finger swipe scrolls the history.</li>' +
     '<li><b>Tabs</b> — <b>+</b> new session, <b>×</b> closes the tab and kills its session, <b>⟳</b> restarts the session fresh.</li>' +
     '</ul>' +
@@ -790,40 +790,38 @@ makeButton(controlsEl, 'tb-btn tb-icon', '⟳', 'Restart this session', () => {
   activeSession?.focus();
 });
 
-// Reliable image attach for every platform (incl. iPad) and over plain HTTP —
-// no clipboard needed: pick/take a photo, it uploads and the path is inserted.
-const imageInput = document.createElement('input');
-imageInput.type = 'file';
-imageInput.accept = 'image/*';
-imageInput.multiple = true;
-imageInput.style.display = 'none';
-document.body.append(imageInput);
-imageInput.addEventListener('change', () => {
-  if (imageInput.files) {
-    for (const f of Array.from(imageInput.files)) void uploadImage(f, f.name);
+// Reliable file attach for every platform (incl. iPad) and over plain HTTP —
+// no clipboard needed: pick any file(s), each uploads and its path is inserted.
+const fileInput = document.createElement('input');
+fileInput.type = 'file';
+fileInput.multiple = true;
+fileInput.style.display = 'none';
+document.body.append(fileInput);
+fileInput.addEventListener('change', () => {
+  if (fileInput.files) {
+    for (const f of Array.from(fileInput.files)) void uploadFile(f, f.name);
   }
-  imageInput.value = '';
+  fileInput.value = '';
 });
-// Monochrome line icon (matches the other glyphs; uses currentColor).
-const imgBtn = document.createElement('button');
-imgBtn.className = 'tb-btn tb-icon';
-imgBtn.type = 'button';
-imgBtn.title = 'Attach an image (upload + insert path)';
-imgBtn.setAttribute('aria-label', 'Attach an image');
-imgBtn.innerHTML =
+// Monochrome paperclip icon (matches the other glyphs; uses currentColor).
+const fileBtn = document.createElement('button');
+fileBtn.className = 'tb-btn tb-icon';
+fileBtn.type = 'button';
+fileBtn.title = 'Attach a file (upload + insert path)';
+fileBtn.setAttribute('aria-label', 'Attach a file');
+fileBtn.innerHTML =
   '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" ' +
   'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
-  '<rect x="3" y="3" width="18" height="18" rx="2"></rect>' +
-  '<circle cx="8.5" cy="8.5" r="1.5"></circle>' +
-  '<path d="M21 15l-5-5L5 21"></path></svg>';
-imgBtn.addEventListener('pointerdown', (e) => {
+  '<path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 ' +
+  '5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>';
+fileBtn.addEventListener('pointerdown', (e) => {
   e.preventDefault();
-  imageInput.click();
+  fileInput.click();
 });
-controlsEl.append(imgBtn);
+controlsEl.append(fileBtn);
 
 makeButton(controlsEl, 'tb-btn tb-icon', '⤢', 'Toggle fullscreen', toggleFullscreen);
-makeButton(controlsEl, 'tb-btn tb-icon', '?', 'Help: copy / paste / images', openHelp);
+makeButton(controlsEl, 'tb-btn tb-icon', '?', 'Help: copy / paste / files', openHelp);
 
 // --- on-screen key bar (sends to the active session) -----------------------
 interface KeyDef {
@@ -940,8 +938,9 @@ window.addEventListener('beforeunload', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Image paste / drag-drop -> upload -> insert the saved path into the active
-// session, so the program running there (e.g. Claude Code) can read the image.
+// File paste / drag-drop / picker -> upload -> insert the saved path into the
+// active session, so the program running there (e.g. Claude Code) can read it.
+// Any file type works, not just images.
 // ---------------------------------------------------------------------------
 function flashStatus(text: string, ms: number): void {
   showStatus(text);
@@ -950,16 +949,20 @@ function flashStatus(text: string, ms: number): void {
   }, ms);
 }
 
-async function uploadImage(file: Blob, name?: string): Promise<void> {
-  if (!file || !file.type.startsWith('image/')) return;
-  showStatus('uploading image…');
+async function uploadFile(file: Blob, name?: string): Promise<void> {
+  if (!file) return;
+  showStatus('uploading file…');
   try {
     const res = await fetch(
       '/upload' + (name ? `?name=${encodeURIComponent(name)}` : ''),
-      { method: 'POST', headers: { 'Content-Type': file.type }, body: file },
+      {
+        method: 'POST',
+        headers: { 'Content-Type': file.type || 'application/octet-stream' },
+        body: file,
+      },
     );
     if (!res.ok) {
-      flashStatus('image upload failed', 2500);
+      flashStatus('file upload failed', 2500);
       return;
     }
     const data = (await res.json()) as { path?: string };
@@ -972,47 +975,46 @@ async function uploadImage(file: Blob, name?: string): Promise<void> {
       activeSession.sendSeq(p + ' ');
       activeSession.focus();
     }
-    flashStatus(`image added: ${data.path ?? ''}`, 2500);
+    flashStatus(`file added: ${data.path ?? ''}`, 2500);
   } catch {
-    flashStatus('image upload failed', 2500);
+    flashStatus('file upload failed', 2500);
   }
 }
 
 // Capture phase: xterm's own paste handler calls stopPropagation() on its
 // textarea/element, so a bubble-phase listener would never see pastes made into
-// the focused terminal. Capturing lets us intercept image pastes first.
+// the focused terminal. Capturing lets us intercept file pastes first. Any file
+// kind is uploaded; plain-text pastes fall through to xterm untouched.
 window.addEventListener(
   'paste',
   (e: ClipboardEvent) => {
     const items = e.clipboardData?.items;
     if (!items) return;
+    const files: File[] = [];
     for (let i = 0; i < items.length; i += 1) {
-      const it = items[i];
-      if (it.kind === 'file' && it.type.startsWith('image/')) {
-        const f = it.getAsFile();
-        if (f) {
-          e.preventDefault();
-          e.stopImmediatePropagation(); // don't let xterm also handle it
-          void uploadImage(f, f.name);
-        }
-        return;
+      if (items[i].kind === 'file') {
+        const f = items[i].getAsFile();
+        if (f) files.push(f);
       }
     }
-    // No image item: leave the event alone so xterm handles a normal text paste.
+    if (files.length === 0) return; // no file: let xterm handle a text paste
+    e.preventDefault();
+    e.stopImmediatePropagation(); // don't let xterm also handle it
+    for (const f of files) void uploadFile(f, f.name);
   },
   true,
 );
 
-function dragHasImage(dt: DataTransfer | null): boolean {
+function dragHasFile(dt: DataTransfer | null): boolean {
   if (!dt) return false;
   for (let i = 0; i < dt.items.length; i += 1) {
-    if (dt.items[i].type.startsWith('image/')) return true;
+    if (dt.items[i].kind === 'file') return true;
   }
   return false;
 }
 
 termArea.addEventListener('dragover', (e) => {
-  if (!dragHasImage(e.dataTransfer)) return;
+  if (!dragHasFile(e.dataTransfer)) return;
   e.preventDefault();
   if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
   termArea.classList.add('dragging');
@@ -1022,10 +1024,8 @@ termArea.addEventListener('drop', (e) => {
   termArea.classList.remove('dragging');
   const files = e.dataTransfer?.files;
   if (!files || files.length === 0) return;
-  const imgs = Array.from(files).filter((f) => f.type.startsWith('image/'));
-  if (imgs.length === 0) return;
   e.preventDefault();
-  for (const f of imgs) void uploadImage(f, f.name);
+  for (const f of Array.from(files)) void uploadFile(f, f.name);
 });
 
 // ---------------------------------------------------------------------------

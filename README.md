@@ -21,7 +21,7 @@ the address gets a full shell. See [Security](#security).
 - **Multi-session tabs** — open (`+`), close-and-kill (`×`), restart (`⟳`)
 - **On-screen keys** for iPad/touch — arrows, Esc/Tab/sticky Ctrl·Alt, Copy/Paste
 - **Copy & paste** that works over plain HTTP (no HTTPS required)
-- **Attach images** (button / paste / drag) → upload → insert path, for **Claude
+- **Attach any file** (button / paste / drag) → upload → insert path, for **Claude
   Code** and other AI CLIs
 - Font size, fullscreen, IME (CJK) input, and a `?` help overlay
 - Runs over **Tailscale** or any **LAN/intranet** IP
@@ -276,7 +276,7 @@ adds two bars:
 
 - **Top bar** — session **tabs** on the left (see below) and controls on the
   right: `A−`/`A+` (font size, persisted), `⌨` (toggle the key bar), `⟳`
-  (restart the session), an **image** button (attach an image), `⤢`
+  (restart the session), a **📎 attach** button (attach any file), `⤢`
   (fullscreen), and `?` (a help overlay — also shown once on first visit).
 - **Bottom key bar** — `Copy Paste Esc Tab Ctrl Alt ← ↑ ↓ → Home End PgUp PgDn
   ^C | ~ / -`, horizontally scrollable. `Ctrl` and `Alt` are **sticky**: tap to
@@ -349,36 +349,39 @@ your shell instead, e.g. `HOST=100.x.y.z PORT=8090 npm start`.
 | `PORT`            | `8090`                                               | Port the HTTP/WebSocket server listens on.                                  |
 | `HOST`            | Tailscale IPv4 (`tailscale ip -4`), else `0.0.0.0`   | Address to bind. Set explicitly to pin a specific interface/IP.             |
 | `DEFAULT_SESSION` | `web`                                                | tmux session name used when the client doesn't pass `?session=NAME`.        |
-| `UPLOAD_DIR`      | `~/terminal-web-uploads`                             | Where pasted/dropped images are saved (see below).                          |
+| `UPLOAD_DIR`      | `~/terminal-web-uploads`                             | Where pasted/dropped/attached files are saved (see below).                  |
 | `UPLOAD_RETENTION_HOURS` | `72`                                          | Auto-delete uploads older than this (0 = never by age).                     |
 | `UPLOAD_MAX_FILES` | `100`                                               | Keep at most this many uploads, newest first (0 = unlimited).               |
+| `UPLOAD_MAX_MB`   | `25`                                                 | Reject any single upload larger than this many MB (0 = no limit).           |
 
 ---
 
-## Pasting images (for Claude Code & other AI CLIs)
+## Attaching files (for Claude Code & other AI CLIs)
 
-A terminal is a text stream, so you can't paste pixels into it. Instead there
-are three ways to attach an image; each uploads it to the server (`POST
-/upload`), which saves it under `UPLOAD_DIR` (default `~/terminal-web-uploads`)
-and returns the path, and the page then **types that absolute path at the
-prompt**:
+A terminal is a text stream, so you can't paste a file into it directly.
+Instead there are three ways to attach **any file** (image, PDF, text, …); each
+uploads it to the server (`POST /upload`), which saves it under `UPLOAD_DIR`
+(default `~/terminal-web-uploads`) and returns the path, and the page then
+**types that absolute path at the prompt**:
 
-- The **image button** in the top bar — pick a file or take a photo. This is
-  the most reliable everywhere (incl. iPad) and over plain HTTP.
-- **Paste** an image (Cmd/Ctrl-V) into the terminal.
-- **Drag-drop** an image file onto the terminal.
+- The **📎 attach button** in the top bar — pick one or more files. This is the
+  most reliable everywhere (incl. iPad) and over plain HTTP.
+- **Paste** a file (Cmd/Ctrl-V) into the terminal.
+- **Drag-drop** file(s) onto the terminal.
 
-So to show an image to Claude Code (or any CLI that reads image paths): attach
-it, then press Enter — Claude Code picks up the inserted path and reads the
-image. Images are capped at 25 MB and saved `0600`.
+The saved file keeps its original name and extension (sanitized, with a
+`clip-<timestamp>-` prefix). So to hand a file to Claude Code (or any CLI that
+reads a path): attach it, then press Enter — the CLI picks up the inserted path
+and reads the file. Uploads are capped at `UPLOAD_MAX_MB` (default 25 MB) and
+saved `0600`.
 
 To stop the folder growing forever, uploads are auto-pruned on boot and after
 each upload: files older than `UPLOAD_RETENTION_HOURS` (default 72h) are
 deleted, then only the newest `UPLOAD_MAX_FILES` (default 100) are kept. Only
-`clip-*` image files are touched. Set either to `0` to disable that limit.
+our own `clip-*` files are touched. Set either to `0` to disable that limit.
 
 > The upload endpoint has no auth beyond the tailnet, same as the terminal —
-> anyone on your tailnet can POST an image into `UPLOAD_DIR`.
+> anyone on your tailnet can POST a file into `UPLOAD_DIR`.
 
 ---
 

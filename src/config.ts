@@ -21,12 +21,14 @@ export interface Config {
   tmuxConfPath: string;
   /** Absolute path to the public/ directory (static root). */
   publicDir: string;
-  /** Directory where pasted/dropped images are saved (POST /upload). */
+  /** Directory where pasted/dropped/attached files are saved (POST /upload). */
   uploadDir: string;
-  /** Delete uploaded images older than this many hours (0 = never by age). */
+  /** Delete uploaded files older than this many hours (0 = never by age). */
   uploadRetentionHours: number;
-  /** Keep at most this many uploaded images (0 = unlimited). */
+  /** Keep at most this many uploaded files (0 = unlimited). */
   uploadMaxFiles: number;
+  /** Reject uploads larger than this many bytes. */
+  uploadMaxBytes: number;
   /** Detected Tailscale IPv4 address, if any (for nicer startup logging). */
   tailscaleIp: string | null;
 }
@@ -115,6 +117,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     uploadDir,
     uploadRetentionHours: parseNonNegInt(env.UPLOAD_RETENTION_HOURS, 72),
     uploadMaxFiles: parseNonNegInt(env.UPLOAD_MAX_FILES, 100),
+    uploadMaxBytes: parseNonNegInt(env.UPLOAD_MAX_MB, 25) * 1024 * 1024,
     tailscaleIp,
   };
 }

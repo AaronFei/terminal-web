@@ -175,12 +175,15 @@ async function serveStatic(
 }
 
 // ---------------------------------------------------------------------------
-// Image upload (POST /upload): save a pasted/dropped image to a file so the
-// program in the terminal (e.g. Claude Code) can read it by path. The client
-// sends the raw image bytes as the body with the image's Content-Type.
+// File upload (POST /upload): save a pasted/dropped/attached file to disk so
+// the program in the terminal (e.g. Claude Code) can read it by path. The
+// client sends the raw bytes as the body, the file's Content-Type as a header,
+// and the original filename as ?name= so we can preserve its extension/name.
+// Any file type is accepted — not just images.
 // ---------------------------------------------------------------------------
-const MAX_UPLOAD_BYTES = 25 * 1024 * 1024; // 25 MB
 
+// Fallback extensions for common image types, used only when the client sends
+// no usable filename (e.g. a clipboard image paste has no name).
 const IMAGE_EXT: Record<string, string> = {
   "image/png": ".png",
   "image/jpeg": ".jpg",
@@ -192,6 +195,25 @@ const IMAGE_EXT: Record<string, string> = {
   "image/heif": ".heif",
   "image/tiff": ".tiff",
 };
+
+/**
+ * Reduce a client-supplied filename to a safe basename for our upload dir:
+ * strip any directory components, collapse anything outside [A-Za-z0-9._-] to
+ * "_", drop leading dots (no hidden/".." names), and bound the length while
+ * keeping the extension. Returns null if nothing usable remains.
+ */
+function safeUploadBaseName(raw: string | null): string | null {
+  if (!raw) return null;
+  let base = raw.replace(/\\/g, "/");
+  base = base.slice(base.lastIndexOf("/") + 1); // basename only
+  base = base.replace(/[^A-Za-z0-9._-]+/g, "_"); // collapse unsafe chars (incl. spaces)
+  base = base.replace(/^[.]+/, ""); // never start with a dot
+  if (base.length > 96) {
+    const ext = path.extname(base).slice(0, 16);
+    base = base.slice(0, 96 - ext.length) + ext;
+  }
+  return base.length ? base : null;
+}
 
 function sendJsonHttp(
   res: http.ServerResponse,
@@ -206,10 +228,12 @@ function sendJsonHttp(
   res.end(text);
 }
 
-const UPLOAD_NAME_RE = /^clip-.*\.(png|jpe?g|gif|webp|bmp|svg|heic|heif|tiff)$/i;
+// Matches the files we generate (clip-<ISO-stamp>-<rand>...), regardless of the
+// original name/extension appended after, so pruning only ever touches ours.
+const UPLOAD_NAME_RE = /^clip-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}-[a-z0-9]/i;
 
 /**
- * Keep the upload directory bounded: delete our `clip-*` images older than
+ * Keep the upload directory bounded: delete our `clip-*` files older than
  * uploadRetentionHours, then keep only the newest uploadMaxFiles. Only touches
  * files matching our own naming pattern. Never throws.
  */
@@ -257,26 +281,29 @@ async function pruneUploads(): Promise<void> {
 
 async function handleUpload(
   req: http.IncomingMessage,
-  res: http.ServerResponse
+  res: http.ServerResponse,
+  nameParam: string | null
 ): Promise<void> {
   const ctype = (req.headers["content-type"] ?? "")
     .split(";")[0]
     .trim()
     .toLowerCase();
-  const ext = IMAGE_EXT[ctype];
-  if (!ext) {
-    sendJsonHttp(res, 415, { error: `unsupported content-type: ${ctype}` });
-    return;
-  }
 
+  // Any file type is allowed. Prefer the original (sanitized) filename so the
+  // saved file keeps its name and extension; fall back to a content-type ext
+  // (mainly for clipboard image pastes, which carry no name), then ".bin".
+  const safeName = safeUploadBaseName(nameParam);
+
+  const maxBytes = config.uploadMaxBytes;
   const chunks: Buffer[] = [];
   let size = 0;
   try {
     for await (const chunk of req) {
       const buf = chunk as Buffer;
       size += buf.length;
-      if (size > MAX_UPLOAD_BYTES) {
-        sendJsonHttp(res, 413, { error: "file too large (max 25 MB)" });
+      if (maxBytes > 0 && size > maxBytes) {
+        const mb = Math.round(maxBytes / (1024 * 1024));
+        sendJsonHttp(res, 413, { error: `file too large (max ${mb} MB)` });
         req.destroy();
         return;
       }
@@ -300,8 +327,9 @@ async function handleUpload(
       .replace(/[:]/g, "-")
       .replace(/\..+$/, "")
       .replace("T", "_");
-    const rand = Math.random().toString(36).slice(2, 8);
-    const filename = `clip-${stamp}-${rand}${ext}`;
+    const rand = Math.random().toString(36).slice(2, 8) || "x";
+    const suffix = safeName ? `-${safeName}` : IMAGE_EXT[ctype] ?? ".bin";
+    const filename = `clip-${stamp}-${rand}${suffix}`;
     const filePath = path.join(config.uploadDir, filename);
     await fsp.writeFile(filePath, Buffer.concat(chunks), { mode: 0o600 });
     console.log(`[upload] saved ${filePath} (${size} bytes)`);
@@ -330,7 +358,7 @@ const server = http.createServer((req, res) => {
       const method = req.method ?? "GET";
 
       if (method === "POST" && requestUrl.pathname === "/upload") {
-        await handleUpload(req, res);
+        await handleUpload(req, res, requestUrl.searchParams.get("name"));
         return;
       }
 
