@@ -1,7 +1,7 @@
 # terminal-web
 
 A web-based terminal: open a browser tab, get a real shell. The shell runs
-inside a **tmux** session, so closing the tab (or losing your network) just
+inside a **tmux** session, so closing the window (or losing your network) just
 detaches — your programs keep running and reattach when you come back.
 
 Built with [xterm.js](https://xtermjs.org/) on the front end and a small
@@ -11,6 +11,19 @@ Node.js + TypeScript server using [`ws`](https://github.com/websockets/ws) and
 It's designed to live on your **Tailnet**: the server binds to your Tailscale
 IP and there is **no application-level authentication** — anyone who can reach
 the address gets a full shell. See [Security](#security).
+
+**Features**
+
+- **Resumable** sessions (tmux) — survive disconnect, refresh and sleep
+- Deep **scrollback** (mouse-wheel)
+- **Multi-session tabs** — open (`+`), close-and-kill (`×`), restart (`⟳`)
+- **On-screen keys** for iPad/touch — arrows, Esc/Tab/sticky Ctrl·Alt, Copy/Paste
+- **Copy & paste** that works over plain HTTP (no HTTPS required)
+- **Attach images** (button / paste / drag) → upload → insert path, for **Claude
+  Code** and other AI CLIs
+- Font size, fullscreen, IME (CJK) input, and a `?` help overlay
+- Runs over **Tailscale** or any **LAN/intranet** IP
+- Optional **background service** (launchd on macOS, systemd on Linux)
 
 ---
 
@@ -40,7 +53,8 @@ the address gets a full shell. See [Security](#security).
 - The browser streams keystrokes to the server as **binary** WebSocket frames;
   the server writes them straight to the pty.
 - The pty's output is streamed back as **binary** frames; xterm renders it.
-- **Text** frames carry JSON control messages (`resize`, `ping`/`pong`).
+- **Text** frames carry JSON control messages: `resize`, `ping`/`pong`,
+  `restart` and `kill` (session control), and an optional `debug` trace.
 - The pty runs `tmux new-session -A -s NAME`, so the same named session is
   reused (or created) on every connect. The tmux server outlives the pty.
 
@@ -197,13 +211,17 @@ The pty doesn't run your shell directly — it runs
 `tmux new-session -A -s NAME` (with `-A` meaning "attach if it exists, else
 create"). So:
 
-- **Disconnecting** (closing the tab, sleeping the laptop, dropping Wi-Fi)
-  closes the WebSocket. The server kills the pty, which only **detaches** the
-  tmux client. The tmux *server* and your session — including every running
-  program — keep going.
+- **Disconnecting** — closing the *browser* tab/window, refreshing, sleeping
+  the laptop, or dropping Wi-Fi — closes the WebSocket. The server kills the
+  pty, which only **detaches** the tmux client. The tmux *server* and your
+  session (every running program) keep going.
 - **Reconnecting** opens a new WebSocket, spawns a new pty, and re-attaches to
   the same named session. tmux repaints the screen and you're back where you
   left off.
+
+> Closing a **tab inside the app** (the `×`) is different: it *kills* that tmux
+> session for good. So to keep a job running, just close the window or let the
+> connection drop — don't press `×`. See [Sessions & tabs](#sessions--tabs).
 
 The front end intentionally does **not** reset the terminal on reconnect, so
 your local xterm scrollback is preserved and tmux's repaint lands cleanly. A
@@ -234,13 +252,15 @@ owns the authoritative history (important after a reattach).
 iPad/phone soft keyboards lack arrow keys, Esc, Tab, and modifiers, so the page
 adds two bars:
 
-- **Top control bar** — a connection dot + the session name, plus buttons:
-  `A−`/`A+` (font size, persisted), `⌨ Keys` (toggle the key bar), and `⤢`
-  (fullscreen).
-- **Bottom key bar** — `Esc Tab Ctrl Alt ← ↑ ↓ → Home End PgUp PgDn ^C | ~ / -`,
-  horizontally scrollable. `Ctrl` and `Alt` are **sticky**: tap to arm them (they
-  highlight), then the next key is sent with that modifier — e.g. `Ctrl` then `c`
-  sends `Ctrl-C`; `Ctrl`/`Alt` + an arrow sends the xterm modified sequence.
+- **Top bar** — session **tabs** on the left (see below) and controls on the
+  right: `A−`/`A+` (font size, persisted), `⌨` (toggle the key bar), `⟳`
+  (restart the session), an **image** button (attach an image), `⤢`
+  (fullscreen), and `?` (a help overlay — also shown once on first visit).
+- **Bottom key bar** — `Copy Paste Esc Tab Ctrl Alt ← ↑ ↓ → Home End PgUp PgDn
+  ^C | ~ / -`, horizontally scrollable. `Ctrl` and `Alt` are **sticky**: tap to
+  arm them (they highlight), then the next key is sent with that modifier — e.g.
+  `Ctrl` then `c` sends `Ctrl-C`; `Ctrl`/`Alt` + an arrow sends the xterm
+  modified sequence.
 
 The key bar shows by default on touch devices and is hidden on desktop; your
 choice is remembered (localStorage). Tapping a key keeps focus on the terminal
@@ -249,19 +269,49 @@ so the soft keyboard stays up, and the bar lifts above the iOS keyboard via the
 
 ---
 
-## Switching sessions
+## Sessions & tabs
 
-Each tmux session is independent. Pick one with the `session` query parameter:
+Each tmux session is independent, and the top bar shows one **tab** per open
+session (with a live connection dot). 
+
+- **`+`** opens a new session (you're prompted for a name).
+- **`×`** closes the tab **and kills that tmux session for good** (its programs
+  are terminated). This is *not* the same as disconnecting — see
+  [How resume works](#how-resume-works).
+- **`⟳`** restarts the active session: kills it and reconnects into a fresh one.
+- Open tabs and the active tab are remembered (localStorage) and restored on
+  reload.
+
+You can also pick the session for a fresh page with the `session` query
+parameter (handy for bookmarks/links):
 
 ```
 http://<host>:<port>/?session=work
-http://<host>:<port>/?session=scratch
 ```
 
 Without `?session=`, the default (`DEFAULT_SESSION`, default `web`) is used.
 Names are sanitized to `[A-Za-z0-9_-]{1,64}`; anything invalid falls back to
-`web`. Open different sessions in different tabs to run independent shells that
-all survive disconnects.
+`web`.
+
+---
+
+## Copy, paste & clipboard
+
+The browser Clipboard **API** needs a *secure context* (HTTPS or
+`http://localhost`), so over a plain `http://<ip>` URL it's blocked. This app
+works around that so you don't strictly need HTTPS:
+
+- **Select** — tmux mouse mode owns plain dragging, so hold **Option** (macOS)
+  or **Shift** (Windows/Linux) and drag to select. Selecting copies
+  automatically (via `execCommand`, which works over HTTP), or tap **Copy**.
+- **Paste** — on a desktop, click the terminal and press **⌘V** /
+  **Ctrl+Shift+V** (the native paste works over HTTP). On touch/HTTP, tap
+  **Paste** in the key bar: a small box pops up, you paste into it, and it's
+  sent to the terminal.
+- On HTTPS (e.g. `tailscale serve`) the Clipboard API is unlocked and the
+  Copy/Paste buttons work directly everywhere, including iPad.
+
+The `?` help overlay summarizes these (with the right keys for your OS).
 
 ---
 
@@ -285,15 +335,20 @@ your shell instead, e.g. `HOST=100.x.y.z PORT=8090 npm start`.
 
 ## Pasting images (for Claude Code & other AI CLIs)
 
-A terminal is a text stream, so you can't paste pixels into it. Instead, when
-you **paste** an image (Cmd/Ctrl-V) or **drag-drop** an image file onto the
-terminal, the browser uploads it to the server (`POST /upload`), which saves it
-under `UPLOAD_DIR` (default `~/terminal-web-uploads`) and returns the path. The
-page then **types that absolute path at the prompt**.
+A terminal is a text stream, so you can't paste pixels into it. Instead there
+are three ways to attach an image; each uploads it to the server (`POST
+/upload`), which saves it under `UPLOAD_DIR` (default `~/terminal-web-uploads`)
+and returns the path, and the page then **types that absolute path at the
+prompt**:
 
-So to show an image to Claude Code (or any CLI that reads image paths): paste
-the image, then press Enter — Claude Code picks up the inserted path and reads
-the image. Images are capped at 25 MB and saved `0600`.
+- The **image button** in the top bar — pick a file or take a photo. This is
+  the most reliable everywhere (incl. iPad) and over plain HTTP.
+- **Paste** an image (Cmd/Ctrl-V) into the terminal.
+- **Drag-drop** an image file onto the terminal.
+
+So to show an image to Claude Code (or any CLI that reads image paths): attach
+it, then press Enter — Claude Code picks up the inserted path and reads the
+image. Images are capped at 25 MB and saved `0600`.
 
 To stop the folder growing forever, uploads are auto-pruned on boot and after
 each upload: files older than `UPLOAD_RETENTION_HOURS` (default 72h) are
@@ -315,11 +370,11 @@ bound address gets an interactive shell as the user running the server.
   internet. Avoid binding to `0.0.0.0` on untrusted networks.
 - Lock it down further with **Tailscale ACLs** so only specific devices/users
   on your tailnet can reach the port.
-- The server speaks **plain HTTP** (no TLS). Because it's not a secure context,
-  the browser **`navigator.clipboard` API may be unavailable or limited** —
-  copy/paste falls back to tmux's own copy-mode and your terminal's native
-  selection. (Tailscale can provide HTTPS via `tailscale serve` if you want a
-  secure context; that's outside this project's scope.)
+- The server speaks **plain HTTP** (no TLS), which isn't a *secure context*, so
+  the browser's `navigator.clipboard` API is blocked. Copy/paste still works via
+  fallbacks — see [Copy, paste & clipboard](#copy-paste--clipboard). For the
+  native clipboard (and HTTPS), put it behind a TLS proxy such as
+  `tailscale serve`.
 
 Treat exposing this as equivalent to handing out SSH access.
 
