@@ -20,6 +20,9 @@ const IME_DEDUP_MS = 300;
 
 const params = new URLSearchParams(window.location.search);
 const IME_DEBUG = (params.get('debug') ?? '').includes('ime');
+// WebGL renderer is on by default; ?webgl=0 (or ?nowebgl) falls back to the DOM
+// renderer — useful for flaky GPUs or headless capture.
+const WEBGL_ENABLED = params.get('webgl') !== '0' && !params.has('nowebgl');
 
 const encoder = new TextEncoder();
 
@@ -283,12 +286,14 @@ class Session {
     termArea.append(this.el);
     this.term.open(this.el);
 
-    try {
-      const webgl = new WebglAddon();
-      webgl.onContextLoss(() => webgl.dispose());
-      this.term.loadAddon(webgl);
-    } catch {
-      /* fall back to canvas/DOM renderer */
+    if (WEBGL_ENABLED) {
+      try {
+        const webgl = new WebglAddon();
+        webgl.onContextLoss(() => webgl.dispose());
+        this.term.loadAddon(webgl);
+      } catch {
+        /* fall back to the DOM renderer */
+      }
     }
 
     // Copy the selection to the clipboard when a drag/touch selection ends.

@@ -4,6 +4,8 @@ A web-based terminal: open a browser tab, get a real shell. The shell runs
 inside a **tmux** session, so closing the window (or losing your network) just
 detaches — your programs keep running and reattach when you come back.
 
+![terminal-web — tabs, on-screen key bar, and a live shell](docs/screenshot.png)
+
 Built with [xterm.js](https://xtermjs.org/) on the front end and a small
 Node.js + TypeScript server using [`ws`](https://github.com/websockets/ws) and
 [`node-pty`](https://github.com/microsoft/node-pty) on the back end.
@@ -24,6 +26,26 @@ the address gets a full shell. See [Security](#security).
 - Font size, fullscreen, IME (CJK) input, and a `?` help overlay
 - Runs over **Tailscale** or any **LAN/intranet** IP
 - Optional **background service** (launchd on macOS, systemd on Linux)
+
+---
+
+## Quickstart
+
+```bash
+git clone git@github.com:AaronFei/terminal-web.git && cd terminal-web
+npm install      # needs Node 18+ and tmux (on Linux also: build-essential python3)
+npm run build
+bash scripts/start.sh           # binds your Tailscale IP and prints the URL
+# no Tailscale?  HOST=192.168.1.50 PORT=8090 npm start   (or HOST=0.0.0.0)
+```
+
+Open the printed `http://<host>:8090/`. Want it always-on (start at boot,
+restart on crash)? `bash scripts/service.sh install` (launchd on macOS, systemd
+on Linux). See [Run](#run) and [Without Tailscale](#without-tailscale-lan--intranet)
+for details.
+
+> ⚠️ No login/auth — anyone who can reach the URL gets a full shell. Keep it on
+> a network you trust. See [Security](#security).
 
 ---
 
@@ -410,6 +432,10 @@ port isn't blocked.
 Make sure the client bundle was built: `npm run build` (or use
 `scripts/start.sh`, which builds it automatically). Check the browser console
 for errors loading `/dist/terminal.js`.
+
+**Garbled glyphs / blank terminal on an old or virtual GPU**
+The WebGL renderer can misbehave on some GPUs. Append `?webgl=0` to the URL to
+fall back to the DOM renderer (e.g. `http://<host>:8090/?webgl=0`).
 
 ---
 
