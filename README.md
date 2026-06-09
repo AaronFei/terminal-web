@@ -53,8 +53,9 @@ project:
 
 - **Node.js 18+** (ESM, runs the server via `tsx`)
 - **tmux** — the session backend (`brew install tmux` on macOS)
-- **tailscale** — for Tailnet-only binding (optional but recommended;
-  `brew install tailscale` or the macOS app, then `tailscale up`)
+- **tailscale** — **optional**. Only used to auto-detect which IP to bind to.
+  Not installed? It's fine — set `HOST` yourself (see
+  [Without Tailscale](#without-tailscale-lan--intranet)).
 
 Development was done on macOS.
 
@@ -110,6 +111,32 @@ detects the Tailscale IP for `HOST` when `HOST` is unset, and logs the URLs it
 binds (highlighting the Tailscale one).
 
 Then open the printed URL, e.g. `http://100.x.y.z:8090/`.
+
+### Without Tailscale (LAN / intranet)
+
+Tailscale is **optional** — it's only used to auto-pick the bind address. From
+a clean clone the only hard requirements are **Node 18+** and **tmux**. Without
+tailscale, set `HOST` yourself:
+
+```bash
+git clone <repo> && cd terminal-web
+npm install
+npm run build
+
+# bind to a specific LAN/intranet IP...
+HOST=192.168.1.50 PORT=8090 npm start
+# ...or bind every interface (reachable on all of the host's IPs)
+HOST=0.0.0.0 PORT=8090 npm start
+```
+
+`scripts/start.sh` and `scripts/service.sh install` also work without tailscale
+— they just warn, then fall back to the `HOST` you set (or `0.0.0.0`). Open
+`http://<that-ip>:8090/` from any machine that can reach it.
+
+> **Security:** there is **no app-level auth** and traffic is plain HTTP —
+> anyone who can reach the bound `IP:port` gets a full shell. On a Tailnet that
+> is limited to your authorized devices; on a shared LAN it's everyone on that
+> segment. Only expose it on a network you trust (or put it behind a firewall).
 
 ### Development
 
