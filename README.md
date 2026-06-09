@@ -355,3 +355,9 @@ port isn't blocked.
 Make sure the client bundle was built: `npm run build` (or use
 `scripts/start.sh`, which builds it automatically). Check the browser console
 for errors loading `/dist/terminal.js`.
+
+---
+
+## License
+
+MIT © 2026 AaronFei. See [LICENSE](LICENSE).

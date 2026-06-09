@@ -4,6 +4,8 @@
   "private": true,
   "type": "module",
   "description": "A web-based terminal (xterm.js + node-pty) that runs your shell inside tmux for resumable sessions.",
+  "license": "MIT",
+  "author": "AaronFei",
   "engines": {
     "node": ">=18"
   },
