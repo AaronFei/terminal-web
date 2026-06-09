@@ -52,7 +52,10 @@ These are CLI prerequisites — they are **not** bundled or installed by this
 project:
 
 - **Node.js 18+** (ESM, runs the server via `tsx`)
-- **tmux** — the session backend (`brew install tmux` on macOS)
+- **tmux** — the session backend (`brew install tmux` on macOS,
+  `sudo apt install tmux` on Debian/Ubuntu)
+- **Linux only:** a C/C++ toolchain + Python 3 to build `node-pty`
+  (`sudo apt install -y build-essential python3`) — see [Install](#install)
 - **tailscale** — **optional**. Only used to auto-detect which IP to bind to.
   Not installed? It's fine — set `HOST` yourself (see
   [Without Tailscale](#without-tailscale-lan--intranet)).
@@ -67,10 +70,13 @@ Development was done on macOS.
 npm install
 ```
 
-> **Note:** `node-pty` is a native addon and **compiles on install**. You need
-> a working C/C++ toolchain. On macOS that means the Xcode Command Line Tools:
-> `xcode-select --install`. See [Troubleshooting](#troubleshooting) if the
-> build fails.
+> **Note:** `node-pty` is a native addon. It ships **prebuilt** binaries for
+> macOS and Windows, but on **Linux it compiles from source on install** — so
+> you need a C/C++ toolchain + Python 3
+> (`sudo apt install -y build-essential python3` on Debian/Ubuntu). On macOS,
+> if no prebuilt matches your Node version it also compiles, which needs the
+> Xcode Command Line Tools (`xcode-select --install`). See
+> [Troubleshooting](#troubleshooting) if install fails.
 
 ---
 
@@ -152,29 +158,36 @@ stop the script (Ctrl-C).
 
 ---
 
-## Running as a background service (launchd)
+## Running as a background service (launchd / systemd)
 
 To keep terminal-web running across logins and restarts (instead of a terminal
-window you have to leave open), install it as a per-user launchd agent:
+window you have to leave open), install it as a per-user service. The same
+helper auto-detects the platform — **launchd on macOS, systemd on Linux**:
 
 ```bash
-bash scripts/service.sh install     # write plist, load, start at login + on crash
-bash scripts/service.sh status      # show launchd state + an HTTP probe
-bash scripts/service.sh logs        # tail logs/launchd.{out,err}.log
+bash scripts/service.sh install     # write unit, load, start at login/boot + on crash
+bash scripts/service.sh status      # show state + an HTTP probe
+bash scripts/service.sh logs        # tail the service logs
 bash scripts/service.sh restart     # after changing server code
 bash scripts/service.sh uninstall   # stop and remove
 ```
 
-`install` writes `~/Library/LaunchAgents/com.aaronfei.terminal-web.plist`,
-pinning the node path, the repo path, and `HOST`/`PORT`. By default `HOST` is
-your Tailscale IPv4 (override with `HOST=… PORT=… bash scripts/service.sh
-install`). `KeepAlive` restarts the server if it exits; `ThrottleInterval`
-avoids a hot loop while Tailscale is still coming up at boot — binding to the
-Tailscale IP fails until the tailnet is up, then succeeds on the next retry.
+`install` pins the node path, the repo path, and `HOST`/`PORT` into the unit.
+By default `HOST` is your Tailscale IPv4, else `0.0.0.0` (override with
+`HOST=… PORT=… bash scripts/service.sh install`). The service auto-restarts if
+it exits, with a 10 s back-off so it doesn't hot-loop while the network (or
+Tailscale) is still coming up at boot.
 
-Logs go to `logs/launchd.out.log` / `logs/launchd.err.log`. After editing
-**server** code run `scripts/service.sh restart`; after editing **frontend**
-code run `npm run build` (the service serves the prebuilt bundle).
+- **macOS:** writes `~/Library/LaunchAgents/com.aaronfei.terminal-web.plist`;
+  logs to `logs/launchd.out.log` / `logs/launchd.err.log`.
+- **Linux:** writes `~/.config/systemd/user/terminal-web.service`, runs
+  `systemctl --user enable --now`, and tries `loginctl enable-linger` so it
+  survives logout / starts at boot (run `sudo loginctl enable-linger $USER`
+  yourself if it couldn't). Logs go to the journal
+  (`journalctl --user -u terminal-web -f`).
+
+After editing **server** code run `scripts/service.sh restart`; after editing
+**frontend** code run `npm run build` (the service serves the prebuilt bundle).
 
 ---
 

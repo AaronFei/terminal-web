@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Manage terminal-web as a per-user launchd service on macOS so it starts at
-# login and restarts on crash.
+# Manage terminal-web as a background service that starts on login/boot and
+# restarts on crash. Auto-detects the platform:
+#   - macOS  -> launchd  (~/Library/LaunchAgents/<label>.plist)
+#   - Linux  -> systemd  (~/.config/systemd/user/<unit>.service)
 #
 # Usage:
-#   bash scripts/service.sh install     # write the plist + load + start
-#   bash scripts/service.sh uninstall   # stop + unload + remove the plist
+#   bash scripts/service.sh install     # write unit + load + start
+#   bash scripts/service.sh uninstall   # stop + unload + remove
 #   bash scripts/service.sh restart     # restart the running service
-#   bash scripts/service.sh status      # show launchd state + a curl probe
+#   bash scripts/service.sh status      # show state + a curl probe
 #   bash scripts/service.sh logs        # tail the service logs
 #
 # Env overrides for `install`:
@@ -14,44 +16,50 @@
 #   PORT=<n>    listen port  (default: 8090)
 set -euo pipefail
 
-LABEL="com.aaronfei.terminal-web"
+LABEL="com.aaronfei.terminal-web" # macOS launchd label
+UNIT="terminal-web"               # Linux systemd unit name
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-PLIST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
-UID_NUM="$(id -u)"
-DOMAIN="gui/${UID_NUM}"
+OS="$(uname -s)"
 
 die() { echo "error: $*" >&2; exit 1; }
 
-cmd_install() {
+# --- shared: resolve node/tsx/host/port/path and build if needed -------------
+resolve_env() {
   command -v node >/dev/null 2>&1 || die "node not found on PATH"
-  command -v tmux >/dev/null 2>&1 || echo "warning: tmux not found; sessions will fail until installed" >&2
+  command -v tmux >/dev/null 2>&1 || \
+    echo "warning: tmux not found; sessions will fail until installed" >&2
 
-  local node_bin node_dir ts_dir tailscale_ip host port path_env tsx_cli
-  node_bin="$(command -v node)"
-  node_dir="$(dirname "${node_bin}")"
-  tsx_cli="${REPO_ROOT}/node_modules/tsx/dist/cli.mjs"
-  [ -f "${tsx_cli}" ] || die "tsx not installed — run 'npm install' first (${tsx_cli} missing)"
+  NODE_BIN="$(command -v node)"
+  NODE_DIR="$(dirname "${NODE_BIN}")"
+  TSX_CLI="${REPO_ROOT}/node_modules/tsx/dist/cli.mjs"
+  [ -f "${TSX_CLI}" ] || die "tsx not installed — run 'npm install' first (${TSX_CLI} missing)"
 
-  # Build the bundle if it's missing so the service can serve assets.
   [ -f "${REPO_ROOT}/public/dist/terminal.js" ] || (cd "${REPO_ROOT}" && npm run build)
 
-  tailscale_ip=""
+  TS_IP=""
   if command -v tailscale >/dev/null 2>&1; then
-    tailscale_ip="$(tailscale ip -4 2>/dev/null | head -1 || true)"
+    TS_IP="$(tailscale ip -4 2>/dev/null | head -1 || true)"
   fi
-  host="${HOST:-${tailscale_ip:-0.0.0.0}}"
-  port="${PORT:-8090}"
+  HOST_VAL="${HOST:-${TS_IP:-0.0.0.0}}"
+  PORT_VAL="${PORT:-8090}"
 
-  # PATH for launchd's minimal environment: node's dir, tailscale's dir, base.
-  ts_dir=""
-  if command -v tailscale >/dev/null 2>&1; then ts_dir="$(dirname "$(command -v tailscale)")"; fi
-  path_env="${node_dir}"
-  [ -n "${ts_dir}" ] && [ "${ts_dir}" != "${node_dir}" ] && path_env="${path_env}:${ts_dir}"
-  path_env="${path_env}:/usr/bin:/bin:/usr/sbin:/sbin"
+  TS_DIR=""
+  if command -v tailscale >/dev/null 2>&1; then TS_DIR="$(dirname "$(command -v tailscale)")"; fi
+  PATH_ENV="${NODE_DIR}"
+  [ -n "${TS_DIR}" ] && [ "${TS_DIR}" != "${NODE_DIR}" ] && PATH_ENV="${PATH_ENV}:${TS_DIR}"
+  PATH_ENV="${PATH_ENV}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-  mkdir -p "${REPO_ROOT}/logs" "${HOME}/Library/LaunchAgents"
+  mkdir -p "${REPO_ROOT}/logs"
+}
 
+# ============================ macOS / launchd ================================
+PLIST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
+mac_domain() { echo "gui/$(id -u)"; }
+
+mac_install() {
+  resolve_env
+  mkdir -p "${HOME}/Library/LaunchAgents"
   cat > "${PLIST}" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -61,8 +69,8 @@ cmd_install() {
     <string>${LABEL}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${node_bin}</string>
-        <string>${tsx_cli}</string>
+        <string>${NODE_BIN}</string>
+        <string>${TSX_CLI}</string>
         <string>${REPO_ROOT}/src/server.ts</string>
     </array>
     <key>WorkingDirectory</key>
@@ -70,11 +78,11 @@ cmd_install() {
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>${path_env}</string>
+        <string>${PATH_ENV}</string>
         <key>HOST</key>
-        <string>${host}</string>
+        <string>${HOST_VAL}</string>
         <key>PORT</key>
-        <string>${port}</string>
+        <string>${PORT_VAL}</string>
         <key>DEFAULT_SESSION</key>
         <string>web</string>
     </dict>
@@ -91,48 +99,124 @@ cmd_install() {
 </dict>
 </plist>
 PLIST
-
-  launchctl bootout "${DOMAIN}/${LABEL}" 2>/dev/null || true
-  launchctl bootstrap "${DOMAIN}" "${PLIST}"
-  launchctl kickstart -k "${DOMAIN}/${LABEL}"
-  echo "installed and started: ${LABEL}"
-  echo "  bound to http://${host}:${port}/"
-  echo "  plist:   ${PLIST}"
+  local dom; dom="$(mac_domain)"
+  launchctl bootout "${dom}/${LABEL}" 2>/dev/null || true
+  launchctl bootstrap "${dom}" "${PLIST}"
+  launchctl kickstart -k "${dom}/${LABEL}"
+  echo "installed and started (launchd): ${LABEL}"
+  echo "  bound to http://${HOST_VAL}:${PORT_VAL}/"
   echo "  logs:    ${REPO_ROOT}/logs/launchd.{out,err}.log"
 }
 
-cmd_uninstall() {
-  launchctl bootout "${DOMAIN}/${LABEL}" 2>/dev/null || true
+mac_uninstall() {
+  launchctl bootout "$(mac_domain)/${LABEL}" 2>/dev/null || true
   rm -f "${PLIST}"
-  echo "uninstalled: ${LABEL}"
+  echo "uninstalled (launchd): ${LABEL}"
 }
 
-cmd_restart() {
-  launchctl kickstart -k "${DOMAIN}/${LABEL}"
-  echo "restarted: ${LABEL}"
+mac_restart() {
+  launchctl kickstart -k "$(mac_domain)/${LABEL}"
+  echo "restarted (launchd): ${LABEL}"
 }
 
-cmd_status() {
-  launchctl print "${DOMAIN}/${LABEL}" 2>/dev/null | grep -E "state =|pid =|last exit code" || \
-    echo "service not loaded"
-  # Probe the bound address if we can read it from the plist.
+mac_status() {
+  launchctl print "$(mac_domain)/${LABEL}" 2>/dev/null \
+    | grep -E "state =|pid =|last exit code" || echo "service not loaded"
   if [ -f "${PLIST}" ]; then
     local host port
     host="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:HOST' "${PLIST}" 2>/dev/null || echo '')"
     port="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:PORT' "${PLIST}" 2>/dev/null || echo 8090)"
-    [ -n "${host}" ] && echo "probe: http://${host}:${port}/ -> $(curl -sS -o /dev/null -w '%{http_code}' "http://${host}:${port}/" 2>&1 || echo 'unreachable')"
+    [ -n "${host}" ] && echo "probe: http://${host}:${port}/ -> $(curl -sS -o /dev/null -w '%{http_code}' "http://${host}:${port}/" 2>&1 || echo unreachable)"
   fi
 }
 
-cmd_logs() {
+mac_logs() {
   tail -n 40 -f "${REPO_ROOT}/logs/launchd.out.log" "${REPO_ROOT}/logs/launchd.err.log"
 }
 
+# ============================ Linux / systemd ================================
+UNIT_FILE="${HOME}/.config/systemd/user/${UNIT}.service"
+
+linux_install() {
+  command -v systemctl >/dev/null 2>&1 || die "systemctl not found (this helper targets systemd on Linux)"
+  resolve_env
+  mkdir -p "${HOME}/.config/systemd/user"
+  cat > "${UNIT_FILE}" <<UNITFILE
+[Unit]
+Description=terminal-web — web terminal (xterm.js + node-pty + tmux)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=${REPO_ROOT}
+Environment=PATH=${PATH_ENV}
+Environment=HOST=${HOST_VAL}
+Environment=PORT=${PORT_VAL}
+Environment=DEFAULT_SESSION=web
+ExecStart=${NODE_BIN} ${TSX_CLI} ${REPO_ROOT}/src/server.ts
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+UNITFILE
+
+  systemctl --user daemon-reload
+  systemctl --user enable --now "${UNIT}.service"
+
+  # Let the service keep running after logout / across reboots without an
+  # active login session. May require privileges; warn (don't fail) if denied.
+  if ! loginctl enable-linger "$(id -un)" 2>/dev/null; then
+    echo "note: could not enable linger automatically; for boot-without-login run:" >&2
+    echo "      sudo loginctl enable-linger $(id -un)" >&2
+  fi
+
+  echo "installed and started (systemd --user): ${UNIT}.service"
+  echo "  bound to http://${HOST_VAL}:${PORT_VAL}/"
+  echo "  logs:    journalctl --user -u ${UNIT} -f   (or: scripts/service.sh logs)"
+}
+
+linux_uninstall() {
+  systemctl --user disable --now "${UNIT}.service" 2>/dev/null || true
+  rm -f "${UNIT_FILE}"
+  systemctl --user daemon-reload 2>/dev/null || true
+  echo "uninstalled (systemd --user): ${UNIT}.service"
+}
+
+linux_restart() {
+  systemctl --user restart "${UNIT}.service"
+  echo "restarted (systemd --user): ${UNIT}.service"
+}
+
+linux_status() {
+  systemctl --user --no-pager status "${UNIT}.service" 2>&1 \
+    | grep -E "Active:|Main PID:|Loaded:" || echo "service not loaded"
+  if [ -f "${UNIT_FILE}" ]; then
+    local host port
+    host="$(sed -n 's/^Environment=HOST=//p' "${UNIT_FILE}" | head -1)"
+    port="$(sed -n 's/^Environment=PORT=//p' "${UNIT_FILE}" | head -1)"
+    port="${port:-8090}"
+    [ -n "${host}" ] && echo "probe: http://${host}:${port}/ -> $(curl -sS -o /dev/null -w '%{http_code}' "http://${host}:${port}/" 2>&1 || echo unreachable)"
+  fi
+}
+
+linux_logs() {
+  journalctl --user -u "${UNIT}" -n 40 -f
+}
+
+# ============================ dispatch =======================================
+case "${OS}" in
+  Darwin) PLATFORM=mac ;;
+  Linux)  PLATFORM=linux ;;
+  *) die "unsupported OS '${OS}' (this helper supports macOS and Linux)" ;;
+esac
+
 case "${1:-}" in
-  install)   cmd_install ;;
-  uninstall) cmd_uninstall ;;
-  restart)   cmd_restart ;;
-  status)    cmd_status ;;
-  logs)      cmd_logs ;;
+  install)   "${PLATFORM}_install" ;;
+  uninstall) "${PLATFORM}_uninstall" ;;
+  restart)   "${PLATFORM}_restart" ;;
+  status)    "${PLATFORM}_status" ;;
+  logs)      "${PLATFORM}_logs" ;;
   *) echo "usage: bash scripts/service.sh {install|uninstall|restart|status|logs}" >&2; exit 1 ;;
 esac
