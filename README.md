@@ -238,6 +238,8 @@ your shell instead, e.g. `HOST=100.x.y.z PORT=8090 npm start`.
 | `HOST`            | Tailscale IPv4 (`tailscale ip -4`), else `0.0.0.0`   | Address to bind. Set explicitly to pin a specific interface/IP.             |
 | `DEFAULT_SESSION` | `web`                                                | tmux session name used when the client doesn't pass `?session=NAME`.        |
 | `UPLOAD_DIR`      | `~/terminal-web-uploads`                             | Where pasted/dropped images are saved (see below).                          |
+| `UPLOAD_RETENTION_HOURS` | `72`                                          | Auto-delete uploads older than this (0 = never by age).                     |
+| `UPLOAD_MAX_FILES` | `100`                                               | Keep at most this many uploads, newest first (0 = unlimited).               |
 
 ---
 
@@ -252,6 +254,11 @@ page then **types that absolute path at the prompt**.
 So to show an image to Claude Code (or any CLI that reads image paths): paste
 the image, then press Enter — Claude Code picks up the inserted path and reads
 the image. Images are capped at 25 MB and saved `0600`.
+
+To stop the folder growing forever, uploads are auto-pruned on boot and after
+each upload: files older than `UPLOAD_RETENTION_HOURS` (default 72h) are
+deleted, then only the newest `UPLOAD_MAX_FILES` (default 100) are kept. Only
+`clip-*` image files are touched. Set either to `0` to disable that limit.
 
 > The upload endpoint has no auth beyond the tailnet, same as the terminal —
 > anyone on your tailnet can POST an image into `UPLOAD_DIR`.

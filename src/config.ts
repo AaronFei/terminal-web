@@ -23,6 +23,10 @@ export interface Config {
   publicDir: string;
   /** Directory where pasted/dropped images are saved (POST /upload). */
   uploadDir: string;
+  /** Delete uploaded images older than this many hours (0 = never by age). */
+  uploadRetentionHours: number;
+  /** Keep at most this many uploaded images (0 = unlimited). */
+  uploadMaxFiles: number;
   /** Detected Tailscale IPv4 address, if any (for nicer startup logging). */
   tailscaleIp: string | null;
 }
@@ -52,6 +56,13 @@ function detectTailscaleIp(): string | null {
   } catch {
     return null;
   }
+}
+
+function parseNonNegInt(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isInteger(n) || n < 0) return fallback;
+  return n;
 }
 
 function parsePort(raw: string | undefined, fallback: number): number {
@@ -102,6 +113,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     tmuxConfPath: path.join(REPO_ROOT, "tmux", "web.tmux.conf"),
     publicDir: path.join(REPO_ROOT, "public"),
     uploadDir,
+    uploadRetentionHours: parseNonNegInt(env.UPLOAD_RETENTION_HOURS, 72),
+    uploadMaxFiles: parseNonNegInt(env.UPLOAD_MAX_FILES, 100),
     tailscaleIp,
   };
 }

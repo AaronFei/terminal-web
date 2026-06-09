@@ -157,6 +157,55 @@ function sendJsonHttp(
   res.end(text);
 }
 
+const UPLOAD_NAME_RE = /^clip-.*\.(png|jpe?g|gif|webp|bmp|svg|heic|heif|tiff)$/i;
+
+/**
+ * Keep the upload directory bounded: delete our `clip-*` images older than
+ * uploadRetentionHours, then keep only the newest uploadMaxFiles. Only touches
+ * files matching our own naming pattern. Never throws.
+ */
+async function pruneUploads(): Promise<void> {
+  try {
+    let names: string[];
+    try {
+      names = await fsp.readdir(config.uploadDir);
+    } catch {
+      return; // dir doesn't exist yet — nothing to prune
+    }
+    const stats: { fp: string; mtime: number }[] = [];
+    for (const name of names) {
+      if (!UPLOAD_NAME_RE.test(name)) continue;
+      const fp = path.join(config.uploadDir, name);
+      try {
+        const st = await fsp.stat(fp);
+        if (st.isFile()) stats.push({ fp, mtime: st.mtimeMs });
+      } catch {
+        /* ignore */
+      }
+    }
+
+    const now = Date.now();
+    const maxAgeMs = config.uploadRetentionHours * 3_600_000;
+    const survivors: { fp: string; mtime: number }[] = [];
+    for (const s of stats) {
+      if (maxAgeMs > 0 && now - s.mtime > maxAgeMs) {
+        await fsp.unlink(s.fp).catch(() => {});
+      } else {
+        survivors.push(s);
+      }
+    }
+
+    if (config.uploadMaxFiles > 0 && survivors.length > config.uploadMaxFiles) {
+      survivors.sort((a, b) => b.mtime - a.mtime); // newest first
+      for (const s of survivors.slice(config.uploadMaxFiles)) {
+        await fsp.unlink(s.fp).catch(() => {});
+      }
+    }
+  } catch (err) {
+    console.error("[upload] prune error:", err);
+  }
+}
+
 async function handleUpload(
   req: http.IncomingMessage,
   res: http.ServerResponse
@@ -208,6 +257,8 @@ async function handleUpload(
     await fsp.writeFile(filePath, Buffer.concat(chunks), { mode: 0o600 });
     console.log(`[upload] saved ${filePath} (${size} bytes)`);
     sendJsonHttp(res, 200, { path: filePath, name: filename, size });
+    void pruneUploads(); // keep the upload dir bounded
+
   } catch (err) {
     console.error("[upload] write error:", err);
     sendJsonHttp(res, 500, { error: "could not save file" });
@@ -542,6 +593,7 @@ function logStartup(): void {
 
 server.listen(config.port, config.host, () => {
   logStartup();
+  void pruneUploads(); // tidy old uploads on boot
 });
 
 server.on("error", (err: NodeJS.ErrnoException) => {
