@@ -183,6 +183,16 @@ body {
   color: #fff;
 }
 
+/* destructive action (e.g. "Close & kill" in the confirm dialog) */
+.tb-btn.danger {
+  background: #5a1d1d;
+  border-color: #a33;
+  color: #fff;
+}
+.tb-btn.danger:active {
+  background: #7a2424;
+}
+
 /* --------------------------------------------------------------------------
    Terminal: sits between the top bar and the (optional) key bar
    -------------------------------------------------------------------------- */

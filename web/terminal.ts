@@ -566,7 +566,7 @@ function buildTab(s: Session): void {
   close.addEventListener('pointerdown', (e) => {
     e.preventDefault();
     e.stopPropagation();
-    closeSession(s);
+    confirmCloseSession(s);
   });
 
   s.tabEl = tab;
@@ -594,6 +594,52 @@ function activateSession(s: Session): void {
   for (const x of sessions) x.tabEl?.classList.toggle('active', x === s);
   reflectActiveStatus();
   saveTabs();
+}
+
+// Ask before killing a session: closing a tab terminates its tmux session and
+// any programs running in it, so make the user confirm first.
+function confirmCloseSession(s: Session): void {
+  if (document.querySelector('.confirm-overlay')) return;
+  const overlay = document.createElement('div');
+  overlay.className = 'paste-overlay confirm-overlay';
+  const box = document.createElement('div');
+  box.className = 'paste-box confirm-box';
+  const label = document.createElement('div');
+  label.className = 'paste-label';
+  const strong = document.createElement('b');
+  strong.textContent = s.name;
+  label.append('Close ', strong, '? This kills its tmux session and ends any programs running in it.');
+  const row = document.createElement('div');
+  row.className = 'paste-row';
+  const cancel = document.createElement('button');
+  cancel.className = 'tb-btn';
+  cancel.type = 'button';
+  cancel.textContent = 'Cancel';
+  const confirm = document.createElement('button');
+  confirm.className = 'tb-btn danger';
+  confirm.type = 'button';
+  confirm.textContent = 'Close & kill';
+  row.append(cancel, confirm);
+  box.append(label, row);
+  overlay.append(box);
+  document.body.append(overlay);
+  window.setTimeout(() => confirm.focus(), 0);
+
+  const close = (): void => {
+    overlay.remove();
+    activeSession?.focus();
+  };
+  cancel.addEventListener('click', close);
+  confirm.addEventListener('click', () => {
+    close();
+    closeSession(s);
+  });
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) close();
+  });
+  overlay.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') close();
+  });
 }
 
 function closeSession(s: Session): void {
