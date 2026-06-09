@@ -163,7 +163,14 @@ body {
    as the text buttons while the symbol itself is much larger. */
 .tb-icon {
   font-size: 24px;
+  line-height: 1;
   padding: 0 6px;
+}
+
+/* SVG icons: block-level so there's no inline baseline gap, and centered by
+   the button's flexbox like the text glyphs. */
+.tb-btn svg {
+  display: block;
 }
 
 .tb-btn:active {
