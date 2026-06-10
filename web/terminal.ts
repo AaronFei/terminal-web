@@ -153,7 +153,7 @@ function openHelp(): void {
     `<li><b>Paste</b> — click the terminal, then <b>${pasteKey}</b>. On a phone/tablet, tap <b>Paste</b> and paste into the box that appears.</li>` +
     '<li><b>Attach a file</b> (for Claude Code etc.) — tap the 📎 button, or paste / drag any file (image, PDF, text…): it uploads and inserts the file path. Then press Enter.</li>' +
     '<li><b>Scroll</b> — mouse wheel or two-finger swipe scrolls the history.</li>' +
-    '<li><b>Tabs</b> — <b>+</b> new session, <b>×</b> closes the tab and kills its session, <b>⟳</b> restarts the session fresh.</li>' +
+    '<li><b>Tabs</b> — <b>+</b> new session, <b>×</b> closes the tab and kills its session, <b>⟳</b> restarts the session fresh. Double-click (or double-tap) a tab to rename it — the label changes but its tmux session stays the same.</li>' +
     '</ul>' +
     '<div class="paste-row"><button class="tb-btn" type="button" data-help-close>Got it</button></div>';
   overlay.append(box);
@@ -246,12 +246,23 @@ function hideStatus(): void {
 // Session: one terminal + one WebSocket + reconnect, rendered in its own pane.
 // ---------------------------------------------------------------------------
 class Session {
+  // Immutable tmux session id — used for the WebSocket ?session= param and the
+  // kill command. Renaming a tab never touches this, so × still kills the
+  // original session.
   readonly name: string;
+  // Mutable label shown on the tab; defaults to the session name.
+  displayName: string;
   readonly term: Terminal;
   readonly el: HTMLElement;
   tabEl: HTMLElement | null = null;
+  tabLabel: HTMLElement | null = null;
   tabDot: HTMLElement | null = null;
   connected = false;
+  // True once the socket has opened at least once — i.e. the server has seen
+  // (and registered) this session. The cross-device sync only ever removes
+  // sessions that have connected, so a brand-new tab mid-connect is never
+  // mistaken for one closed elsewhere.
+  everConnected = false;
 
   private readonly fitAddon = new FitAddon();
   private ws: WebSocket | null = null;
@@ -264,8 +275,9 @@ class Session {
   private lastData = '';
   private lastDataAt = 0;
 
-  constructor(name: string) {
+  constructor(name: string, displayName?: string) {
     this.name = name;
+    this.displayName = displayName?.trim() || name;
     this.term = new Terminal({
       cursorBlink: true,
       fontFamily:
@@ -465,6 +477,7 @@ class Session {
 
     socket.onopen = () => {
       this.reconnectDelay = MIN_DELAY;
+      this.everConnected = true;
       this.setConnected(true);
       this.fit();
       this.startPing();
@@ -551,16 +564,29 @@ function buildTab(s: Session): void {
   dot.className = 'tab-dot';
   const label = document.createElement('span');
   label.className = 'tab-label';
-  label.textContent = s.name;
+  label.textContent = s.displayName;
+  label.title = `session: ${s.name} (double-click to rename)`;
   const close = document.createElement('span');
   close.className = 'tab-close';
   close.textContent = '×';
   close.title = 'Close tab & kill session';
   tab.append(dot, label, close);
 
+  // Single tap activates; a second tap within 350ms renames the tab. Manual
+  // detection (rather than a `dblclick` listener) because the pointerdown
+  // preventDefault below suppresses the synthesized click/dblclick events, and
+  // this also gives touch devices a double-tap-to-rename gesture.
+  let lastTap = 0;
   tab.addEventListener('pointerdown', (e) => {
     if (e.target === close) return;
     e.preventDefault();
+    const now = performance.now();
+    if (now - lastTap < 350) {
+      lastTap = 0;
+      promptRenameSession(s);
+      return;
+    }
+    lastTap = now;
     activateSession(s);
   });
   close.addEventListener('pointerdown', (e) => {
@@ -570,17 +596,20 @@ function buildTab(s: Session): void {
   });
 
   s.tabEl = tab;
+  s.tabLabel = label;
   s.tabDot = dot;
   tabsEl.insertBefore(tab, addBtn); // keep the "+" button last
   updateTabDot(s);
 }
 
-function addSession(name: string, makeActive: boolean): Session {
+function addSession(name: string, makeActive: boolean, displayName?: string): Session {
   let s = sessions.find((x) => x.name === name);
   if (!s) {
-    s = new Session(name);
+    s = new Session(name, displayName);
     sessions.push(s);
     buildTab(s);
+  } else if (displayName && displayName.trim() && displayName.trim() !== s.displayName) {
+    setDisplayName(s, displayName.trim());
   }
   if (makeActive) activateSession(s);
   saveTabs();
@@ -607,8 +636,13 @@ function confirmCloseSession(s: Session): void {
   const label = document.createElement('div');
   label.className = 'paste-label';
   const strong = document.createElement('b');
-  strong.textContent = s.name;
-  label.append('Close ', strong, '? This kills its tmux session and ends any programs running in it.');
+  strong.textContent = s.displayName;
+  const sessionNote = s.displayName === s.name ? '' : ` (tmux session "${s.name}")`;
+  label.append(
+    'Close ',
+    strong,
+    `${sessionNote}? This kills its tmux session and ends any programs running in it.`,
+  );
   const row = document.createElement('div');
   row.className = 'paste-row';
   const cancel = document.createElement('button');
@@ -645,6 +679,8 @@ function confirmCloseSession(s: Session): void {
 function closeSession(s: Session): void {
   const idx = sessions.indexOf(s);
   if (idx < 0) return;
+  // Guard against a server sync that raced the kill re-adding this tab.
+  recentlyClosed.set(s.name, performance.now());
   // Closing a tab kills its tmux session for good (its programs are terminated).
   s.kill();
   sessions.splice(idx, 1);
@@ -674,27 +710,185 @@ function promptAddSession(): void {
   addSession(sanitizeName(raw) ?? suggestion, true);
 }
 
+// Update only the tab's display label; the tmux session name (s.name) is left
+// untouched so closing the tab still kills the original session.
+function setDisplayName(s: Session, displayName: string): void {
+  s.displayName = displayName;
+  if (s.tabLabel) {
+    s.tabLabel.textContent = displayName;
+    s.tabLabel.title = `session: ${s.name} (double-click to rename)`;
+  }
+}
+
+// Rename a tab (display only). The label can be any text; the underlying tmux
+// session keeps its original name, so × still kills the right session.
+function promptRenameSession(s: Session): void {
+  const raw = window.prompt(
+    `Rename tab (display only — the tmux session stays "${s.name}"):`,
+    s.displayName,
+  );
+  if (raw === null) return; // cancelled
+  const trimmed = raw.trim().slice(0, 64);
+  setDisplayName(s, trimmed.length ? trimmed : s.name);
+  saveTabs();
+  renameOnServer(s.name, s.displayName); // sync the label to other devices
+  activeSession?.focus();
+}
+
+interface SavedTab {
+  name: string;
+  displayName: string;
+}
+
 function saveTabs(): void {
   try {
-    localStorage.setItem('tw.tabs', JSON.stringify(sessions.map((s) => s.name)));
+    localStorage.setItem(
+      'tw.tabs',
+      JSON.stringify(sessions.map((s) => ({ name: s.name, displayName: s.displayName }))),
+    );
     if (activeSession) localStorage.setItem('tw.activeTab', activeSession.name);
   } catch {
     /* ignore */
   }
 }
 
-function loadTabs(): { names: string[]; active: string | null } {
+function loadTabs(): { tabs: SavedTab[]; active: string | null } {
   try {
     const parsed = JSON.parse(localStorage.getItem('tw.tabs') ?? '[]');
     const active = localStorage.getItem('tw.activeTab');
     if (Array.isArray(parsed)) {
-      const names = parsed.filter((x): x is string => typeof x === 'string');
-      return { names, active };
+      const tabs: SavedTab[] = [];
+      for (const item of parsed) {
+        // Old format: a bare session-name string. New format: { name, displayName }.
+        if (typeof item === 'string') {
+          tabs.push({ name: item, displayName: item });
+        } else if (item && typeof item === 'object' && typeof item.name === 'string') {
+          const dn =
+            typeof item.displayName === 'string' && item.displayName.trim().length
+              ? item.displayName
+              : item.name;
+          tabs.push({ name: item.name, displayName: dn });
+        }
+      }
+      return { tabs, active };
     }
   } catch {
     /* ignore */
   }
-  return { names: [], active: null };
+  return { tabs: [], active: null };
+}
+
+// ---------------------------------------------------------------------------
+// Cross-device sync: the server holds the authoritative tab list (which
+// sessions exist + their display names), so opening the page on any platform
+// shows the same tabs. localStorage is now only a per-device cache (offline
+// fallback + which tab this device last had focused).
+// ---------------------------------------------------------------------------
+
+// Sessions just closed on this device; suppress a racing server sync from
+// re-adding them before the kill is reflected server-side. Expired in sync().
+const recentlyClosed = new Map<string, number>();
+const CLOSE_GUARD_MS = 6000;
+
+// Fetch the server's tab list. Returns null (and we keep local state) if the
+// server is unreachable or slow, so a flaky network never blanks the tabs.
+async function fetchServerTabs(timeoutMs = 2500): Promise<SavedTab[] | null> {
+  const ctrl = new AbortController();
+  const timer = window.setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch('/api/sessions', { cache: 'no-store', signal: ctrl.signal });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { tabs?: unknown };
+    if (!Array.isArray(data.tabs)) return null;
+    const out: SavedTab[] = [];
+    for (const item of data.tabs) {
+      if (item && typeof item === 'object' && typeof (item as SavedTab).name === 'string') {
+        const name = (item as SavedTab).name;
+        const dnRaw = (item as SavedTab).displayName;
+        const dn = typeof dnRaw === 'string' && dnRaw.trim() ? dnRaw : name;
+        out.push({ name, displayName: dn });
+      }
+    }
+    return out;
+  } catch {
+    return null;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+// Best-effort: tell the server a tab was renamed so other devices pick it up.
+// The local label is already updated; a failure just delays cross-device sync.
+function renameOnServer(name: string, displayName: string): void {
+  void fetch('/api/sessions/rename', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, displayName }),
+  }).catch(() => {
+    /* ignore — local UI already reflects the change */
+  });
+}
+
+// Tear down a tab whose session was closed on another device. Unlike
+// closeSession this sends NO kill (the session is already gone server-side) —
+// it just removes the tab and frees the terminal locally.
+function removeLocalSession(s: Session): void {
+  const idx = sessions.indexOf(s);
+  if (idx < 0) return;
+  sessions.splice(idx, 1);
+  s.tabEl?.remove();
+  s.dispose();
+  if (activeSession === s) {
+    activeSession = null;
+    const next = sessions[idx] ?? sessions[idx - 1] ?? null;
+    if (next) activateSession(next);
+  }
+}
+
+let syncing = false;
+
+// Reconcile our local tabs with the server's list: adopt sessions opened (or
+// renamed) on other devices, drop sessions closed elsewhere. The active tab is
+// per-device and never changed here unless its session disappeared.
+async function syncFromServer(): Promise<void> {
+  if (syncing) return;
+  syncing = true;
+  try {
+    const serverTabs = await fetchServerTabs();
+    if (!serverTabs) return; // unreachable — keep what we have
+    const byName = new Map(serverTabs.map((t) => [t.name, t]));
+
+    // Expire stale close-guards first so re-opening a name later still works.
+    const now = performance.now();
+    for (const [name, at] of recentlyClosed) {
+      if (now - at > CLOSE_GUARD_MS) recentlyClosed.delete(name);
+    }
+
+    // Add tabs opened elsewhere; adopt display-name changes from elsewhere.
+    for (const t of serverTabs) {
+      if (recentlyClosed.has(t.name)) continue; // don't resurrect a just-closed tab
+      const existing = sessions.find((s) => s.name === t.name);
+      if (!existing) {
+        addSession(t.name, false, t.displayName);
+      } else if (t.displayName && t.displayName !== existing.displayName) {
+        setDisplayName(existing, t.displayName);
+      }
+    }
+
+    // Remove tabs closed elsewhere. Only sessions that have actually connected
+    // (so the server knows them) are eligible — never a still-connecting new tab.
+    for (const s of sessions.slice()) {
+      if (byName.has(s.name)) continue;
+      if (!s.everConnected) continue;
+      if (recentlyClosed.has(s.name)) continue;
+      removeLocalSession(s);
+    }
+
+    if (sessions.length === 0) addSession(defaultSessionName, true);
+    saveTabs();
+  } finally {
+    syncing = false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1032,16 +1226,43 @@ termArea.addEventListener('drop', (e) => {
 // Init: restore tabs (or start one), restore prefs, activate.
 // ---------------------------------------------------------------------------
 const urlSession = sanitizeName(params.get('session'));
-const restored = loadTabs();
-const defaultSessionName = urlSession ?? restored.names[0] ?? 'web';
+const cached = loadTabs(); // per-device cache: offline fallback + last focus
+// A sensible value from the first tick (used by closeSession / syncFromServer
+// before init resolves); init refines it once the tab list is known.
+let defaultSessionName = urlSession ?? cached.tabs[0]?.name ?? 'web';
 
-let initialNames = restored.names.length ? restored.names.slice() : [defaultSessionName];
-if (urlSession && !initialNames.includes(urlSession)) initialNames = [urlSession, ...initialNames];
+async function init(): Promise<void> {
+  // The server's list is authoritative; fall back to the local cache, then to
+  // a single default session when both are empty.
+  const server = await fetchServerTabs();
+  let initialTabs: SavedTab[] =
+    server && server.length
+      ? server
+      : cached.tabs.length
+        ? cached.tabs.slice()
+        : [{ name: defaultSessionName, displayName: defaultSessionName }];
+  if (urlSession && !initialTabs.some((t) => t.name === urlSession)) {
+    initialTabs = [{ name: urlSession, displayName: urlSession }, ...initialTabs];
+  }
+  defaultSessionName = urlSession ?? initialTabs[0]?.name ?? 'web';
 
-for (const name of initialNames) addSession(name, false);
+  for (const t of initialTabs) addSession(t.name, false, t.displayName);
 
-const activeName = urlSession ?? restored.active ?? initialNames[0];
-activateSession(sessions.find((s) => s.name === activeName) ?? sessions[0]);
+  const activeName = urlSession ?? cached.active ?? initialTabs[0].name;
+  activateSession(sessions.find((s) => s.name === activeName) ?? sessions[0]);
+}
+
+void init();
+
+// Keep the tab list in sync with the server: when the page regains focus /
+// visibility, and on a light interval while visible.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') void syncFromServer();
+});
+window.addEventListener('focus', () => void syncFromServer());
+setInterval(() => {
+  if (document.visibilityState === 'visible') void syncFromServer();
+}, 5000);
 
 // Default: show the key bar on touch devices, hidden on desktop (unless saved).
 const keybarDefault = (() => {

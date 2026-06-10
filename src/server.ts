@@ -14,11 +14,18 @@ import {
   sanitizeSession,
   tmuxArgs,
   ensureTmuxAvailable,
+  listTmuxSessions,
 } from "./tmux.js";
+import { TabsStore } from "./tabsStore.js";
 import type { ServerMessage } from "./types.js";
 import { isClientMessage } from "./types.js";
 
 const config = loadConfig();
+
+// Cross-device tab list (which sessions exist + their display names). Persisted
+// server-side so every browser hitting this host sees the same tabs.
+const tabsStore = new TabsStore(config.tabsStorePath);
+tabsStore.load();
 
 // Short hostname of the machine running this server, used to label the page
 // title so several hosts open in different tabs are easy to tell apart. Strip
@@ -228,6 +235,66 @@ function sendJsonHttp(
   res.end(text);
 }
 
+/** Read a small request body fully, rejecting anything over `maxBytes`. */
+async function readBody(
+  req: http.IncomingMessage,
+  maxBytes: number
+): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const buf = chunk as Buffer;
+    size += buf.length;
+    if (size > maxBytes) throw new Error("body too large");
+    chunks.push(buf);
+  }
+  return Buffer.concat(chunks);
+}
+
+// ---------------------------------------------------------------------------
+// Cross-device tab sync (GET/POST /api/sessions...). The tab list lives on the
+// server so any browser sees the same sessions; display names persist here too.
+// ---------------------------------------------------------------------------
+
+/**
+ * Return the tracked tabs, filtered to sessions that still exist in tmux so
+ * sessions killed outside the web UI self-heal away. If tmux can't be queried
+ * (`null`), keep every tracked tab rather than wrongly dropping them all.
+ */
+async function handleListSessions(res: http.ServerResponse): Promise<void> {
+  const live = await listTmuxSessions();
+  let tabs = tabsStore.list();
+  if (live) {
+    const alive = new Set(live);
+    tabs = tabs.filter((t) => alive.has(t.name));
+  }
+  sendJsonHttp(res, 200, { tabs });
+}
+
+/** Persist a tab's display-name change ({ name, displayName }). */
+async function handleRenameSession(
+  req: http.IncomingMessage,
+  res: http.ServerResponse
+): Promise<void> {
+  let body: unknown;
+  try {
+    body = JSON.parse((await readBody(req, 4096)).toString("utf8"));
+  } catch {
+    sendJsonHttp(res, 400, { error: "invalid body" });
+    return;
+  }
+  const obj = body as { name?: unknown; displayName?: unknown };
+  if (typeof obj?.name !== "string") {
+    sendJsonHttp(res, 400, { error: "missing name" });
+    return;
+  }
+  const name = sanitizeSession(obj.name);
+  const displayName =
+    typeof obj.displayName === "string" ? obj.displayName : name;
+  tabsStore.rename(name, displayName);
+  sendJsonHttp(res, 200, { ok: true });
+}
+
 // Matches the files we generate (clip-<ISO-stamp>-<rand>...), regardless of the
 // original name/extension appended after, so pruning only ever touches ours.
 const UPLOAD_NAME_RE = /^clip-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}-[a-z0-9]/i;
@@ -362,6 +429,16 @@ const server = http.createServer((req, res) => {
         return;
       }
 
+      if (method === "GET" && requestUrl.pathname === "/api/sessions") {
+        await handleListSessions(res);
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/sessions/rename") {
+        await handleRenameSession(req, res);
+        return;
+      }
+
       if (method !== "GET" && method !== "HEAD") {
         res.writeHead(405, {
           "Content-Type": "text/plain; charset=utf-8",
@@ -474,6 +551,9 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
 
   console.log(`[ws] connected -> tmux session "${session}" (pid ${proc.pid})`);
 
+  // Track this session so other devices see it as a tab (cross-device sync).
+  tabsStore.register(session);
+
   let closed = false;
 
   const cleanup = (): void => {
@@ -565,7 +645,9 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
           }
         });
       } else if (parsed.type === "kill") {
-        // Close-tab: kill the session for good (nothing is recreated).
+        // Close-tab: kill the session for good (nothing is recreated) and drop
+        // it from the cross-device tab list so it disappears everywhere.
+        tabsStore.remove(session);
         execFile("tmux", ["kill-session", "-t", session], (err) => {
           if (err) {
             console.error(

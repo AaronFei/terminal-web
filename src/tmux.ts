@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 
 /**
  * Sanitize a requested tmux session name.
@@ -26,6 +26,35 @@ export function sanitizeSession(name: string | null | undefined): string {
  */
 export function tmuxArgs(session: string, confPath: string): string[] {
   return ["-u", "-f", confPath, "new-session", "-A", "-s", session];
+}
+
+/**
+ * List the names of all currently-running tmux sessions.
+ *
+ * Returns the session names on success, or `null` when the list can't be
+ * determined — `tmux list-sessions` exits non-zero both when tmux is missing
+ * and when no server is running (zero sessions), and we can't tell those apart.
+ * Callers treat `null` as "unknown" and keep their existing state rather than
+ * wrongly concluding every session is gone. Never throws.
+ */
+export function listTmuxSessions(): Promise<string[] | null> {
+  return new Promise((resolve) => {
+    execFile(
+      "tmux",
+      ["list-sessions", "-F", "#{session_name}"],
+      (err, stdout) => {
+        if (err) {
+          resolve(null);
+          return;
+        }
+        const names = stdout
+          .split("\n")
+          .map((l) => l.trim())
+          .filter((l) => l.length > 0);
+        resolve(names);
+      }
+    );
+  });
 }
 
 /**
