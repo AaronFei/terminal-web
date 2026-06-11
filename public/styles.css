@@ -31,11 +31,11 @@ body {
   top: 0;
   left: 0;
   right: 0;
-  height: var(--topbar-h);
+  height: calc(var(--topbar-h) + env(safe-area-inset-top));
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 0 8px;
+  padding: env(safe-area-inset-top) 8px 0;
   padding-left: max(8px, env(safe-area-inset-left));
   padding-right: max(8px, env(safe-area-inset-right));
   background: #252526;
@@ -200,7 +200,7 @@ body {
   position: fixed;
   left: 0;
   right: 0;
-  top: var(--topbar-h);
+  top: calc(var(--topbar-h) + env(safe-area-inset-top));
   bottom: calc(var(--keybar-h) + var(--kb-offset));
   background: #1e1e1e;
 }
@@ -411,10 +411,10 @@ body {
   top: 0;
   left: 0;
   right: 0;
-  height: var(--topbar-h);
+  height: calc(var(--topbar-h) + env(safe-area-inset-top));
   align-items: center;
   gap: 6px;
-  padding: 0 6px;
+  padding: env(safe-area-inset-top) 6px 0;
   padding-left: max(6px, env(safe-area-inset-left));
   padding-right: max(6px, env(safe-area-inset-right));
   background: #252526;

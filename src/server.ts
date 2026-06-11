@@ -87,6 +87,7 @@ const CONTENT_TYPES: Record<string, string> = {
   ".ico": "image/x-icon",
   ".png": "image/png",
   ".svg": "image/svg+xml; charset=utf-8",
+  ".webmanifest": "application/manifest+json; charset=utf-8",
   ".woff": "font/woff",
   ".woff2": "font/woff2",
   ".txt": "text/plain; charset=utf-8",
@@ -101,6 +102,15 @@ function contentTypeFor(filePath: string): string {
  * Returns null for unknown routes. Guards against path traversal by resolving
  * and confirming the result stays within publicDir.
  */
+const PWA_ASSETS = new Set([
+  "/manifest.webmanifest",
+  "/apple-touch-icon.png",
+  "/icon.svg",
+  "/icon-192.png",
+  "/icon-512.png",
+  "/icon-512-maskable.png",
+]);
+
 function resolveStaticPath(pathname: string): string | null {
   let rel: string | null = null;
 
@@ -108,6 +118,9 @@ function resolveStaticPath(pathname: string): string | null {
     rel = "index.html";
   } else if (pathname === "/styles.css") {
     rel = "styles.css";
+  } else if (PWA_ASSETS.has(pathname)) {
+    // PWA manifest + icons live at the web root.
+    rel = pathname.slice(1);
   } else if (pathname.startsWith("/dist/")) {
     // Anything emitted by esbuild: terminal.js, terminal.css, *.map, etc.
     rel = "dist/" + pathname.slice("/dist/".length);
