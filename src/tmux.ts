@@ -118,7 +118,9 @@ export function tagWebSession(name: string, attempt = 0): void {
 
 /** Persist a web tab's display label on its tmux session. Best-effort. */
 export function setWebTabLabel(name: string, displayName: string): void {
-  const dn = displayName.trim().slice(0, 64) || name;
+  // Strip control chars (newlines/tabs) so a label can never break the
+  // space-delimited parsing in listWebTabs.
+  const dn = displayName.replace(/[\x00-\x1f]/g, " ").trim().slice(0, 64) || name;
   execFile("tmux", ["set-option", "-t", name, TAB_LABEL, dn], () => {});
 }
 
@@ -129,10 +131,16 @@ export function setWebTabLabel(name: string, displayName: string): void {
  * {@link listTmuxSessions} — versus `[]` for "queried fine, no tabs".
  */
 export function listWebTabs(): Promise<WebTab[] | null> {
-  // Tab-separated so labels with spaces survive; a literal tab can't appear in
-  // a session name or in our (sanitized, single-line) labels.
-  const fmt = ["#{session_name}", `#{${TAB_TAG}}`, `#{${TAB_LABEL}}`, "#{session_created}"].join(
-    "\t"
+  // Space-separated, with the free-text label LAST. We deliberately avoid a TAB
+  // (or any control char) separator: under a non-UTF-8 locale — e.g. the bare
+  // environment launchd gives the service — tmux sanitizes control characters
+  // in -F output to "_", which silently merged every field into one and made
+  // this return nothing (so tabs vanished the moment their socket closed).
+  // Session names are restricted to [A-Za-z0-9_-] (no spaces) and the tag and
+  // created stamp are numeric, so splitting on spaces with the label as the
+  // trailing remainder is unambiguous.
+  const fmt = [`#{${TAB_TAG}}`, "#{session_created}", "#{session_name}", `#{${TAB_LABEL}}`].join(
+    " "
   );
   return new Promise((resolve) => {
     execFile("tmux", ["list-sessions", "-F", fmt], (err, stdout) => {
@@ -143,12 +151,17 @@ export function listWebTabs(): Promise<WebTab[] | null> {
       const rows: { name: string; displayName: string; created: number }[] = [];
       for (const line of stdout.split("\n")) {
         if (!line) continue;
-        const [name, tag, label, created] = line.split("\t");
-        if (!name || tag !== "1") continue;
+        const parts = line.split(" ");
+        if (parts.length < 3) continue;
+        const tag = parts[0];
+        if (tag !== "1") continue; // only sessions tagged as web tabs
+        const name = parts[2];
+        if (!name) continue;
+        const label = parts.slice(3).join(" ");
         rows.push({
           name,
-          displayName: label && label.trim() ? label : name,
-          created: Number(created) || 0,
+          displayName: label.trim() ? label : name,
+          created: Number(parts[1]) || 0,
         });
       }
       rows.sort((a, b) => a.created - b.created);
