@@ -580,7 +580,14 @@ class Session {
       }
       if (typeof ev.data === 'string') {
         try {
-          JSON.parse(ev.data);
+          const msg = JSON.parse(ev.data) as { type?: string };
+          // The session was closed (killed) here or on another device: drop the
+          // tab and do NOT reconnect — reconnecting would recreate the session
+          // via `new-session -A`, resurrecting what was just closed.
+          if (msg && msg.type === 'closed') {
+            recentlyClosed.set(this.name, performance.now());
+            removeLocalSession(this);
+          }
         } catch {
           /* ignore */
         }

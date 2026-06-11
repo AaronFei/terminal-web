@@ -46,6 +46,16 @@ export interface InfoMessage {
 }
 
 /**
+ * Server -> Client: this session was closed (killed) — here or on another
+ * device. The client drops the tab and does NOT reconnect (which would
+ * otherwise recreate the session via `new-session -A`). This is what syncs a
+ * tab close across devices in real time.
+ */
+export interface ClosedMessage {
+  type: "closed";
+}
+
+/**
  * Client -> Server: diagnostic trace (only sent when ?debug=ime is set). The
  * server just logs these; they never affect terminal behavior.
  */
@@ -65,7 +75,7 @@ export type ClientMessage =
   | DebugMessage;
 
 /** Any JSON control message the server may send to a client. */
-export type ServerMessage = PongMessage | InfoMessage;
+export type ServerMessage = PongMessage | InfoMessage | ClosedMessage;
 
 /** Union of every JSON control message in the protocol. */
 export type ControlMessage = ClientMessage | ServerMessage;

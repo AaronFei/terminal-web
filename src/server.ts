@@ -29,6 +29,36 @@ const config = loadConfig();
 // shows up in /api/sessions immediately, before its tag write has landed.
 const liveSessions = new Set<string>();
 
+// Every WebSocket currently attached to each session name. Used to tell the
+// *other* devices on a session that it was closed, so they drop the tab instead
+// of auto-reconnecting (which would resurrect the just-killed tmux session).
+const sessionClients = new Map<string, Set<WebSocket>>();
+
+function addSessionClient(name: string, ws: WebSocket): void {
+  let set = sessionClients.get(name);
+  if (!set) {
+    set = new Set();
+    sessionClients.set(name, set);
+  }
+  set.add(ws);
+}
+
+function removeSessionClient(name: string, ws: WebSocket): void {
+  const set = sessionClients.get(name);
+  if (!set) return;
+  set.delete(ws);
+  if (set.size === 0) sessionClients.delete(name);
+}
+
+/** Tell every client of `name` except `except` that the session was closed. */
+function broadcastClosed(name: string, except: WebSocket): void {
+  const set = sessionClients.get(name);
+  if (!set) return;
+  for (const peer of set) {
+    if (peer !== except) sendJson(peer, { type: "closed" });
+  }
+}
+
 // Short hostname of the machine running this server, used to label the page
 // title so several hosts open in different tabs are easy to tell apart. Strip
 // any DNS domain suffix (e.g. "nuc.local" -> "nuc").
@@ -563,6 +593,7 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
   // the tag write. Tagging on every connect also adopts pre-existing sessions.
   liveSessions.add(session);
   tagWebSession(session);
+  addSessionClient(session, ws);
 
   let closed = false;
 
@@ -659,7 +690,10 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
       } else if (parsed.type === "kill") {
         // Close-tab: kill the session for good (nothing is recreated). Killing
         // the tmux session drops its @twtab tag with it, so the tab disappears
-        // from every device's list automatically.
+        // from every device's list automatically. Tell the other devices first
+        // (before the kill drops their sockets) so they remove the tab instead
+        // of auto-reconnecting and recreating the session.
+        broadcastClosed(session, ws);
         liveSessions.delete(session);
         execFile("tmux", ["kill-session", "-t", session], (err) => {
           if (err) {
@@ -692,6 +726,7 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
   ws.on("close", () => {
     onData.dispose();
     onExit.dispose();
+    removeSessionClient(session, ws);
     cleanup();
     console.log(`[ws] disconnected from "${session}" (tmux session persists)`);
   });
