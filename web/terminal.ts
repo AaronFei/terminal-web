@@ -1152,11 +1152,11 @@ const KEYS: KeyDef[] = [
   { label: 'Tab', seq: '\t' },
   { label: 'Ctrl', mod: 'ctrl' },
   { label: 'Alt', mod: 'alt' },
+  { label: '^C', seq: '\x03' },
   { label: '←', seq: '\x1b[D' },
   { label: '↑', seq: '\x1b[A' },
   { label: '↓', seq: '\x1b[B' },
   { label: '→', seq: '\x1b[C' },
-  { label: '^C', seq: '\x03' },
 ];
 
 let ctrlArmed = false;
