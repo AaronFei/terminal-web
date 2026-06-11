@@ -20,6 +20,7 @@ import {
 } from "./tmux.js";
 import type { ServerMessage } from "./types.js";
 import { isClientMessage } from "./types.js";
+import { gateHttp, isAuthed } from "./auth.js";
 
 const config = loadConfig();
 
@@ -461,6 +462,10 @@ const server = http.createServer((req, res) => {
       const requestUrl = new URL(req.url, "http://localhost");
       const method = req.method ?? "GET";
 
+      // Token gate (no-op when AUTH_TOKEN is unset). Handles the login page and
+      // the ?token=… sign-in for every route.
+      if (gateHttp(req, res, requestUrl, config.authToken)) return;
+
       if (method === "POST" && requestUrl.pathname === "/upload") {
         await handleUpload(req, res, requestUrl.searchParams.get("name"));
         return;
@@ -748,6 +753,15 @@ server.on("upgrade", (req, socket, head) => {
 
   if (pathname !== "/ws") {
     socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
+  // The terminal stream is the sensitive part: reject the upgrade unless the
+  // request carries the auth cookie (the browser sends it automatically once
+  // signed in). No-op when AUTH_TOKEN is unset.
+  if (!isAuthed(req, config.authToken)) {
+    socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
     socket.destroy();
     return;
   }

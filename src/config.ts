@@ -29,6 +29,8 @@ export interface Config {
   uploadMaxFiles: number;
   /** Reject uploads larger than this many bytes. */
   uploadMaxBytes: number;
+  /** Shared token required to access the app (HTTP + WS). Empty = no auth. */
+  authToken: string;
   /** Detected Tailscale IPv4 address, if any (for nicer startup logging). */
   tailscaleIp: string | null;
 }
@@ -118,6 +120,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     uploadRetentionHours: parseNonNegInt(env.UPLOAD_RETENTION_HOURS, 72),
     uploadMaxFiles: parseNonNegInt(env.UPLOAD_MAX_FILES, 100),
     uploadMaxBytes: parseNonNegInt(env.UPLOAD_MAX_MB, 25) * 1024 * 1024,
+    authToken: (env.AUTH_TOKEN ?? "").trim(),
     tailscaleIp,
   };
 }

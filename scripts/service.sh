@@ -43,6 +43,8 @@ resolve_env() {
   fi
   HOST_VAL="${HOST:-${TS_IP:-0.0.0.0}}"
   PORT_VAL="${PORT:-8090}"
+  # Optional shared access token (only injected into the unit when set).
+  AUTH_TOKEN_VAL="${AUTH_TOKEN:-}"
 
   TS_DIR=""
   if command -v tailscale >/dev/null 2>&1; then TS_DIR="$(dirname "$(command -v tailscale)")"; fi
@@ -60,6 +62,10 @@ mac_domain() { echo "gui/$(id -u)"; }
 mac_install() {
   resolve_env
   mkdir -p "${HOME}/Library/LaunchAgents"
+  local auth_plist=""
+  [ -n "${AUTH_TOKEN_VAL}" ] && auth_plist="
+        <key>AUTH_TOKEN</key>
+        <string>${AUTH_TOKEN_VAL}</string>"
   cat > "${PLIST}" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -84,7 +90,7 @@ mac_install() {
         <key>PORT</key>
         <string>${PORT_VAL}</string>
         <key>DEFAULT_SESSION</key>
-        <string>web</string>
+        <string>web</string>${auth_plist}
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -141,6 +147,8 @@ linux_install() {
   command -v systemctl >/dev/null 2>&1 || die "systemctl not found (this helper targets systemd on Linux)"
   resolve_env
   mkdir -p "${HOME}/.config/systemd/user"
+  local auth_unit=""
+  [ -n "${AUTH_TOKEN_VAL}" ] && auth_unit="Environment=AUTH_TOKEN=${AUTH_TOKEN_VAL}"
   cat > "${UNIT_FILE}" <<UNITFILE
 [Unit]
 Description=terminal-web — web terminal (xterm.js + node-pty + tmux)
@@ -154,6 +162,7 @@ Environment=PATH=${PATH_ENV}
 Environment=HOST=${HOST_VAL}
 Environment=PORT=${PORT_VAL}
 Environment=DEFAULT_SESSION=web
+${auth_unit}
 ExecStart=${NODE_BIN} ${TSX_CLI} ${REPO_ROOT}/src/server.ts
 Restart=always
 RestartSec=10
