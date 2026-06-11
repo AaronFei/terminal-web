@@ -1203,6 +1203,11 @@ for (const def of KEYS) {
   if (def.mod) modButtons[def.mod] = b;
   b.addEventListener('pointerdown', (e) => {
     e.preventDefault();
+    // On touch, never refocus the terminal: focusing its textarea pops up the
+    // soft keyboard. The keys send their bytes straight over the WebSocket, so
+    // focus isn't needed — preventDefault already keeps whatever focus state
+    // (and thus the keyboard) the user already had.
+    const refocus = e.pointerType !== 'touch';
     if (def.action === 'copy') {
       const sel = activeSession?.term.getSelection() ?? '';
       if (sel) {
@@ -1210,12 +1215,12 @@ for (const def of KEYS) {
       } else {
         flashStatus('nothing selected', 1200);
       }
-      activeSession?.focus();
+      if (refocus) activeSession?.focus();
       return;
     }
     if (def.action === 'paste') {
       pasteFromClipboard();
-      activeSession?.focus();
+      if (refocus) activeSession?.focus();
       return;
     }
     if (def.mod) {
@@ -1230,7 +1235,7 @@ for (const def of KEYS) {
       altArmed = false;
       refreshModVisuals();
     }
-    activeSession?.focus();
+    if (refocus) activeSession?.focus();
   });
   keybarEl.append(b);
 }
@@ -1277,8 +1282,9 @@ mTitle.addEventListener('pointerdown', (e) => {
 
 const mAttachBtn = mBtn('📎', 'Attach a file', () => fileInput.click());
 const mKeysBtn = mBtn('⌨', 'Toggle on-screen keys', () => {
+  // No focus() here: on a phone, focusing the terminal pops the soft keyboard,
+  // which defeats the point of toggling the on-screen keys.
   setKeybarVisible(keybarEl.classList.contains('hidden'));
-  activeSession?.focus();
 });
 const mMoreBtn = mBtn('⋯', 'More actions', () => openSheet());
 
