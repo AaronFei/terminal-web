@@ -1156,15 +1156,7 @@ const KEYS: KeyDef[] = [
   { label: '↑', seq: '\x1b[A' },
   { label: '↓', seq: '\x1b[B' },
   { label: '→', seq: '\x1b[C' },
-  { label: 'Home', seq: '\x1b[H' },
-  { label: 'End', seq: '\x1b[F' },
-  { label: 'PgUp', seq: '\x1b[5~' },
-  { label: 'PgDn', seq: '\x1b[6~' },
   { label: '^C', seq: '\x03' },
-  { label: '|', seq: '|' },
-  { label: '~', seq: '~' },
-  { label: '/', seq: '/' },
-  { label: '-', seq: '-' },
 ];
 
 let ctrlArmed = false;
