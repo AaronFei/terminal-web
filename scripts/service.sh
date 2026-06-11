@@ -172,7 +172,10 @@ WantedBy=default.target
 UNITFILE
 
   systemctl --user daemon-reload
-  systemctl --user enable --now "${UNIT}.service"
+  systemctl --user enable "${UNIT}.service"
+  # restart (not just `enable --now`, which is a no-op when already running) so
+  # a changed unit — e.g. a new AUTH_TOKEN — actually takes effect.
+  systemctl --user restart "${UNIT}.service"
 
   # Let the service keep running after logout / across reboots without an
   # active login session. May require privileges; warn (don't fail) if denied.
