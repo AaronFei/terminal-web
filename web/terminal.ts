@@ -1033,7 +1033,11 @@ function setKeybarVisible(visible: boolean): void {
 
 function updateKeyboardOffset(): void {
   const vv = window.visualViewport;
-  const offset = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) : 0;
+  const raw = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) : 0;
+  // Only a real soft keyboard takes up meaningful height. Ignore small
+  // discrepancies — e.g. the home-indicator safe area in a standalone PWA,
+  // which otherwise gets mistaken for a keyboard and leaves a gap at the bottom.
+  const offset = raw > 100 ? raw : 0;
   root.style.setProperty('--kb-offset', `${offset}px`);
   fitActive();
 }
@@ -1129,10 +1133,10 @@ fileBtn.innerHTML =
   'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
   '<path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 ' +
   '5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>';
-fileBtn.addEventListener('pointerdown', (e) => {
-  e.preventDefault();
-  fileInput.click();
-});
+// Use a real click (not pointerdown+preventDefault): iOS blocks opening a file
+// picker from a preventDefaulted pointer event, so the attach button did nothing
+// on phones.
+fileBtn.addEventListener('click', () => fileInput.click());
 controlsEl.append(fileBtn);
 
 makeButton(controlsEl, 'tb-btn tb-icon', '⤢', 'Toggle fullscreen', toggleFullscreen);
@@ -1272,7 +1276,15 @@ mTitle.addEventListener('pointerdown', (e) => {
   openDrawer();
 });
 
-const mAttachBtn = mBtn('📎', 'Attach a file', () => fileInput.click());
+// Built directly (not via mBtn) so it triggers on a real `click`: iOS refuses to
+// open a file picker from a preventDefaulted pointerdown.
+const mAttachBtn = document.createElement('button');
+mAttachBtn.className = 'm-btn';
+mAttachBtn.type = 'button';
+mAttachBtn.textContent = '📎';
+mAttachBtn.title = 'Attach a file';
+mAttachBtn.setAttribute('aria-label', 'Attach a file');
+mAttachBtn.addEventListener('click', () => fileInput.click());
 const mKeysBtn = mBtn('⌨', 'Toggle on-screen keys', () => {
   // No focus() here: on a phone, focusing the terminal pops the soft keyboard,
   // which defeats the point of toggling the on-screen keys.
