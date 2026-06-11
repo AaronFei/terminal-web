@@ -14,18 +14,20 @@ import {
   sanitizeSession,
   tmuxArgs,
   ensureTmuxAvailable,
-  listTmuxSessions,
+  tagWebSession,
+  setWebTabLabel,
+  listWebTabs,
 } from "./tmux.js";
-import { TabsStore } from "./tabsStore.js";
 import type { ServerMessage } from "./types.js";
 import { isClientMessage } from "./types.js";
 
 const config = loadConfig();
 
-// Cross-device tab list (which sessions exist + their display names). Persisted
-// server-side so every browser hitting this host sees the same tabs.
-const tabsStore = new TabsStore(config.tabsStorePath);
-tabsStore.load();
+// The cross-device tab list lives on the tmux sessions themselves (a @twtab
+// user option), so it can't drift from reality — see tmux.ts. This set just
+// tracks sessions with a live WebSocket right now, so a freshly-connected tab
+// shows up in /api/sessions immediately, before its tag write has landed.
+const liveSessions = new Set<string>();
 
 // Short hostname of the machine running this server, used to label the page
 // title so several hosts open in different tabs are easy to tell apart. Strip
@@ -257,18 +259,23 @@ async function readBody(
 // ---------------------------------------------------------------------------
 
 /**
- * Return the tracked tabs, filtered to sessions that still exist in tmux so
- * sessions killed outside the web UI self-heal away. If tmux can't be queried
- * (`null`), keep every tracked tab rather than wrongly dropping them all.
+ * Return the web tabs, sourced from tmux (sessions carrying the @twtab tag),
+ * unioned with sessions that have a live WebSocket right now (covering the
+ * brief window between a tab connecting and its tag write completing). When
+ * tmux can't be queried, reply with `tabs: null` so the client keeps its
+ * current tabs instead of wrongly clearing them.
  */
 async function handleListSessions(res: http.ServerResponse): Promise<void> {
-  const live = await listTmuxSessions();
-  let tabs = tabsStore.list();
-  if (live) {
-    const alive = new Set(live);
-    tabs = tabs.filter((t) => alive.has(t.name));
+  const tagged = await listWebTabs();
+  if (tagged === null) {
+    sendJsonHttp(res, 200, { tabs: null }); // unknown -> client keeps its state
+    return;
   }
-  sendJsonHttp(res, 200, { tabs });
+  const byName = new Map(tagged.map((t) => [t.name, t]));
+  for (const name of liveSessions) {
+    if (!byName.has(name)) byName.set(name, { name, displayName: name });
+  }
+  sendJsonHttp(res, 200, { tabs: [...byName.values()] });
 }
 
 /** Persist a tab's display-name change ({ name, displayName }). */
@@ -291,7 +298,7 @@ async function handleRenameSession(
   const name = sanitizeSession(obj.name);
   const displayName =
     typeof obj.displayName === "string" ? obj.displayName : name;
-  tabsStore.rename(name, displayName);
+  setWebTabLabel(name, displayName);
   sendJsonHttp(res, 200, { ok: true });
 }
 
@@ -551,14 +558,18 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
 
   console.log(`[ws] connected -> tmux session "${session}" (pid ${proc.pid})`);
 
-  // Track this session so other devices see it as a tab (cross-device sync).
-  tabsStore.register(session);
+  // Tag the tmux session as a web tab so every device sees it (cross-device
+  // sync), and note it as live so /api/sessions lists it without waiting for
+  // the tag write. Tagging on every connect also adopts pre-existing sessions.
+  liveSessions.add(session);
+  tagWebSession(session);
 
   let closed = false;
 
   const cleanup = (): void => {
     if (closed) return;
     closed = true;
+    liveSessions.delete(session);
     try {
       // Killing the pty only detaches this tmux client; the server/session
       // persist so the session can be resumed on reconnect.
@@ -584,6 +595,7 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
       `[ws] pty for "${session}" exited (code ${exitCode}, signal ${signal ?? "none"})`
     );
     closed = true; // pty is already gone; avoid kill() in cleanup
+    liveSessions.delete(session);
     if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
       try {
         ws.close(1000, "pty exited");
@@ -645,9 +657,10 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
           }
         });
       } else if (parsed.type === "kill") {
-        // Close-tab: kill the session for good (nothing is recreated) and drop
-        // it from the cross-device tab list so it disappears everywhere.
-        tabsStore.remove(session);
+        // Close-tab: kill the session for good (nothing is recreated). Killing
+        // the tmux session drops its @twtab tag with it, so the tab disappears
+        // from every device's list automatically.
+        liveSessions.delete(session);
         execFile("tmux", ["kill-session", "-t", session], (err) => {
           if (err) {
             console.error(

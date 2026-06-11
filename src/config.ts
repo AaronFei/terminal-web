@@ -23,8 +23,6 @@ export interface Config {
   publicDir: string;
   /** Directory where pasted/dropped/attached files are saved (POST /upload). */
   uploadDir: string;
-  /** JSON file persisting the cross-device list of web-opened tabs. */
-  tabsStorePath: string;
   /** Delete uploaded files older than this many hours (0 = never by age). */
   uploadRetentionHours: number;
   /** Keep at most this many uploaded files (0 = unlimited). */
@@ -108,11 +106,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       ? path.resolve(env.UPLOAD_DIR.trim())
       : path.join(os.homedir(), "terminal-web-uploads");
 
-  const tabsStorePath =
-    env.TABS_STORE && env.TABS_STORE.trim() !== ""
-      ? path.resolve(env.TABS_STORE.trim())
-      : path.join(os.homedir(), ".terminal-web", "tabs.json");
-
   return {
     port,
     host,
@@ -122,7 +115,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     tmuxConfPath: path.join(REPO_ROOT, "tmux", "web.tmux.conf"),
     publicDir: path.join(REPO_ROOT, "public"),
     uploadDir,
-    tabsStorePath,
     uploadRetentionHours: parseNonNegInt(env.UPLOAD_RETENTION_HOURS, 72),
     uploadMaxFiles: parseNonNegInt(env.UPLOAD_MAX_FILES, 100),
     uploadMaxBytes: parseNonNegInt(env.UPLOAD_MAX_MB, 25) * 1024 * 1024,

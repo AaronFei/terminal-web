@@ -82,3 +82,77 @@ export function requireTmux(): void {
     );
   }
 }
+
+// ---------------------------------------------------------------------------
+// Web-tab membership lives on the tmux session itself, via user options:
+//   @twtab   = "1"     -> this session is a web tab (shown on every device)
+//   @twlabel = "..."   -> the tab's display label
+//
+// Making tmux the single source of truth means the tab list can never drift
+// from reality: a session shows up as a tab iff it exists in tmux and carries
+// the tag, and its label dies with the session. No separate file to get stale.
+// ---------------------------------------------------------------------------
+const TAB_TAG = "@twtab";
+const TAB_LABEL = "@twlabel";
+
+export interface WebTab {
+  /** tmux session name — the immutable id used to attach/kill the session. */
+  name: string;
+  /** Label shown on the tab; defaults to the session name. */
+  displayName: string;
+}
+
+/**
+ * Mark a session as a web tab so every device shows it. Best-effort, with a
+ * few retries: the tag is written right after the pty spawns `tmux
+ * new-session`, which may not have registered the session yet, so an immediate
+ * set-option can fail with "can't find session" — retry briefly until it sticks.
+ */
+export function tagWebSession(name: string, attempt = 0): void {
+  execFile("tmux", ["set-option", "-t", name, TAB_TAG, "1"], (err) => {
+    if (err && attempt < 10) {
+      setTimeout(() => tagWebSession(name, attempt + 1), 150);
+    }
+  });
+}
+
+/** Persist a web tab's display label on its tmux session. Best-effort. */
+export function setWebTabLabel(name: string, displayName: string): void {
+  const dn = displayName.trim().slice(0, 64) || name;
+  execFile("tmux", ["set-option", "-t", name, TAB_LABEL, dn], () => {});
+}
+
+/**
+ * List the tmux sessions tagged as web tabs, in creation order, each with its
+ * display label. Returns `null` when tmux can't be queried (no server / not
+ * installed) — same "unknown, keep prior state" contract as
+ * {@link listTmuxSessions} — versus `[]` for "queried fine, no tabs".
+ */
+export function listWebTabs(): Promise<WebTab[] | null> {
+  // Tab-separated so labels with spaces survive; a literal tab can't appear in
+  // a session name or in our (sanitized, single-line) labels.
+  const fmt = ["#{session_name}", `#{${TAB_TAG}}`, `#{${TAB_LABEL}}`, "#{session_created}"].join(
+    "\t"
+  );
+  return new Promise((resolve) => {
+    execFile("tmux", ["list-sessions", "-F", fmt], (err, stdout) => {
+      if (err) {
+        resolve(null);
+        return;
+      }
+      const rows: { name: string; displayName: string; created: number }[] = [];
+      for (const line of stdout.split("\n")) {
+        if (!line) continue;
+        const [name, tag, label, created] = line.split("\t");
+        if (!name || tag !== "1") continue;
+        rows.push({
+          name,
+          displayName: label && label.trim() ? label : name,
+          created: Number(created) || 0,
+        });
+      }
+      rows.sort((a, b) => a.created - b.created);
+      resolve(rows.map(({ name, displayName }) => ({ name, displayName })));
+    });
+  });
+}

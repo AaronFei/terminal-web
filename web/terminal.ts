@@ -566,6 +566,10 @@ class Session {
       this.setConnected(true);
       this.fit();
       this.startPing();
+      // Re-assert a custom label: the server stores it on the tmux session
+      // (@twlabel), which is wiped when the session is killed+recreated by a
+      // restart, so a renamed tab would otherwise revert to its raw name.
+      if (this.displayName !== this.name) renameOnServer(this.name, this.displayName);
       if (isActive(this)) this.term.focus();
     };
 
