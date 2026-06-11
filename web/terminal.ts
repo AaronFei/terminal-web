@@ -321,6 +321,7 @@ class Session {
     this.el.addEventListener('touchend', copySelection);
 
     this.wireInput();
+    this.wireTouchScroll();
     this.connect();
   }
 
@@ -382,6 +383,90 @@ class Session {
   /** Send a raw key sequence (used by the on-screen key bar for the active session). */
   sendSeq(seq: string): void {
     this.send(seq);
+  }
+
+  // One-finger touch scrolling. tmux runs in the alternate screen (no
+  // xterm-local scrollback) with `mouse on`, so history is browsed via
+  // copy-mode, which is normally driven by the mouse wheel. A phone has no
+  // wheel, so we translate a one-finger vertical drag into SGR mouse-wheel
+  // events sent to tmux — dragging down scrolls back through history, dragging
+  // up returns toward the live prompt, just like a real wheel.
+  private wireTouchScroll(): void {
+    const STEP = 22; // px of drag per wheel "tick"
+    let startX = 0;
+    let startY = 0;
+    let lastY = 0;
+    let col = 1;
+    let row = 1;
+    let tracking = false;
+    let scrolling = false;
+
+    this.el.addEventListener(
+      'touchstart',
+      (e: TouchEvent) => {
+        if (e.touches.length !== 1) {
+          tracking = false;
+          return;
+        }
+        const t = e.touches[0];
+        startX = t.clientX;
+        startY = lastY = t.clientY;
+        tracking = true;
+        scrolling = false;
+        // Cell under the finger, so tmux targets the right pane if it's split.
+        const rect = this.el.getBoundingClientRect();
+        const cw = rect.width / Math.max(1, this.term.cols);
+        const ch = rect.height / Math.max(1, this.term.rows);
+        col = Math.max(1, Math.min(this.term.cols, Math.floor((t.clientX - rect.left) / cw) + 1));
+        row = Math.max(1, Math.min(this.term.rows, Math.floor((t.clientY - rect.top) / ch) + 1));
+      },
+      { capture: true, passive: true },
+    );
+
+    this.el.addEventListener(
+      'touchmove',
+      (e: TouchEvent) => {
+        if (!tracking || e.touches.length !== 1) return;
+        const t = e.touches[0];
+        if (!scrolling) {
+          const dyTotal = t.clientY - startY;
+          const dxTotal = t.clientX - startX;
+          // Only hijack once the gesture is clearly a vertical drag, so taps
+          // (focus / move cursor) and horizontal gestures still reach xterm.
+          if (Math.abs(dyTotal) < 10 || Math.abs(dyTotal) <= Math.abs(dxTotal)) return;
+          scrolling = true;
+        }
+        e.preventDefault();
+        e.stopPropagation();
+        let dy = t.clientY - lastY;
+        let ticks = 0;
+        while (Math.abs(dy) >= STEP) {
+          if (dy > 0) {
+            ticks += 1; // finger down → scroll back (wheel up)
+            dy -= STEP;
+          } else {
+            ticks -= 1; // finger up → toward the live prompt (wheel down)
+            dy += STEP;
+          }
+        }
+        lastY = t.clientY - dy; // carry the sub-step remainder
+        if (ticks !== 0) this.sendWheel(ticks, col, row);
+      },
+      { capture: true, passive: false },
+    );
+
+    const end = (): void => {
+      tracking = false;
+      scrolling = false;
+    };
+    this.el.addEventListener('touchend', end, { capture: true, passive: true });
+    this.el.addEventListener('touchcancel', end, { capture: true, passive: true });
+  }
+
+  // Emit |ticks| SGR mouse-wheel events (Cb 64 = up, 65 = down; press-only).
+  private sendWheel(ticks: number, col: number, row: number): void {
+    const seq = `\x1b[<${ticks > 0 ? 64 : 65};${col};${row}M`;
+    for (let i = Math.abs(ticks); i > 0; i -= 1) this.send(seq);
   }
 
   private sendResize(): void {
@@ -555,6 +640,7 @@ function reflectActiveStatus(): void {
 
 function updateTabDot(s: Session): void {
   s.tabDot?.classList.toggle('connected', s.connected);
+  refreshMobileUI();
 }
 
 function buildTab(s: Session): void {
@@ -600,6 +686,7 @@ function buildTab(s: Session): void {
   s.tabDot = dot;
   tabsEl.insertBefore(tab, addBtn); // keep the "+" button last
   updateTabDot(s);
+  refreshMobileUI();
 }
 
 function addSession(name: string, makeActive: boolean, displayName?: string): Session {
@@ -622,6 +709,7 @@ function activateSession(s: Session): void {
   s.setActive(true);
   for (const x of sessions) x.tabEl?.classList.toggle('active', x === s);
   reflectActiveStatus();
+  refreshMobileUI();
   saveTabs();
 }
 
@@ -692,6 +780,7 @@ function closeSession(s: Session): void {
     if (next) activateSession(next);
   }
   if (sessions.length === 0) addSession(defaultSessionName, true);
+  refreshMobileUI();
   saveTabs();
 }
 
@@ -718,6 +807,7 @@ function setDisplayName(s: Session, displayName: string): void {
     s.tabLabel.textContent = displayName;
     s.tabLabel.title = `session: ${s.name} (double-click to rename)`;
   }
+  refreshMobileUI();
 }
 
 // Rename a tab (display only). The label can be any text; the underlying tmux
@@ -843,6 +933,7 @@ function removeLocalSession(s: Session): void {
     const next = sessions[idx] ?? sessions[idx - 1] ?? null;
     if (next) activateSession(next);
   }
+  refreshMobileUI();
 }
 
 let syncing = false;
@@ -898,16 +989,35 @@ function fitActive(): void {
   activeSession?.fit();
 }
 
+// Below this width the key bar wraps to several rows (see styles.css) instead
+// of being one horizontally-scrollable row, so its height is no longer fixed.
+const mobileMQ = window.matchMedia('(max-width: 640px)');
+
+// Publish the key bar's real height into --keybar-h so the terminal sits right
+// above it: a fixed value on desktop (single row), the measured wrapped height
+// on a phone.
+function updateKeybarHeight(): void {
+  if (keybarEl.classList.contains('hidden')) {
+    root.style.setProperty('--keybar-h', '0px');
+    return;
+  }
+  const h = mobileMQ.matches ? keybarEl.offsetHeight : KEYBAR_HEIGHT;
+  root.style.setProperty('--keybar-h', `${h}px`);
+}
+
 function setKeybarVisible(visible: boolean): void {
   keybarEl.classList.toggle('hidden', !visible);
-  root.style.setProperty('--keybar-h', visible ? `${KEYBAR_HEIGHT}px` : '0px');
   keysBtn.classList.toggle('active', visible);
+  refreshMobileUI();
   try {
     localStorage.setItem('tw.keybar', visible ? '1' : '0');
   } catch {
     /* ignore */
   }
-  requestAnimationFrame(() => fitActive());
+  requestAnimationFrame(() => {
+    updateKeybarHeight();
+    fitActive();
+  });
 }
 
 function updateKeyboardOffset(): void {
@@ -1115,9 +1225,260 @@ for (const def of KEYS) {
 }
 
 // ---------------------------------------------------------------------------
+// Mobile UI: a compact top bar + a bottom "Sessions" drawer + an actions
+// sheet. Built unconditionally; CSS (@media max-width:640px) hides it on
+// desktop and hides the original #topbar on phones. Everything reuses the
+// existing session functions, so the two layouts stay in sync.
+// ---------------------------------------------------------------------------
+const mobilebar = document.createElement('div');
+mobilebar.id = 'mobilebar';
+
+function mBtn(label: string, title: string, onTap: () => void): HTMLButtonElement {
+  const b = document.createElement('button');
+  b.className = 'm-btn';
+  b.type = 'button';
+  b.textContent = label;
+  b.title = title;
+  b.setAttribute('aria-label', title);
+  b.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    onTap();
+  });
+  return b;
+}
+
+const mMenuBtn = mBtn('☰', 'Sessions', () => openDrawer());
+const mTitle = document.createElement('button');
+mTitle.className = 'm-title';
+mTitle.type = 'button';
+const mTitleDot = document.createElement('span');
+mTitleDot.className = 'tab-dot';
+const mTitleLabel = document.createElement('span');
+mTitleLabel.className = 'm-title-label';
+const mCaret = document.createElement('span');
+mCaret.className = 'm-caret';
+mCaret.textContent = '▾';
+mTitle.append(mTitleDot, mTitleLabel, mCaret);
+mTitle.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  openDrawer();
+});
+
+const mAttachBtn = mBtn('📎', 'Attach a file', () => fileInput.click());
+const mKeysBtn = mBtn('⌨', 'Toggle on-screen keys', () => {
+  setKeybarVisible(keybarEl.classList.contains('hidden'));
+  activeSession?.focus();
+});
+const mMoreBtn = mBtn('⋯', 'More actions', () => openSheet());
+
+mobilebar.append(mMenuBtn, mTitle, mAttachBtn, mKeysBtn, mMoreBtn);
+document.body.append(mobilebar);
+
+// --- Sessions drawer (bottom sheet) ----------------------------------------
+const drawerOverlay = document.createElement('div');
+drawerOverlay.className = 'sheet-overlay hidden';
+const drawer = document.createElement('div');
+drawer.className = 'sheet drawer';
+const drawerGrip = document.createElement('div');
+drawerGrip.className = 'sheet-grip';
+const drawerTitle = document.createElement('div');
+drawerTitle.className = 'sheet-title';
+drawerTitle.textContent = 'Sessions';
+const drawerList = document.createElement('div');
+drawerList.className = 'drawer-list';
+const drawerNew = document.createElement('button');
+drawerNew.className = 'drawer-new';
+drawerNew.type = 'button';
+drawerNew.textContent = '+  New session';
+drawerNew.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  closeDrawer();
+  promptAddSession();
+});
+drawer.append(drawerGrip, drawerTitle, drawerList, drawerNew);
+drawerOverlay.append(drawer);
+document.body.append(drawerOverlay);
+drawerOverlay.addEventListener('pointerdown', (e) => {
+  if (e.target === drawerOverlay) closeDrawer();
+});
+
+let drawerOpen = false;
+
+function renderDrawer(): void {
+  drawerList.textContent = '';
+  for (const s of sessions) {
+    const row = document.createElement('div');
+    row.className = 'drawer-row' + (s === activeSession ? ' active' : '');
+
+    const body = document.createElement('div');
+    body.className = 'drawer-body';
+    const dot = document.createElement('span');
+    dot.className = 'tab-dot' + (s.connected ? ' connected' : '');
+    const name = document.createElement('span');
+    name.className = 'drawer-name';
+    name.textContent = s.displayName;
+    body.append(dot, name);
+    body.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      activateSession(s);
+      closeDrawer();
+    });
+
+    const rename = document.createElement('button');
+    rename.className = 'drawer-act';
+    rename.type = 'button';
+    rename.textContent = '✎';
+    rename.title = 'Rename tab';
+    rename.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      promptRenameSession(s);
+      renderDrawer();
+    });
+
+    const close = document.createElement('button');
+    close.className = 'drawer-act danger';
+    close.type = 'button';
+    close.textContent = '×';
+    close.title = 'Close tab & kill session';
+    close.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      closeDrawer();
+      confirmCloseSession(s);
+    });
+
+    row.append(body, rename, close);
+    drawerList.append(row);
+  }
+}
+
+function openDrawer(): void {
+  renderDrawer();
+  drawerOverlay.classList.remove('hidden');
+  drawerOpen = true;
+}
+function closeDrawer(): void {
+  drawerOverlay.classList.add('hidden');
+  drawerOpen = false;
+  activeSession?.focus();
+}
+
+// --- Actions sheet (font / restart / paste / fullscreen / help) ------------
+const sheetOverlay = document.createElement('div');
+sheetOverlay.className = 'sheet-overlay hidden';
+const sheet = document.createElement('div');
+sheet.className = 'sheet actions-sheet';
+const sheetGrip = document.createElement('div');
+sheetGrip.className = 'sheet-grip';
+const sheetTitle = document.createElement('div');
+sheetTitle.className = 'sheet-title';
+sheetTitle.textContent = 'Actions';
+
+const fontRow = document.createElement('div');
+fontRow.className = 'sheet-font';
+const fontMinus = document.createElement('button');
+fontMinus.className = 'sf-btn';
+fontMinus.type = 'button';
+fontMinus.textContent = 'A−';
+const fontVal = document.createElement('div');
+fontVal.className = 'sf-val';
+const fontPlus = document.createElement('button');
+fontPlus.className = 'sf-btn';
+fontPlus.type = 'button';
+fontPlus.textContent = 'A+';
+function updateFontVal(): void {
+  fontVal.textContent = `Font ${currentFont}px`;
+}
+fontMinus.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  changeFont(-1);
+  updateFontVal();
+});
+fontPlus.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  changeFont(1);
+  updateFontVal();
+});
+fontRow.append(fontMinus, fontVal, fontPlus);
+
+function sheetRow(ico: string, label: string, onTap: () => void): HTMLButtonElement {
+  const b = document.createElement('button');
+  b.className = 'sheet-row';
+  b.type = 'button';
+  const i = document.createElement('span');
+  i.className = 'sheet-ico';
+  i.textContent = ico;
+  const t = document.createElement('span');
+  t.textContent = label;
+  b.append(i, t);
+  b.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    onTap();
+  });
+  return b;
+}
+
+sheet.append(
+  sheetGrip,
+  sheetTitle,
+  fontRow,
+  sheetRow('⟳', 'Restart this session', () => {
+    closeSheet();
+    activeSession?.restart();
+    activeSession?.focus();
+  }),
+  sheetRow('📋', 'Paste', () => {
+    closeSheet();
+    pasteFromClipboard();
+  }),
+  sheetRow('⤢', 'Toggle fullscreen', () => {
+    closeSheet();
+    toggleFullscreen();
+  }),
+  sheetRow('?', 'Help: copy / paste / files', () => {
+    closeSheet();
+    openHelp();
+  }),
+);
+sheetOverlay.append(sheet);
+document.body.append(sheetOverlay);
+sheetOverlay.addEventListener('pointerdown', (e) => {
+  if (e.target === sheetOverlay) closeSheet();
+});
+
+function openSheet(): void {
+  updateFontVal();
+  sheetOverlay.classList.remove('hidden');
+}
+function closeSheet(): void {
+  sheetOverlay.classList.add('hidden');
+}
+
+// Keep the mobile bar's title + connection dot current, and re-render the open
+// drawer when the session list / active tab / connection state changes.
+function refreshMobileUI(): void {
+  const s = activeSession;
+  mTitleLabel.textContent = s ? s.displayName : '—';
+  mTitleDot.classList.toggle('connected', !!s?.connected);
+  mKeysBtn.classList.toggle('active', !keybarEl.classList.contains('hidden'));
+  if (drawerOpen) renderDrawer();
+}
+refreshMobileUI();
+
+// ---------------------------------------------------------------------------
 // Global resize handling
 // ---------------------------------------------------------------------------
-window.addEventListener('resize', () => fitActive());
+window.addEventListener('resize', () => {
+  updateKeybarHeight(); // rows may re-wrap when the width changes
+  fitActive();
+});
+// Re-measure when crossing the mobile breakpoint (e.g. rotating the phone),
+// since the key bar switches between a fixed row and the wrapped layout.
+mobileMQ.addEventListener('change', () => {
+  updateKeybarHeight();
+  fitActive();
+});
 let areaObserver: ResizeObserver | null = null;
 if (typeof ResizeObserver !== 'undefined') {
   areaObserver = new ResizeObserver(() => fitActive());
