@@ -1034,10 +1034,12 @@ function setKeybarVisible(visible: boolean): void {
 function updateKeyboardOffset(): void {
   const vv = window.visualViewport;
   const raw = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) : 0;
-  // Only a real soft keyboard takes up meaningful height. Ignore small
-  // discrepancies — e.g. the home-indicator safe area in a standalone PWA,
-  // which otherwise gets mistaken for a keyboard and leaves a gap at the bottom.
-  const offset = raw > 100 ? raw : 0;
+  // Only a real soft keyboard (>~250px) takes up meaningful height. In a
+  // standalone PWA, window.innerHeight includes the status-bar + home-indicator
+  // areas that visualViewport.height excludes, so with no keyboard `raw` is the
+  // safe-area sum (~95–110px) — ignore anything below 150px so that isn't
+  // mistaken for a keyboard and left as a gap at the bottom.
+  const offset = raw > 150 ? raw : 0;
   root.style.setProperty('--kb-offset', `${offset}px`);
   fitActive();
 }
@@ -1144,19 +1146,21 @@ makeButton(controlsEl, 'tb-btn tb-icon', '?', 'Help: copy / paste / files', open
 
 // --- on-screen key bar (sends to the active session) -----------------------
 interface KeyDef {
-  label: string;
+  label?: string;
   seq?: string;
   mod?: 'ctrl' | 'alt';
   action?: 'copy' | 'paste';
+  /** Force a line break here (mobile only): the keys after it wrap to a new row. */
+  rowBreak?: boolean;
 }
 const KEYS: KeyDef[] = [
-  { label: 'Copy', action: 'copy' },
-  { label: 'Paste', action: 'paste' },
   { label: 'Esc', seq: '\x1b' },
   { label: 'Tab', seq: '\t' },
   { label: 'Ctrl', mod: 'ctrl' },
   { label: 'Alt', mod: 'alt' },
   { label: '^C', seq: '\x03' },
+  // On a phone the arrows get their own second row; everything else stays on the first.
+  { rowBreak: true },
   { label: '←', seq: '\x1b[D' },
   { label: '↑', seq: '\x1b[A' },
   { label: '↓', seq: '\x1b[B' },
@@ -1191,11 +1195,17 @@ function applyMods(seq: string): string {
 }
 
 for (const def of KEYS) {
+  if (def.rowBreak) {
+    const brk = document.createElement('div');
+    brk.className = 'kb-break';
+    keybarEl.append(brk);
+    continue;
+  }
   const b = document.createElement('button');
   b.className = 'kb-key';
   b.type = 'button';
-  b.textContent = def.label;
-  b.title = def.label;
+  b.textContent = def.label ?? '';
+  b.title = def.label ?? '';
   if (def.mod) modButtons[def.mod] = b;
   b.addEventListener('pointerdown', (e) => {
     e.preventDefault();
