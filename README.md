@@ -2,29 +2,41 @@
 
 A web-based terminal: open a browser tab, get a real shell. The shell runs
 inside a **tmux** session, so closing the window (or losing your network) just
-detaches — your programs keep running and reattach when you come back.
+detaches — your programs keep running and reattach when you come back. Open it
+on your laptop and keep going from your phone — it's the **same live session**.
 
-![terminal-web — tabs, on-screen key bar, and a live shell](docs/screenshot.png)
+![terminal-web — a live, resumable shell in your browser](docs/demo.gif)
+
+<table>
+  <tr>
+    <td><img src="docs/screenshot.png" alt="Desktop: tabs, control bar, and a live shell"></td>
+    <td width="34%"><img src="docs/mobile.png" alt="Mobile: compact top bar and on-screen key bar"></td>
+  </tr>
+</table>
 
 Built with [xterm.js](https://xtermjs.org/) on the front end and a small
 Node.js + TypeScript server using [`ws`](https://github.com/websockets/ws) and
 [`node-pty`](https://github.com/microsoft/node-pty) on the back end.
 
 It's designed to live on your **Tailnet**: the server binds to your Tailscale
-IP and there is **no application-level authentication** — anyone who can reach
-the address gets a full shell. See [Security](#security).
+IP and, by default, has **no application-level auth** — anyone who can reach the
+address gets a full shell. To expose it more widely (e.g. behind a tunnel), set
+an `AUTH_TOKEN` to gate access with a shared token. See [Security](#security).
 
 **Features**
 
 - **Resumable** sessions (tmux) — survive disconnect, refresh and sleep
-- Deep **scrollback** (mouse-wheel)
-- **Multi-session tabs** — open (`+`), close-and-kill (`×`), restart (`⟳`)
-- **On-screen keys** for iPad/touch — arrows, Esc/Tab/sticky Ctrl·Alt, Copy/Paste
+- Deep **scrollback** (mouse-wheel, or one-finger drag on touch)
+- **Multi-session tabs** — open (`+`), rename (double-tap), close-and-kill (`×`),
+  restart (`⟳`); the tab list **syncs across all your devices**
+- **Mobile layout + installable PWA** — compact top bar, a sessions drawer, and
+  an on-screen key bar (arrows, Esc/Tab/sticky Ctrl·Alt, `^C`)
 - **Copy & paste** that works over plain HTTP (no HTTPS required)
 - **Attach any file** (button / paste / drag) → upload → insert path, for **Claude
   Code** and other AI CLIs
 - Font size, fullscreen, IME (CJK) input, and a `?` help overlay
-- Runs over **Tailscale** or any **LAN/intranet** IP
+- Runs over **Tailscale** or any **LAN/intranet** IP; optional **shared-token
+  auth** (`AUTH_TOKEN`) to safely expose it beyond your Tailnet
 - Optional **background service** (launchd on macOS, systemd on Linux)
 
 ---
@@ -349,6 +361,7 @@ your shell instead, e.g. `HOST=100.x.y.z PORT=8090 npm start`.
 | `PORT`            | `8090`                                               | Port the HTTP/WebSocket server listens on.                                  |
 | `HOST`            | Tailscale IPv4 (`tailscale ip -4`), else `0.0.0.0`   | Address to bind. Set explicitly to pin a specific interface/IP.             |
 | `DEFAULT_SESSION` | `web`                                                | tmux session name used when the client doesn't pass `?session=NAME`.        |
+| `AUTH_TOKEN`      | _(empty = no auth)_                                  | Shared token required for requests arriving via Cloudflare; see [Security](#security). |
 | `UPLOAD_DIR`      | `~/terminal-web-uploads`                             | Where pasted/dropped/attached files are saved (see below).                  |
 | `UPLOAD_RETENTION_HOURS` | `72`                                          | Auto-delete uploads older than this (0 = never by age).                     |
 | `UPLOAD_MAX_FILES` | `100`                                               | Keep at most this many uploads, newest first (0 = unlimited).               |
@@ -387,14 +400,21 @@ our own `clip-*` files are touched. Set either to `0` to disable that limit.
 
 ## Security
 
-**There is no application-level authentication.** Anyone who can reach the
-bound address gets an interactive shell as the user running the server.
+By default **there is no application-level authentication** — anyone who can
+reach the bound address gets an interactive shell as the user running the server.
 
 - Keep it **Tailnet-only**: leave `HOST` pointed at your Tailscale IP (the
   default behavior) so the server is not exposed on your LAN or the public
   internet. Avoid binding to `0.0.0.0` on untrusted networks.
 - Lock it down further with **Tailscale ACLs** so only specific devices/users
   on your tailnet can reach the port.
+- **Exposing it beyond your Tailnet?** Set `AUTH_TOKEN` to a long random secret
+  (e.g. `openssl rand -hex 24`). Requests that arrive **through Cloudflare**
+  (detected via the `Cf-Ray` / `Cf-Connecting-Ip` headers it stamps) then require
+  the token — open it once with `?token=…` to set a cookie; the WebSocket is
+  gated too. Direct Tailnet/LAN access stays token-free. A static shared token is
+  **not** a substitute for real auth (no per-user identity or MFA); for stronger
+  control, front it with an identity-aware proxy (Cloudflare Access, Tailscale, …).
 - The server speaks **plain HTTP** (no TLS), which isn't a *secure context*, so
   the browser's `navigator.clipboard` API is blocked. Copy/paste still works via
   fallbacks — see [Copy, paste & clipboard](#copy-paste--clipboard). For the
