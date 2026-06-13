@@ -355,8 +355,32 @@ class Session {
       });
     }
 
+    // iOS routes a CJK keyboard's punctuation, numbers and space through the IME
+    // as a plain insertText (no composition, no normal keydown), and xterm.js
+    // drops them. Forward any insertText that xterm doesn't turn into an onData
+    // within a tick, and clear the textarea so the dropped char isn't re-read.
+    // xterm-handled input (English keys, committed CJK) reconciles via onData
+    // below, so nothing is sent twice.
+    let pendingInsert: string | null = null;
+    if (ta) {
+      ta.addEventListener('input', (e) => {
+        const ie = e as InputEvent;
+        if (ie.isComposing || ie.inputType !== 'insertText' || !ie.data) return;
+        const data = ie.data;
+        pendingInsert = data;
+        window.setTimeout(() => {
+          if (pendingInsert !== data) return; // xterm handled it, or superseded
+          pendingInsert = null;
+          ta.value = '';
+          this.debug('forward-insertText', data);
+          this.send(data);
+        }, 0);
+      });
+    }
+
     this.term.onData((data: string) => {
       this.debug('onData', data);
+      if (pendingInsert !== null && data === pendingInsert) pendingInsert = null; // xterm handled it
       const now = performance.now();
       // Only dedupe multibyte (IME) content; ASCII/control input is never touched.
       if (
