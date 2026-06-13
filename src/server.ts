@@ -30,6 +30,13 @@ const config = loadConfig();
 // shows up in /api/sessions immediately, before its tag write has landed.
 const liveSessions = new Set<string>();
 
+// Every pty currently alive (one per attached WebSocket). Its size is capped at
+// config.maxPtys before we ever spawn another tmux client, so a runaway or
+// rapidly-reconnecting client can't exhaust the host's small system-wide pty
+// table (macOS kern.tty.ptmx_max is only ~511) and lock everything — including
+// new SSH logins — out of allocating a terminal.
+const livePtys = new Set<pty.IPty>();
+
 // Every WebSocket currently attached to each session name. Used to tell the
 // *other* devices on a session that it was closed, so they drop the tab instead
 // of auto-reconnecting (which would resurrect the just-killed tmux session).
@@ -584,6 +591,26 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
   }
   const session = sanitizeSession(requested ?? config.defaultSession);
 
+  // Guard the host's system-wide pty table: refuse the connection (before
+  // spawning any pty) once we're at the cap, rather than letting a runaway or
+  // flapping client pile up ptys until macOS can't allocate one for SSH either.
+  if (livePtys.size >= config.maxPtys) {
+    console.warn(
+      `[ws] pty cap reached (${livePtys.size}/${config.maxPtys}); refusing "${session}". ` +
+        "Close unused tabs, or raise MAX_PTYS."
+    );
+    sendJson(ws, {
+      type: "info",
+      message: `Server is at its terminal limit (${config.maxPtys}). Close an unused tab and reconnect.`,
+    });
+    try {
+      ws.close(1013, "pty cap reached");
+    } catch {
+      /* ignore */
+    }
+    return;
+  }
+
   let proc: pty.IPty;
   try {
     proc = pty.spawn("tmux", tmuxArgs(session, config.tmuxConfPath), {
@@ -604,7 +631,11 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
     return;
   }
 
-  console.log(`[ws] connected -> tmux session "${session}" (pid ${proc.pid})`);
+  livePtys.add(proc);
+  console.log(
+    `[ws] connected -> tmux session "${session}" (pid ${proc.pid}) ` +
+      `[${livePtys.size}/${config.maxPtys} ptys]`
+  );
 
   // Tag the tmux session as a web tab so every device sees it (cross-device
   // sync), and note it as live so /api/sessions lists it without waiting for
@@ -619,6 +650,7 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
     if (closed) return;
     closed = true;
     liveSessions.delete(session);
+    livePtys.delete(proc);
     try {
       // Killing the pty only detaches this tmux client; the server/session
       // persist so the session can be resumed on reconnect.
@@ -645,6 +677,7 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
     );
     closed = true; // pty is already gone; avoid kill() in cleanup
     liveSessions.delete(session);
+    livePtys.delete(proc);
     if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
       try {
         ws.close(1000, "pty exited");
@@ -832,6 +865,7 @@ function logStartup(): void {
     );
   }
   console.log(`  Default session: "${config.defaultSession}"  (override with ?session=NAME)`);
+  console.log(`  Max concurrent terminals: ${config.maxPtys}  (set MAX_PTYS to change)`);
   console.log("");
 }
 
@@ -841,15 +875,23 @@ server.listen(config.port, config.host, () => {
 });
 
 server.on("error", (err: NodeJS.ErrnoException) => {
+  if (err.code === "EADDRNOTAVAIL") {
+    // launchd starts us at boot before tailscaled has configured the tailnet IP
+    // we bind to, so the first bind fails with EADDRNOTAVAIL. Wait and retry the
+    // same bind instead of exiting — exiting made launchd crash-loop us dozens
+    // of times until Tailscale finally came up. The original `listen` callback
+    // (registered via once('listening')) still fires on the eventual success.
+    console.warn(
+      `[server] cannot bind to ${config.host}:${config.port} yet ` +
+        "(address not available — waiting for Tailscale/interface). Retrying in 3s…"
+    );
+    setTimeout(() => server.listen(config.port, config.host), 3000);
+    return;
+  }
   if (err.code === "EADDRINUSE") {
     console.error(
       `[server] port ${config.port} on ${config.host} is already in use. ` +
         "Set PORT to a free port or stop the other process."
-    );
-  } else if (err.code === "EADDRNOTAVAIL") {
-    console.error(
-      `[server] cannot bind to host ${config.host} (address not available). ` +
-        "Is Tailscale up? You can set HOST=0.0.0.0 to bind all interfaces."
     );
   } else {
     console.error("[server] error:", err);

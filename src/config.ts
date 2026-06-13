@@ -31,6 +31,9 @@ export interface Config {
   uploadMaxBytes: number;
   /** Shared token required to access the app (HTTP + WS). Empty = no auth. */
   authToken: string;
+  /** Max concurrent ptys/terminals; new connections past this are refused to
+   *  protect the host's small system-wide pty table (kern.tty.ptmx_max). */
+  maxPtys: number;
   /** Detected Tailscale IPv4 address, if any (for nicer startup logging). */
   tailscaleIp: string | null;
 }
@@ -121,6 +124,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     uploadMaxFiles: parseNonNegInt(env.UPLOAD_MAX_FILES, 100),
     uploadMaxBytes: parseNonNegInt(env.UPLOAD_MAX_MB, 25) * 1024 * 1024,
     authToken: (env.AUTH_TOKEN ?? "").trim(),
+    maxPtys: Math.max(1, parseNonNegInt(env.MAX_PTYS, 48)),
     tailscaleIp,
   };
 }

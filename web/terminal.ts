@@ -545,8 +545,11 @@ class Session {
     if (this.disposed) return;
     if (this.reconnectTimer !== null) return;
     if (isActive(this)) showStatus('reconnecting…');
-    const delay = this.reconnectDelay;
+    const base = this.reconnectDelay;
     this.reconnectDelay = Math.min(this.reconnectDelay * 2, MAX_DELAY);
+    // Jitter ±50%: when several sessions drop together (e.g. a server restart)
+    // this staggers their reconnects instead of firing them all as one burst.
+    const delay = Math.round(base * (0.5 + Math.random()));
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.connect();
