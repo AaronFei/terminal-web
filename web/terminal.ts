@@ -355,32 +355,43 @@ class Session {
       });
     }
 
-    // iOS routes a CJK keyboard's punctuation, numbers and space through the IME
-    // as a plain insertText (no composition, no normal keydown), and xterm.js
-    // drops them. Forward any insertText that xterm doesn't turn into an onData
-    // within a tick, and clear the textarea so the dropped char isn't re-read.
-    // xterm-handled input (English keys, committed CJK) reconciles via onData
-    // below, so nothing is sent twice.
-    let pendingInsert: string | null = null;
+    // iOS CJK keyboards send punctuation, numbers and space as a keydown with
+    // keyCode 229 and the character in .key, but with NO composition and NO
+    // input event — so xterm.js drops them (in Chinese mode those keys did
+    // nothing). A real composition key (Bopomofo / pinyin letter) is also
+    // keyCode 229 but is followed by compositionstart within a few ms. So on
+    // such a keydown we schedule the character, cancel it if a composition
+    // starts, and otherwise forward it. English keys (real keyCode) and
+    // committed CJK (compositionend → onData) are untouched, so nothing doubles.
     if (ta) {
-      ta.addEventListener('input', (e) => {
-        const ie = e as InputEvent;
-        if (ie.isComposing || ie.inputType !== 'insertText' || !ie.data) return;
-        const data = ie.data;
-        pendingInsert = data;
+      const pendingKeys = new Map<number, string>();
+      let lastSeq = -1;
+      let seq = 0;
+      ta.addEventListener('compositionstart', () => {
+        if (lastSeq >= 0) {
+          pendingKeys.delete(lastSeq); // that keydown actually began a composition
+          lastSeq = -1;
+        }
+      });
+      ta.addEventListener('keydown', (e) => {
+        const ke = e as KeyboardEvent;
+        if (ke.keyCode !== 229 || ke.isComposing) return;
+        const k = ke.key;
+        if (!k || k.length !== 1) return; // a single printable char (not Enter/Backspace/…)
+        const s = ++seq;
+        pendingKeys.set(s, k);
+        lastSeq = s;
         window.setTimeout(() => {
-          if (pendingInsert !== data) return; // xterm handled it, or superseded
-          pendingInsert = null;
-          ta.value = '';
-          this.debug('forward-insertText', data);
-          this.send(data);
-        }, 0);
+          if (!pendingKeys.has(s)) return; // a composition consumed it
+          pendingKeys.delete(s);
+          this.debug('forward-key', k);
+          this.send(k);
+        }, 80);
       });
     }
 
     this.term.onData((data: string) => {
       this.debug('onData', data);
-      if (pendingInsert !== null && data === pendingInsert) pendingInsert = null; // xterm handled it
       const now = performance.now();
       // Only dedupe multibyte (IME) content; ASCII/control input is never touched.
       if (
