@@ -367,15 +367,22 @@ class Session {
       const pendingKeys = new Map<number, string>();
       let lastSeq = -1;
       let seq = 0;
-      ta.addEventListener('compositionstart', () => {
+      // Any composition activity means the most-recent IME keydown was actually
+      // composition input (Bopomofo / pinyin), so cancel its pending forward.
+      // The truly-dropped keys (punctuation / number / space) produce no
+      // composition event at all, so their forward survives and fires.
+      const cancelLast = (): void => {
         if (lastSeq >= 0) {
-          pendingKeys.delete(lastSeq); // that keydown actually began a composition
+          pendingKeys.delete(lastSeq);
           lastSeq = -1;
         }
-      });
+      };
+      ta.addEventListener('compositionstart', cancelLast);
+      ta.addEventListener('compositionupdate', cancelLast);
+      ta.addEventListener('compositionend', cancelLast);
       ta.addEventListener('keydown', (e) => {
         const ke = e as KeyboardEvent;
-        if (ke.keyCode !== 229 || ke.isComposing) return;
+        if (ke.keyCode !== 229) return; // only IME-routed keys
         const k = ke.key;
         if (!k || k.length !== 1) return; // a single printable char (not Enter/Backspace/…)
         const s = ++seq;
@@ -386,7 +393,7 @@ class Session {
           pendingKeys.delete(s);
           this.debug('forward-key', k);
           this.send(k);
-        }, 80);
+        }, 90);
       });
     }
 
