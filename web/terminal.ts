@@ -1162,6 +1162,7 @@ const KEYS: KeyDef[] = [
   { label: 'Ctrl', mod: 'ctrl' },
   { label: 'Alt', mod: 'alt' },
   { label: '^C', seq: '\x03' },
+  { label: 'Enter', seq: '\r' },
   // On a phone the arrows get their own second row; everything else stays on the first.
   { rowBreak: true },
   { label: '←', seq: '\x1b[D' },
