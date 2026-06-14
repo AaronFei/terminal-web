@@ -658,6 +658,20 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
     } catch (err) {
       console.error("[ws] error killing pty:", err);
     }
+    // kill() only signals the child — it does NOT close the pty master fd.
+    // node-pty closes that fd only when its master ReadStream reaches EOF, but
+    // ws.on("close") disposes onData first, which pauses that stream, so after
+    // kill() the master /dev/ptmx stays open forever — an orphaned fd that still
+    // counts against macOS's ~511 system-wide pty limit. Stale-WS churn (a
+    // sleeping phone, a Tailscale flap → heartbeat terminate) then leaks one pty
+    // per disconnect until SSH itself can't allocate a tty. destroy() force-
+    // destroys the master ReadStream and closes the fd deterministically.
+    // (IPty's public typing omits destroy(); the runtime UnixTerminal has it.)
+    try {
+      (proc as unknown as { destroy?: () => void }).destroy?.();
+    } catch (err) {
+      console.error("[ws] error destroying pty:", err);
+    }
   };
 
   // pty output -> ws (binary)
@@ -838,6 +852,58 @@ const heartbeat = setInterval(() => {
   }
 }, HEARTBEAT_MS);
 heartbeat.unref();
+
+// Safety net for pty-fd leaks we can't fix from JS: a failed pty.spawn() can
+// orphan a master fd in node-pty's native layer (the throw leaves us no handle
+// to close), and we can't rule out other node-pty leaks. The destroy() in
+// cleanup() fixes the known disconnect leak, but ANY residual leak must never be
+// allowed to creep up to macOS's ~511 system-wide pty cap and lock SSH out
+// again (the 2026-06-13 incident). Periodically count THIS process's open pty
+// masters (character-device fds) via /dev/fd; if they exceed a ceiling far below
+// the system limit but well above maxPtys, log loudly and exit so launchd
+// (KeepAlive) restarts us cleanly. The tmux sessions live in a separate server
+// process and survive, so clients just reconnect into them.
+//
+// node-pty holds ~3 character-device fds per LIVE pty (two on /dev/ptmx — the
+// master ReadStream and its write stream — plus the slave /dev/ttysN), so a
+// fully-loaded server legitimately sits near 3 * maxPtys char-device fds. Trip
+// at 4 * maxPtys (+ a little for stdio) so we never false-fire at capacity, yet
+// still fire hundreds of fds short of the ~511 system cap when something leaks.
+const PTY_FD_CEILING = config.maxPtys * 4 + 16;
+
+function countOwnPtyFds(): number {
+  let fds: string[];
+  try {
+    fds = fs.readdirSync("/dev/fd");
+  } catch {
+    return 0; // not introspectable here (non-macOS / sandbox) — skip the check
+  }
+  let n = 0;
+  for (const entry of fds) {
+    const fd = Number(entry);
+    if (!Number.isInteger(fd)) continue;
+    try {
+      if (fs.fstatSync(fd).isCharacterDevice()) n++;
+    } catch {
+      /* fd vanished or not stat-able (kqueue, listening socket) — ignore */
+    }
+  }
+  return n;
+}
+
+const ptyLeakWatchdog = setInterval(() => {
+  const ptyFds = countOwnPtyFds();
+  if (ptyFds > PTY_FD_CEILING) {
+    console.error(
+      `[watchdog] open pty fds (${ptyFds}) exceeded ceiling ${PTY_FD_CEILING} ` +
+        `(live ptys ${livePtys.size}/${config.maxPtys}) — a pty fd leak is ` +
+        "filling the system pty table; exiting so launchd restarts cleanly " +
+        "(tmux sessions persist)."
+    );
+    process.exit(1);
+  }
+}, HEARTBEAT_MS);
+ptyLeakWatchdog.unref();
 
 // ---------------------------------------------------------------------------
 // Startup & graceful shutdown
