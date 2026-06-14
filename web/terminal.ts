@@ -1672,36 +1672,73 @@ function flashStatus(text: string, ms: number): void {
   }, ms);
 }
 
-async function uploadFile(file: Blob, name?: string): Promise<void> {
-  if (!file) return;
-  showStatus('uploading file…');
-  try {
-    const res = await fetch(
-      '/upload' + (name ? `?name=${encodeURIComponent(name)}` : ''),
-      {
-        method: 'POST',
-        headers: { 'Content-Type': file.type || 'application/octet-stream' },
-        body: file,
-      },
-    );
-    if (!res.ok) {
-      flashStatus('file upload failed', 2500);
+function fmtMB(bytes: number): string {
+  return (bytes / (1024 * 1024)).toFixed(1);
+}
+
+// Upload via XMLHttpRequest (not fetch): fetch exposes no upload-progress
+// events, so a big file (e.g. 75 MB) just sat on "uploading…" with no feedback.
+// xhr.upload.onprogress lets us show a live percentage, and parsing the server's
+// JSON {error} surfaces *why* an upload failed (e.g. "file too large") instead
+// of a generic message. Never rejects — always resolves so callers can `void` it.
+function uploadFile(file: Blob, name?: string): Promise<void> {
+  return new Promise((resolve) => {
+    if (!file) {
+      resolve();
       return;
     }
-    const data = (await res.json()) as { path?: string };
-    if (data.path && activeSession) {
-      // Quote the path if it contains whitespace; append a space so it reads as
-      // a complete argument at the prompt.
-      const p = /\s/.test(data.path)
-        ? `'${data.path.replace(/'/g, `'\\''`)}'`
-        : data.path;
-      activeSession.sendSeq(p + ' ');
-      activeSession.focus();
-    }
-    flashStatus(`file added: ${data.path ?? ''}`, 2500);
-  } catch {
-    flashStatus('file upload failed', 2500);
-  }
+    const label = name ?? 'file';
+    showStatus(`uploading ${label}… 0%`);
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/upload' + (name ? `?name=${encodeURIComponent(name)}` : ''));
+    xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+
+    xhr.upload.onprogress = (e): void => {
+      if (e.lengthComputable) {
+        const pct = Math.round((e.loaded / e.total) * 100);
+        showStatus(
+          `uploading ${label}… ${pct}% (${fmtMB(e.loaded)}/${fmtMB(e.total)} MB)`,
+        );
+      } else {
+        showStatus(`uploading ${label}… ${fmtMB(e.loaded)} MB`);
+      }
+    };
+    // All bytes are sent; the server is now writing the file and replying.
+    xhr.upload.onload = (): void => showStatus(`uploading ${label}… finishing…`);
+
+    xhr.onload = (): void => {
+      let data: { path?: string; error?: string } = {};
+      try {
+        data = JSON.parse(xhr.responseText) as typeof data;
+      } catch {
+        /* non-JSON response */
+      }
+      if (xhr.status >= 200 && xhr.status < 300 && data.path) {
+        if (activeSession) {
+          // Quote the path if it contains whitespace; append a space so it reads
+          // as a complete argument at the prompt.
+          const p = /\s/.test(data.path)
+            ? `'${data.path.replace(/'/g, `'\\''`)}'`
+            : data.path;
+          activeSession.sendSeq(p + ' ');
+          activeSession.focus();
+        }
+        flashStatus(`file added: ${data.path}`, 2500);
+      } else {
+        flashStatus(
+          data.error ? `upload failed: ${data.error}` : 'file upload failed',
+          3500,
+        );
+      }
+      resolve();
+    };
+    xhr.onerror = (): void => {
+      flashStatus('file upload failed', 2500);
+      resolve();
+    };
+    xhr.send(file);
+  });
 }
 
 // Capture phase: xterm's own paste handler calls stopPropagation() on its

@@ -122,7 +122,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     uploadDir,
     uploadRetentionHours: parseNonNegInt(env.UPLOAD_RETENTION_HOURS, 72),
     uploadMaxFiles: parseNonNegInt(env.UPLOAD_MAX_FILES, 100),
-    uploadMaxBytes: parseNonNegInt(env.UPLOAD_MAX_MB, 25) * 1024 * 1024,
+    uploadMaxBytes: parseNonNegInt(env.UPLOAD_MAX_MB, 200) * 1024 * 1024,
     authToken: (env.AUTH_TOKEN ?? "").trim(),
     maxPtys: Math.max(1, parseNonNegInt(env.MAX_PTYS, 48)),
     tailscaleIp,
