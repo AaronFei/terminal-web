@@ -848,9 +848,86 @@ function nextSessionName(): string {
   return `s${i}`;
 }
 
-function promptAddSession(): void {
+// PWA-safe replacement for window.prompt(). iOS standalone WebViews (display:
+// standalone — see manifest) suppress or hang on the native prompt/alert/confirm
+// dialogs, which froze the whole UI when "+ New session" / rename were tapped.
+// Render our own overlay instead (same pattern as confirmCloseSession). Resolves
+// to the entered text, or null if cancelled/dismissed.
+function domPrompt(opts: {
+  label: string;
+  value?: string;
+  okText?: string;
+}): Promise<string | null> {
+  return new Promise((resolve) => {
+    if (document.querySelector('.prompt-overlay')) {
+      resolve(null);
+      return;
+    }
+    const overlay = document.createElement('div');
+    overlay.className = 'paste-overlay prompt-overlay';
+    const box = document.createElement('div');
+    box.className = 'paste-box prompt-box';
+    const label = document.createElement('div');
+    label.className = 'paste-label';
+    label.textContent = opts.label;
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'prompt-input';
+    input.value = opts.value ?? '';
+    input.autocapitalize = 'off';
+    input.autocomplete = 'off';
+    input.spellcheck = false;
+    const row = document.createElement('div');
+    row.className = 'paste-row';
+    const cancel = document.createElement('button');
+    cancel.className = 'tb-btn';
+    cancel.type = 'button';
+    cancel.textContent = 'Cancel';
+    const ok = document.createElement('button');
+    ok.className = 'tb-btn';
+    ok.type = 'button';
+    ok.textContent = opts.okText ?? 'OK';
+    row.append(cancel, ok);
+    box.append(label, input, row);
+    overlay.append(box);
+    document.body.append(overlay);
+    window.setTimeout(() => {
+      input.focus();
+      input.select();
+    }, 0);
+
+    let done = false;
+    const finish = (result: string | null): void => {
+      if (done) return;
+      done = true;
+      overlay.remove();
+      activeSession?.focus();
+      resolve(result);
+    };
+    cancel.addEventListener('click', () => finish(null));
+    ok.addEventListener('click', () => finish(input.value));
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) finish(null);
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        finish(input.value);
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        finish(null);
+      }
+    });
+  });
+}
+
+async function promptAddSession(): Promise<void> {
   const suggestion = nextSessionName();
-  const raw = window.prompt('New session name:', suggestion);
+  const raw = await domPrompt({
+    label: 'New session name:',
+    value: suggestion,
+    okText: 'Create',
+  });
   if (raw === null) return; // cancelled
   addSession(sanitizeName(raw) ?? suggestion, true);
 }
@@ -868,11 +945,12 @@ function setDisplayName(s: Session, displayName: string): void {
 
 // Rename a tab (display only). The label can be any text; the underlying tmux
 // session keeps its original name, so × still kills the right session.
-function promptRenameSession(s: Session): void {
-  const raw = window.prompt(
-    `Rename tab (display only — the tmux session stays "${s.name}"):`,
-    s.displayName,
-  );
+async function promptRenameSession(s: Session): Promise<void> {
+  const raw = await domPrompt({
+    label: `Rename tab (display only — the tmux session stays "${s.name}"):`,
+    value: s.displayName,
+    okText: 'Rename',
+  });
   if (raw === null) return; // cancelled
   const trimmed = raw.trim().slice(0, 64);
   setDisplayName(s, trimmed.length ? trimmed : s.name);

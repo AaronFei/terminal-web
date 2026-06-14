@@ -378,6 +378,23 @@ body {
   margin-top: 10px;
 }
 
+/* Single-line input for the PWA-safe prompt overlay (domPrompt) */
+.prompt-input {
+  width: 100%;
+  box-sizing: border-box;
+  background: #1e1e1e;
+  color: #d4d4d4;
+  border: 1px solid #3a3a3a;
+  border-radius: 6px;
+  padding: 10px;
+  font-family: var(--mono);
+  font-size: 16px; /* >=16px so iOS Safari doesn't zoom on focus */
+}
+.prompt-input:focus {
+  outline: none;
+  border-color: #0a84ff;
+}
+
 /* Help overlay */
 .help-box {
   width: min(92vw, 600px);
