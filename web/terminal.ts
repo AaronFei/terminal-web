@@ -539,7 +539,14 @@ class Session {
     if (active) {
       requestAnimationFrame(() => {
         this.fit();
-        this.term.focus();
+        // On touch (phones / iOS PWA), don't auto-focus the terminal when a
+        // session becomes active: focusing xterm's hidden textarea pops up the
+        // soft keyboard, so every tab switch forced the keyboard open and the
+        // user had to dismiss it each time. Skip the programmatic focus on a
+        // coarse pointer — tapping the terminal still focuses it (and raises the
+        // keyboard) when the user actually wants to type. Desktop keeps the
+        // immediate focus so you can type right after switching.
+        if (!window.matchMedia('(pointer: coarse)').matches) this.term.focus();
       });
     }
   }
