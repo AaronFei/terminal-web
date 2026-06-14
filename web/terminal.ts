@@ -1523,7 +1523,13 @@ function openDrawer(): void {
 function closeDrawer(): void {
   drawerOverlay.classList.add('hidden');
   drawerOpen = false;
-  activeSession?.focus();
+  // Don't focus the terminal on touch: this runs inside the tap gesture that
+  // picked a session, and a synchronous focus() raises the soft keyboard — so
+  // every session switch popped the keyboard. (This, not setActive()'s rAF
+  // focus, was the real culprit: focus() outside a user gesture doesn't raise
+  // the keyboard on iOS.) The drawer is mobile-only, so skip focus entirely on
+  // a coarse pointer; tap the terminal when you actually want to type.
+  if (!window.matchMedia('(pointer: coarse)').matches) activeSession?.focus();
 }
 
 // --- Actions sheet (font / restart / paste / fullscreen / help) ------------
