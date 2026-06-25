@@ -771,6 +771,10 @@ function activateSession(s: Session): void {
   activeSession = s;
   s.setActive(true);
   for (const x of sessions) x.tabEl?.classList.toggle('active', x === s);
+  // With many tabs the active one can sit off-screen in the horizontal strip
+  // (e.g. after picking it from the drawer); scroll it back into view. inline/
+  // block: 'nearest' only scrolls #tabs horizontally, never the page/terminal.
+  s.tabEl?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   reflectActiveStatus();
   refreshMobileUI();
   saveTabs();
@@ -1230,6 +1234,12 @@ addBtn.addEventListener('pointerdown', (e) => {
   promptAddSession();
 });
 
+// Sessions list (opens the same bottom-sheet drawer the phone bar uses). On a
+// tablet the top #tabs strip turns into a long horizontal scroll that's awkward
+// to swipe through once there are many tabs; this gives a one-tap vertical
+// picker instead. Hidden on phones (<=640px), which already have a ☰ in
+// #mobilebar; shown on tablet/desktop where the drawer CSS is global anyway.
+makeButton(controlsEl, 'tb-btn tb-icon', '☰', 'Sessions', () => openDrawer());
 makeButton(controlsEl, 'tb-btn', 'A−', 'Smaller font', () => changeFont(-1));
 makeButton(controlsEl, 'tb-btn', 'A+', 'Larger font', () => changeFont(1));
 const keysBtn = makeButton(controlsEl, 'tb-btn tb-icon', '⌨', 'Toggle on-screen keys', () => {
