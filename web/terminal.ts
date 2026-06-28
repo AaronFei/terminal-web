@@ -12,6 +12,13 @@ const MAX_DELAY = 5000;
 const MIN_FONT = 8;
 const MAX_FONT = 28;
 const KEYBAR_HEIGHT = 48; // px when shown
+
+// Touch "select" mode (toggled from the key bar). tmux runs with `mouse on`, so
+// a finger drag is normally hijacked for scrolling and there is no way to make a
+// text selection by touch (on desktop you hold Option to bypass tmux's mouse
+// reporting; a tablet has no such key). While this is on, a one-finger drag
+// selects text instead of scrolling, and lifting the finger copies it.
+let touchSelectMode = false;
 // Window to drop a duplicated IME emission. The CapsLock-switch double-send
 // arrives ~100-120ms apart (keydown-finalize then compositionend-finalize), so
 // 100ms was just too tight; 300ms covers it with margin while staying far below
@@ -443,24 +450,55 @@ class Session {
     let tracking = false;
     let scrolling = false;
 
+    // Touch-select state (only used while touchSelectMode is on). Anchor is the
+    // 0-based cell where the drag started, in absolute buffer coords (so it
+    // stays correct even when the view is scrolled into the scrollback).
+    let selecting = false;
+    let selMoved = false;
+    let anchorCol = 0;
+    let anchorRow = 0;
+    let cellW = 1;
+    let cellH = 1;
+    let rectLeft = 0;
+    let rectTop = 0;
+
+    // Map a touch point to a 0-based [col, absoluteRow] cell.
+    const cellAt = (clientX: number, clientY: number): [number, number] => {
+      const c = Math.max(0, Math.min(this.term.cols - 1, Math.floor((clientX - rectLeft) / cellW)));
+      const r = Math.max(0, Math.min(this.term.rows - 1, Math.floor((clientY - rectTop) / cellH)));
+      return [c, this.term.buffer.active.viewportY + r];
+    };
+
     this.el.addEventListener(
       'touchstart',
       (e: TouchEvent) => {
         if (e.touches.length !== 1) {
           tracking = false;
+          selecting = false;
           return;
         }
         const t = e.touches[0];
         startX = t.clientX;
         startY = lastY = t.clientY;
+        const rect = this.el.getBoundingClientRect();
+        cellW = rect.width / Math.max(1, this.term.cols);
+        cellH = rect.height / Math.max(1, this.term.rows);
+        rectLeft = rect.left;
+        rectTop = rect.top;
+        if (touchSelectMode) {
+          // Begin a selection drag; suspend scrolling for this gesture.
+          tracking = false;
+          selecting = true;
+          selMoved = false;
+          [anchorCol, anchorRow] = cellAt(t.clientX, t.clientY);
+          this.term.clearSelection();
+          return;
+        }
         tracking = true;
         scrolling = false;
         // Cell under the finger, so tmux targets the right pane if it's split.
-        const rect = this.el.getBoundingClientRect();
-        const cw = rect.width / Math.max(1, this.term.cols);
-        const ch = rect.height / Math.max(1, this.term.rows);
-        col = Math.max(1, Math.min(this.term.cols, Math.floor((t.clientX - rect.left) / cw) + 1));
-        row = Math.max(1, Math.min(this.term.rows, Math.floor((t.clientY - rect.top) / ch) + 1));
+        col = Math.max(1, Math.min(this.term.cols, Math.floor((t.clientX - rectLeft) / cellW) + 1));
+        row = Math.max(1, Math.min(this.term.rows, Math.floor((t.clientY - rectTop) / cellH) + 1));
       },
       { capture: true, passive: true },
     );
@@ -468,8 +506,26 @@ class Session {
     this.el.addEventListener(
       'touchmove',
       (e: TouchEvent) => {
-        if (!tracking || e.touches.length !== 1) return;
+        if (e.touches.length !== 1) return;
         const t = e.touches[0];
+        if (selecting) {
+          e.preventDefault();
+          e.stopPropagation();
+          if (!selMoved && Math.abs(t.clientX - startX) < 6 && Math.abs(t.clientY - startY) < 6) {
+            return; // ignore jitter until it's clearly a drag
+          }
+          selMoved = true;
+          let [sCol, sRow] = [anchorCol, anchorRow];
+          let [eCol, eRow] = cellAt(t.clientX, t.clientY);
+          // Order start-before-end so the length is positive whichever way you drag.
+          if (eRow < sRow || (eRow === sRow && eCol < sCol)) {
+            [sCol, sRow, eCol, eRow] = [eCol, eRow, sCol, sRow];
+          }
+          const length = (eRow - sRow) * this.term.cols + (eCol - sCol) + 1;
+          this.term.select(sCol, sRow, length);
+          return;
+        }
+        if (!tracking) return;
         if (!scrolling) {
           const dyTotal = t.clientY - startY;
           const dxTotal = t.clientX - startX;
@@ -497,9 +553,15 @@ class Session {
       { capture: true, passive: false },
     );
 
+    // Copy a finished touch selection. The bubble-phase `copySelection` handler
+    // (wired in the constructor) copies term.getSelection() on touchend, so a
+    // moved selection lands on the clipboard automatically; a tap with no drag
+    // left the selection cleared, so nothing is copied. Select mode stays armed
+    // until toggled off again.
     const end = (): void => {
       tracking = false;
       scrolling = false;
+      selecting = false;
     };
     this.el.addEventListener('touchend', end, { capture: true, passive: true });
     this.el.addEventListener('touchcancel', end, { capture: true, passive: true });
@@ -1289,7 +1351,7 @@ interface KeyDef {
   label?: string;
   seq?: string;
   mod?: 'ctrl' | 'alt';
-  action?: 'copy' | 'paste';
+  action?: 'copy' | 'paste' | 'select';
   /** Force a line break here (mobile only): the keys after it wrap to a new row. */
   rowBreak?: boolean;
 }
@@ -1300,19 +1362,23 @@ const KEYS: KeyDef[] = [
   { label: 'Alt', mod: 'alt' },
   { label: '^C', seq: '\x03' },
   { label: 'Enter', seq: '\r' },
+  // Touch text-selection toggle: while armed, drag on the terminal to select and
+  // lift to copy (a tablet's stand-in for desktop Option-drag selection).
+  { label: '選取', action: 'select' },
   // On a phone the arrows get their own second row; everything else stays on the first.
   { rowBreak: true },
+  // Ctrl+End: jump to the bottom in Claude Code's fullscreen view (CSI 1;5F).
+  { label: '^End', seq: '\x1b[1;5F' },
   { label: '←', seq: '\x1b[D' },
   { label: '↑', seq: '\x1b[A' },
   { label: '↓', seq: '\x1b[B' },
   { label: '→', seq: '\x1b[C' },
-  // Ctrl+End: jump to the bottom in Claude Code's fullscreen view (CSI 1;5F).
-  { label: '^End', seq: '\x1b[1;5F' },
 ];
 
 let ctrlArmed = false;
 let altArmed = false;
 const modButtons: Partial<Record<'ctrl' | 'alt', HTMLElement>> = {};
+let selectBtn: HTMLElement | null = null;
 
 function refreshModVisuals(): void {
   modButtons.ctrl?.classList.toggle('armed', ctrlArmed);
@@ -1350,6 +1416,7 @@ for (const def of KEYS) {
   b.textContent = def.label ?? '';
   b.title = def.label ?? '';
   if (def.mod) modButtons[def.mod] = b;
+  if (def.action === 'select') selectBtn = b;
   b.addEventListener('pointerdown', (e) => {
     e.preventDefault();
     // On touch, never refocus the terminal: focusing its textarea pops up the
@@ -1357,6 +1424,16 @@ for (const def of KEYS) {
     // focus isn't needed — preventDefault already keeps whatever focus state
     // (and thus the keyboard) the user already had.
     const refocus = e.pointerType !== 'touch';
+    if (def.action === 'select') {
+      // Toggle touch-select mode. While on, dragging the terminal selects text
+      // (and lifting copies it) instead of scrolling; tap again to go back to
+      // scrolling. Never refocus — that would pop the soft keyboard.
+      touchSelectMode = !touchSelectMode;
+      selectBtn?.classList.toggle('armed', touchSelectMode);
+      if (!touchSelectMode) activeSession?.term.clearSelection();
+      flashStatus(touchSelectMode ? '選取模式:拖曳選字→放開複製' : '選取關閉', 1600);
+      return;
+    }
     if (def.action === 'copy') {
       const sel = activeSession?.term.getSelection() ?? '';
       if (sel) {
