@@ -1306,6 +1306,8 @@ const KEYS: KeyDef[] = [
   { label: '↑', seq: '\x1b[A' },
   { label: '↓', seq: '\x1b[B' },
   { label: '→', seq: '\x1b[C' },
+  // Ctrl+End: jump to the bottom in Claude Code's fullscreen view (CSI 1;5F).
+  { label: '^End', seq: '\x1b[1;5F' },
 ];
 
 let ctrlArmed = false;
