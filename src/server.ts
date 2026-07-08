@@ -37,76 +37,14 @@ const liveSessions = new Set<string>();
 // new SSH logins — out of allocating a terminal.
 const livePtys = new Set<pty.IPty>();
 
-// node-pty 1.1.0 opens TWO /dev/ptmx master fds per spawn on macOS but only
-// tracks one of them (the IPty's runtime `fd`). The other — an untracked "twin"
-// master the native layer never hands back to JS — has no handle, so neither
-// proc.kill() nor proc.destroy() can close it, and it LEAKS on every disconnect.
-// Under reconnect churn (a sleeping phone, a Tailscale flap → heartbeat
-// terminate) those orphans creep toward macOS's ~511 system-wide pty cap, which
-// once left SSH itself unable to allocate a tty (the 2026-06-13 lockout).
-//
-// Reap the twin ourselves the instant it's born. pty.spawn() is synchronous and
-// JS is single-threaded, so scanning /dev/fd immediately before and after the
-// spawn brackets EXACTLY the fds this one spawn allocated — no concurrent open
-// can slip in to confuse attribution. The twin is the new character-device fd
-// that shares proc.fd's device major (i.e. is itself a /dev/ptmx master) but
-// isn't proc.fd. Closing it at birth is safe: node-pty never reads or writes it,
-// so the live pty's I/O is unaffected (verified), and it halves our steady-state
-// pty-fd footprint besides. Slaves (/dev/ttysN) carry a different major, so the
-// major match never touches the slave fd node-pty still needs.
-//
-// Scoped to darwin: the major-extraction formula is macOS-specific, and the leak
-// hasn't been observed on Linux — where the pty-fd watchdog still backstops any
-// residual growth regardless.
-const REAP_PTY_TWIN = process.platform === "darwin";
-const darwinDevMajor = (rdev: number): number =>
-  Math.floor(rdev / 0x1000000) & 0xff;
-
-function charDeviceFds(): Set<number> {
-  const out = new Set<number>();
-  let entries: string[];
-  try {
-    entries = fs.readdirSync("/dev/fd");
-  } catch {
-    return out; // not introspectable here — skip (reap becomes a no-op)
-  }
-  for (const entry of entries) {
-    const fd = Number(entry);
-    if (!Number.isInteger(fd)) continue;
-    try {
-      if (fs.fstatSync(fd).isCharacterDevice()) out.add(fd);
-    } catch {
-      /* fd vanished or not stat-able — ignore */
-    }
-  }
-  return out;
-}
-
-// Spawn a pty and immediately close node-pty's leaked twin master fd (see above).
-function spawnPty(...args: Parameters<typeof pty.spawn>): pty.IPty {
-  if (!REAP_PTY_TWIN) return pty.spawn(...args);
-  const before = charDeviceFds();
-  const proc = pty.spawn(...args);
-  try {
-    const procFd = (proc as unknown as { fd: number }).fd;
-    const ptmxMajor = darwinDevMajor(fs.fstatSync(procFd).rdev);
-    for (const entry of fs.readdirSync("/dev/fd")) {
-      const fd = Number(entry);
-      if (!Number.isInteger(fd) || fd === procFd || before.has(fd)) continue;
-      try {
-        const st = fs.fstatSync(fd);
-        if (st.isCharacterDevice() && darwinDevMajor(st.rdev) === ptmxMajor) {
-          fs.closeSync(fd); // the untracked twin master — reap it
-        }
-      } catch {
-        /* fd vanished or not stat-able — ignore */
-      }
-    }
-  } catch (err) {
-    console.error("[pty] twin-fd reap failed (non-fatal):", err);
-  }
-  return proc;
-}
+// node-pty 1.1.0 leaked ~3 fds per spawn on macOS (an untracked "twin" /dev/ptmx
+// master, the slave /dev/ttysN, and a kqueue) — destroy() closed only the
+// tracked master, so reconnect churn once crept toward macOS's ~511 pty cap and
+// locked SSH out (the 2026-06-13 incident). We used to reap the twin ourselves
+// at spawn. node-pty 1.2.0-beta.14 closes all of them on teardown (verified: a
+// spawn→kill→destroy loop leaks ~0.03 fds vs 1.1.0's ~3), so the reaper is gone
+// and plain pty.spawn() is used below. The pty-fd watchdog still backstops any
+// future regression.
 
 // Every WebSocket currently attached to each session name. Used to tell the
 // *other* devices on a session that it was closed, so they drop the tab instead
@@ -756,7 +694,7 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
 
   let proc: pty.IPty;
   try {
-    proc = spawnPty("tmux", tmuxArgs(session, config.tmuxConfPath), {
+    proc = pty.spawn("tmux", tmuxArgs(session, config.tmuxConfPath), {
       name: "xterm-256color",
       cols: DEFAULT_COLS,
       rows: DEFAULT_ROWS,
@@ -804,10 +742,8 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
     // kill() only signals the child — node-pty closes the TRACKED master fd
     // (proc.fd) when its ReadStream reaches EOF, but ws.on("close") disposes
     // onData first, pausing that stream, so the close can lag. destroy() force-
-    // closes it promptly. (The separate untracked "twin" master that node-pty
-    // leaks is already reaped at spawn time by spawnPty(); destroy() can't touch
-    // that one — it has no JS handle.) IPty's public typing omits destroy(); the
-    // runtime UnixTerminal has it.
+    // closes it (and, on node-pty 1.2, the slave + kqueue) promptly. IPty's
+    // public typing omits destroy(); the runtime UnixTerminal has it.
     try {
       (proc as unknown as { destroy?: () => void }).destroy?.();
     } catch (err) {
@@ -1005,11 +941,11 @@ heartbeat.unref();
 // (KeepAlive) restarts us cleanly. The tmux sessions live in a separate server
 // process and survive, so clients just reconnect into them.
 //
-// node-pty holds ~3 character-device fds per LIVE pty (two on /dev/ptmx — the
-// master ReadStream and its write stream — plus the slave /dev/ttysN), so a
-// fully-loaded server legitimately sits near 3 * maxPtys char-device fds. Trip
-// at 4 * maxPtys (+ a little for stdio) so we never false-fire at capacity, yet
-// still fire hundreds of fds short of the ~511 system cap when something leaks.
+// node-pty 1.2 holds ~2 character-device fds per LIVE pty (the /dev/ptmx master
+// plus the slave /dev/ttysN); older builds held more. The ceiling stays at
+// 4 * maxPtys (+ a little for stdio) — comfortably above the real footprint at
+// capacity, yet still hundreds of fds short of the ~511 system cap, so it trips
+// only on a genuine leak.
 const PTY_FD_CEILING = config.maxPtys * 4 + 16;
 
 function countOwnPtyFds(): number {
