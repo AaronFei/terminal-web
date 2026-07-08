@@ -157,6 +157,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Only kill the main node process on stop/restart, NOT the whole cgroup. The
+# tmux server (and users' running programs — e.g. Claude) is spawned as a cgroup
+# child; the systemd default KillMode=control-group would SIGTERM it on every
+# restart, wiping live sessions. KillMode=process leaves it alive so node
+# reconnects to the same tmux on restart — matching launchd's behaviour on macOS.
+KillMode=process
 WorkingDirectory=${REPO_ROOT}
 Environment=PATH=${PATH_ENV}
 Environment=HOST=${HOST_VAL}
