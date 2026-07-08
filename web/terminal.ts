@@ -159,6 +159,7 @@ function openHelp(): void {
     `<li><b>Copy</b> — hold <b>${selKey}</b> and drag to select; it copies automatically. (Or select, then tap <b>Copy</b>.)</li>` +
     `<li><b>Paste</b> — click the terminal, then <b>${pasteKey}</b>. On a phone/tablet, tap <b>Paste</b> and paste into the box that appears.</li>` +
     '<li><b>Attach a file</b> (for Claude Code etc.) — tap the 📎 button, or paste / drag any file (image, PDF, text…): it uploads and inserts the file path. Then press Enter.</li>' +
+    '<li><b>Download a file</b> — tap the ⬇ button and enter a path on the host (e.g. <code>~/output/report.zip</code>); it downloads to this device. Tip: run <code>realpath &lt;file&gt;</code> in the terminal to get the path.</li>' +
     '<li><b>Scroll</b> — mouse wheel or two-finger swipe scrolls the history.</li>' +
     '<li><b>Tabs</b> — <b>+</b> new session, <b>×</b> closes the tab and kills its session, <b>⟳</b> restarts the session fresh. Double-click (or double-tap) a tab to rename it — the label changes but its tmux session stays the same.</li>' +
     '</ul>' +
@@ -1343,6 +1344,31 @@ fileBtn.innerHTML =
 fileBtn.addEventListener('click', () => fileInput.click());
 controlsEl.append(fileBtn);
 
+// Reverse of the attach button: pull a file OFF the host back to this device.
+// A tray-with-down-arrow glyph, monochrome like the paperclip.
+const dlBtn = document.createElement('button');
+dlBtn.className = 'tb-btn tb-icon';
+dlBtn.type = 'button';
+dlBtn.title = 'Download a file from the host';
+dlBtn.setAttribute('aria-label', 'Download a file from the host');
+dlBtn.innerHTML =
+  '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" ' +
+  'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>' +
+  '<polyline points="7 10 12 15 17 10"></polyline>' +
+  '<line x1="12" y1="15" x2="12" y2="3"></line></svg>';
+dlBtn.addEventListener('click', () => {
+  void (async () => {
+    const p = await domPrompt({
+      label: 'Download a file from the host — enter its full path',
+      value: '~/',
+      okText: 'Download',
+    });
+    if (p) void downloadFromHost(p);
+  })();
+});
+controlsEl.append(dlBtn);
+
 makeButton(controlsEl, 'tb-btn tb-icon', '⤢', 'Toggle fullscreen', toggleFullscreen);
 makeButton(controlsEl, 'tb-btn tb-icon', '?', 'Help: copy / paste / files', openHelp);
 
@@ -1828,6 +1854,40 @@ function uploadFile(file: Blob, name?: string): Promise<void> {
     };
     xhr.send(file);
   });
+}
+
+// Pull a file off the host back to this device — the reverse of uploadFile. A
+// HEAD pre-check turns a bad path into a toast instead of silently saving the
+// server's 404 body as a file; the real GET then streams through a transient
+// <a download> so large files never buffer in memory. Auth rides on the
+// same-origin tw_auth cookie automatically.
+async function downloadFromHost(rawPath: string): Promise<void> {
+  const p = rawPath.trim();
+  if (!p) return;
+  const url = '/api/download?path=' + encodeURIComponent(p);
+  showStatus(`preparing ${p}…`);
+  let head: Response;
+  try {
+    head = await fetch(url, { method: 'HEAD' });
+  } catch {
+    flashStatus('download failed (network)', 2500);
+    return;
+  }
+  if (!head.ok) {
+    const why =
+      head.status === 404 ? 'not found' : head.status === 400 ? 'bad path' : `error ${head.status}`;
+    flashStatus(`download failed: ${why}`, 3000);
+    return;
+  }
+  const size = Number(head.headers.get('content-length') ?? '0');
+  const a = document.createElement('a');
+  a.href = url;
+  a.rel = 'noopener';
+  a.download = p.split('/').pop() || 'download';
+  document.body.append(a);
+  a.click();
+  a.remove();
+  flashStatus(`downloading ${a.download}${size ? ` (${fmtMB(size)} MB)` : ''}…`, 2500);
 }
 
 // Capture phase: xterm's own paste handler calls stopPropagation() on its

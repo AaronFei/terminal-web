@@ -539,6 +539,70 @@ async function handleUpload(
 }
 
 // ---------------------------------------------------------------------------
+// File download (GET/HEAD /api/download?path=…): stream a file from the host
+// back to the browser as an attachment — the reverse of /upload. It will read
+// any file the server's user can read, but that is NOT a wider trust boundary
+// than we already expose: the terminal itself grants full shell access behind
+// the SAME auth gate (a client who can attach a session can already
+// `base64 afile` and copy it out). gateHttp() runs before this handler, so the
+// same tw_auth cookie / Cloudflare-token rules apply. A leading `~` expands to
+// the server user's home; a bare relative path is resolved against it.
+// ---------------------------------------------------------------------------
+async function handleDownload(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  pathParam: string | null
+): Promise<void> {
+  const raw = (pathParam ?? "").trim();
+  if (!raw) {
+    sendJsonHttp(res, 400, { error: "missing ?path" });
+    return;
+  }
+  let p = raw;
+  if (p === "~" || p.startsWith("~/")) p = path.join(os.homedir(), p.slice(1));
+  const abs = path.isAbsolute(p) ? path.resolve(p) : path.resolve(os.homedir(), p);
+
+  let stat: fs.Stats;
+  try {
+    stat = await fsp.stat(abs); // follows symlinks
+  } catch {
+    sendJsonHttp(res, 404, { error: "not found" });
+    return;
+  }
+  if (!stat.isFile()) {
+    sendJsonHttp(res, 400, { error: "not a regular file" });
+    return;
+  }
+
+  const base = path.basename(abs);
+  // RFC 6266: an ASCII-only fallback plus a UTF-8 filename* so names with
+  // non-ASCII characters (or quotes/backslashes) still download with the right
+  // name instead of a mojibake or a broken header.
+  const asciiName = base.replace(/[^\x20-\x7e]/g, "_").replace(/["\\]/g, "_");
+  res.writeHead(200, {
+    "Content-Type": "application/octet-stream", // force a download, not a preview
+    "Content-Length": stat.size,
+    "Content-Disposition":
+      `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(base)}`,
+    "Cache-Control": "no-store",
+  });
+  if (req.method === "HEAD") {
+    res.end();
+    return;
+  }
+  const stream = fs.createReadStream(abs);
+  stream.on("error", (err) => {
+    console.error(`[download] read error for ${abs}:`, err);
+    if (!res.headersSent) {
+      res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
+    }
+    res.end();
+  });
+  stream.pipe(res);
+  console.log(`[download] served ${abs} (${stat.size} bytes)`);
+}
+
+// ---------------------------------------------------------------------------
 // HTTP server
 // ---------------------------------------------------------------------------
 
@@ -569,6 +633,14 @@ const server = http.createServer((req, res) => {
 
       if (method === "POST" && requestUrl.pathname === "/api/sessions/rename") {
         await handleRenameSession(req, res);
+        return;
+      }
+
+      if (
+        (method === "GET" || method === "HEAD") &&
+        requestUrl.pathname === "/api/download"
+      ) {
+        await handleDownload(req, res, requestUrl.searchParams.get("path"));
         return;
       }
 
