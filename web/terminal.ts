@@ -283,6 +283,14 @@ class Session {
   private lastData = '';
   private lastDataAt = 0;
 
+  // True between compositionstart and compositionend — i.e. while the soft
+  // keyboard is mid-composition (e.g. picking a 注音 candidate). A reconnect
+  // that re-fits/re-focuses the terminal during this window cancels the iOS
+  // composition (the candidate bar vanishes, input turns raw/direct), so we
+  // defer that re-attach work until the composition commits.
+  private composing = false;
+  private reattachAfterCompose = false;
+
   constructor(name: string, displayName?: string) {
     this.name = name;
     this.displayName = displayName?.trim() || name;
@@ -385,9 +393,23 @@ class Session {
           lastSeq = -1;
         }
       };
-      ta.addEventListener('compositionstart', cancelLast);
+      ta.addEventListener('compositionstart', () => {
+        this.composing = true;
+        cancelLast();
+      });
       ta.addEventListener('compositionupdate', cancelLast);
-      ta.addEventListener('compositionend', cancelLast);
+      ta.addEventListener('compositionend', () => {
+        this.composing = false;
+        cancelLast();
+        // A reconnect arrived mid-composition and deferred its re-fit/re-focus
+        // (see connect's onopen) so it wouldn't cancel the composition; now that
+        // we've committed, it's safe to catch up.
+        if (this.reattachAfterCompose) {
+          this.reattachAfterCompose = false;
+          this.fit();
+          if (isActive(this)) this.term.focus();
+        }
+      });
       ta.addEventListener('keydown', (e) => {
         const ke = e as KeyboardEvent;
         if (ke.keyCode !== 229) return; // only IME-routed keys
@@ -679,13 +701,22 @@ class Session {
       this.reconnectDelay = MIN_DELAY;
       this.everConnected = true;
       this.setConnected(true);
-      this.fit();
       this.startPing();
       // Re-assert a custom label: the server stores it on the tmux session
       // (@twlabel), which is wiped when the session is killed+recreated by a
       // restart, so a renamed tab would otherwise revert to its raw name.
       if (this.displayName !== this.name) renameOnServer(this.name, this.displayName);
-      if (isActive(this)) this.term.focus();
+      // Re-fit + re-focus so typing resumes smoothly after a reconnect — UNLESS
+      // an IME composition is in flight: on iOS these cancel the soft keyboard's
+      // active composition, dropping the 注音 candidate bar and turning input
+      // raw/direct. Mobile reconnects are frequent, so this otherwise interrupts
+      // composing mid-word. Defer to compositionend instead.
+      if (this.composing) {
+        this.reattachAfterCompose = true;
+      } else {
+        this.fit();
+        if (isActive(this)) this.term.focus();
+      }
     };
 
     socket.onmessage = (ev: MessageEvent) => {
