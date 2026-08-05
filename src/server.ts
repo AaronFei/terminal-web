@@ -727,6 +727,30 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
 
   let closed = false;
 
+  // xterm.js auto-answers the terminal-identity queries (DA1 ESC[?..c /
+  // DA2 ESC[>..c) tmux sends when a client attaches. tmux 3.6 only *consumes*
+  // those replies for ~3s after attach; one that arrives later (phone waking
+  // up over the tunnel) or a second one (stale query answered post-reconnect)
+  // is parsed as keystrokes and lands in the foreground program's input as
+  // literal "?1;2c" — regardless of escape-time. Let each kind through once,
+  // early; strip the rest. OSC color replies are consumed anytime, left alone.
+  const DA_WINDOW_MS = 2500;
+  const attachedAt = Date.now();
+  const daSeen: Record<"?" | ">", boolean> = { "?": false, ">": false };
+  const filterDaReplies = (input: string): string => {
+    if (!input.includes("\x1b[")) return input;
+    return input.replace(/\x1b\[([?>])[0-9;]*c/g, (seq, kind: "?" | ">") => {
+      if (!daSeen[kind] && Date.now() - attachedAt <= DA_WINDOW_MS) {
+        daSeen[kind] = true;
+        return seq;
+      }
+      console.log(
+        `[ws] stripped late/duplicate DA reply for "${session}": ${JSON.stringify(seq)}`
+      );
+      return "";
+    });
+  };
+
   const cleanup = (): void => {
     if (closed) return;
     closed = true;
@@ -786,7 +810,8 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
         const buf = Array.isArray(data)
           ? Buffer.concat(data.map((d) => Buffer.from(d)))
           : Buffer.from(data as ArrayBuffer);
-        proc.write(buf.toString("utf8"));
+        const input = filterDaReplies(buf.toString("utf8"));
+        if (input) proc.write(input);
         return;
       }
 
