@@ -1881,6 +1881,13 @@ function uploadFile(file: Blob, name?: string): Promise<void> {
       resolve();
       return;
     }
+    // Bind the destination to the tab that's active NOW, at upload start — the
+    // file belongs to the terminal you attached it from. onload can fire much
+    // later (a big upload, or you switched tabs / backgrounded the app while it
+    // ran); using the live activeSession there sent the path to whatever tab
+    // happened to be active on completion — the wrong one, or none you were
+    // looking at. sendSeq buffers it if that tab's socket is mid-reconnect.
+    const target = activeSession;
     const label = name ?? 'file';
     showStatus(`uploading ${label}… 0%`);
 
@@ -1909,16 +1916,19 @@ function uploadFile(file: Blob, name?: string): Promise<void> {
         /* non-JSON response */
       }
       if (xhr.status >= 200 && xhr.status < 300 && data.path) {
-        if (activeSession) {
+        if (target) {
           // Quote the path if it contains whitespace; append a space so it reads
           // as a complete argument at the prompt.
           const p = /\s/.test(data.path)
             ? `'${data.path.replace(/'/g, `'\\''`)}'`
             : data.path;
-          activeSession.sendSeq(p + ' ');
-          activeSession.focus();
+          target.sendSeq(p + ' ');
+          if (isActive(target)) target.focus();
         }
-        flashStatus(`file added: ${data.path}`, 2500);
+        // If it landed on a tab you've since switched away from, name it so you
+        // know where the path went instead of it seeming to vanish.
+        const where = target && !isActive(target) ? ` → ${target.displayName}` : '';
+        flashStatus(`file added${where}: ${data.path}`, 2500);
       } else {
         flashStatus(
           data.error ? `upload failed: ${data.error}` : 'file upload failed',
