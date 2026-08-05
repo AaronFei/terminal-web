@@ -25,6 +25,11 @@ let touchSelectMode = false;
 // the interval of any legitimate re-typing of the same characters.
 const IME_DEDUP_MS = 300;
 
+// Cap on the bytes of discrete injections (uploaded file path, paste, key-bar
+// press) buffered while the WebSocket is down, so a long outage can't grow the
+// queue without bound. 64 KB is far more than any real path/paste.
+const MAX_PENDING_SEQ = 64 * 1024;
+
 const params = new URLSearchParams(window.location.search);
 const IME_DEBUG = (params.get('debug') ?? '').includes('ime');
 // ?debug=vv logs visualViewport metrics (keyboard occlusion / Safari pan) to
@@ -294,6 +299,11 @@ class Session {
   private composing = false;
   private reattachAfterCompose = false;
 
+  // Discrete injections (file path, paste, key-bar seq) buffered while the WS is
+  // not OPEN, flushed on the next reconnect (see connect's onopen). Raw typing
+  // is never buffered — only these one-shot sends routed through sendSeq().
+  private pendingSeq: string[] = [];
+
   constructor(name: string, displayName?: string) {
     this.name = name;
     this.displayName = displayName?.trim() || name;
@@ -460,9 +470,20 @@ class Session {
     }
   }
 
-  /** Send a raw key sequence (used by the on-screen key bar for the active session). */
+  /**
+   * Send a discrete injection (key-bar sequence, paste, uploaded file path).
+   * Unlike raw keystrokes, these are buffered and replayed on reconnect when the
+   * socket is down — a big upload can saturate the uplink, trip the 20s
+   * heartbeat, and land the path insert mid-reconnect, which would otherwise be
+   * silently dropped by send() and leave the path un-pasted.
+   */
   sendSeq(seq: string): void {
-    this.send(seq);
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.send(seq);
+      return;
+    }
+    const buffered = this.pendingSeq.reduce((n, s) => n + s.length, 0);
+    if (buffered + seq.length <= MAX_PENDING_SEQ) this.pendingSeq.push(seq);
   }
 
   // One-finger touch scrolling. tmux runs in the alternate screen (no
@@ -710,6 +731,14 @@ class Session {
       this.everConnected = true;
       this.setConnected(true);
       this.startPing();
+      // Flush injections buffered while the socket was down (e.g. an uploaded
+      // file path whose insert raced a big-upload reconnect). The socket is
+      // OPEN here, so send() delivers them.
+      if (this.pendingSeq.length) {
+        const buffered = this.pendingSeq;
+        this.pendingSeq = [];
+        for (const s of buffered) this.send(s);
+      }
       // Re-assert a custom label: the server stores it on the tmux session
       // (@twlabel), which is wiped when the session is killed+recreated by a
       // restart, so a renamed tab would otherwise revert to its raw name.
