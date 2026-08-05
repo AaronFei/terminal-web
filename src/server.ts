@@ -610,6 +610,14 @@ server.on("clientError", (err, socket) => {
   }
 });
 
+// Node caps a whole request (body included) at requestTimeout — default 300s.
+// A large file upload over a slow/relayed mobile link easily exceeds 5 min and
+// was being cut off mid-transfer ("uploaded halfway then dropped"). Disable it:
+// the total bytes per request are already bounded by uploadMaxBytes, and
+// headersTimeout still guards the header phase against slow-loris. server.timeout
+// (socket inactivity) is 0/off by default, so nothing else caps a slow upload.
+server.requestTimeout = 0;
+
 // ---------------------------------------------------------------------------
 // WebSocket terminal bridge
 // ---------------------------------------------------------------------------
