@@ -27,6 +27,9 @@ const IME_DEDUP_MS = 300;
 
 const params = new URLSearchParams(window.location.search);
 const IME_DEBUG = (params.get('debug') ?? '').includes('ime');
+// ?debug=vv logs visualViewport metrics (keyboard occlusion / Safari pan) to
+// the server log via the same WS debug channel, for on-device layout diagnosis.
+const VV_DEBUG = (params.get('debug') ?? '').includes('vv');
 // WebGL renderer is on by default; ?webgl=0 (or ?nowebgl) falls back to the DOM
 // renderer — useful for flaky GPUs or headless capture.
 const WEBGL_ENABLED = params.get('webgl') !== '0' && !params.has('nowebgl');
@@ -343,6 +346,11 @@ class Session {
 
   private debug(event: string, data?: string): void {
     if (!IME_DEBUG) return;
+    this.debugSend(event, data);
+  }
+
+  /** Ungated debug sender — callers gate on their own flag (IME_DEBUG / VV_DEBUG). */
+  debugSend(event: string, data?: string): void {
     // eslint-disable-next-line no-console
     console.log('[ime]', this.name, event, JSON.stringify(data ?? ''));
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
@@ -1269,6 +1277,14 @@ function updateKeyboardOffset(): void {
   // mistaken for a keyboard and left as a gap at the bottom.
   const offset = raw > 150 ? raw : 0;
   root.style.setProperty('--kb-offset', `${offset}px`);
+  if (VV_DEBUG && vv) {
+    activeSession?.debugSend(
+      'vv',
+      `ih=${window.innerHeight} vvh=${Math.round(vv.height)} ` +
+        `vvTop=${Math.round(vv.offsetTop)} pageY=${Math.round(window.pageYOffset)} ` +
+        `raw=${Math.round(raw)} off=${Math.round(offset)}`,
+    );
+  }
   fitActive();
 }
 
@@ -1801,6 +1817,9 @@ if (typeof ResizeObserver !== 'undefined') {
 if (window.visualViewport) {
   window.visualViewport.addEventListener('resize', updateKeyboardOffset);
   window.visualViewport.addEventListener('scroll', updateKeyboardOffset);
+  // Baseline snapshot (keyboard closed) once the WS is likely open, so the log
+  // shows the resting numbers before any keyboard event fires.
+  if (VV_DEBUG) window.setTimeout(updateKeyboardOffset, 1500);
 }
 window.addEventListener('beforeunload', () => {
   for (const s of sessions) s.dispose();
