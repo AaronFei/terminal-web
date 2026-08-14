@@ -2005,18 +2005,63 @@ window.addEventListener(
         `types=[${types}] items=[${kinds}] files=${cd?.files?.length ?? 0}`,
       );
     }
-    if (!items) return;
+    const dt = e.clipboardData;
+    if (!dt) return;
+
+    // (1) Real file items — macOS image paste, Win+Shift+S screenshots, any
+    // copied file (any type is allowed). (2) Fall back to dt.files, which some
+    // browsers populate even when the items list doesn't expose the file.
     const files: File[] = [];
-    for (let i = 0; i < items.length; i += 1) {
-      if (items[i].kind === 'file') {
-        const f = items[i].getAsFile();
-        if (f) files.push(f);
+    if (items) {
+      for (let i = 0; i < items.length; i += 1) {
+        if (items[i].kind === 'file') {
+          const f = items[i].getAsFile();
+          if (f) files.push(f);
+        }
       }
     }
-    if (files.length === 0) return; // no file: let xterm handle a text paste
-    e.preventDefault();
-    e.stopImmediatePropagation(); // don't let xterm also handle it
-    for (const f of files) void uploadFile(f, f.name);
+    if (files.length === 0 && dt.files) {
+      for (let i = 0; i < dt.files.length; i += 1) files.push(dt.files[i]);
+    }
+    if (files.length > 0) {
+      e.preventDefault();
+      e.stopImmediatePropagation(); // don't let xterm also handle it
+      for (const f of files) void uploadFile(f, f.name);
+      return;
+    }
+
+    // (3) Windows-Chrome case: copying an image from a web page (or Office)
+    // often delivers it ONLY as text/html (an <img src="data:...">) with NO
+    // file item, so the checks above find nothing. Recover the embedded image
+    // by parsing the HTML and fetching a data:/blob: src into a Blob. Remote
+    // http(s)/file: srcs can't be fetched client-side (CORS/security), so those
+    // fall through to xterm's normal text paste.
+    const html = dt.getData ? dt.getData('text/html') : '';
+    if (html) {
+      const src =
+        new DOMParser().parseFromString(html, 'text/html').querySelector('img')?.getAttribute('src') ??
+        '';
+      if (src.startsWith('data:image/') || src.startsWith('blob:')) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        void (async () => {
+          try {
+            const blob = await fetch(src).then((r) => r.blob());
+            if (blob.type.startsWith('image/')) {
+              const ext = (blob.type.split('/')[1] || 'png').replace(/[^a-z0-9]/gi, '') || 'png';
+              await uploadFile(blob, `pasted-image.${ext}`);
+            }
+          } catch {
+            flashStatus('paste: could not read the image', 2500);
+          }
+        })();
+        return;
+      }
+      if (PASTE_DEBUG && src) {
+        activeSession?.debugSend('paste', `unfetchable img src=${src.slice(0, 48)}`);
+      }
+    }
+    // Nothing uploadable: let xterm handle the (text) paste.
   },
   true,
 );
