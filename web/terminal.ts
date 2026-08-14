@@ -35,6 +35,10 @@ const IME_DEBUG = (params.get('debug') ?? '').includes('ime');
 // ?debug=vv logs visualViewport metrics (keyboard occlusion / Safari pan) to
 // the server log via the same WS debug channel, for on-device layout diagnosis.
 const VV_DEBUG = (params.get('debug') ?? '').includes('vv');
+// ?debug=paste logs what each paste event actually carries (clipboard types,
+// item kinds/types, file count) — for diagnosing why image paste-to-upload
+// behaves differently across browsers/OSes (e.g. Windows Chrome).
+const PASTE_DEBUG = (params.get('debug') ?? '').includes('paste');
 // WebGL renderer is on by default; ?webgl=0 (or ?nowebgl) falls back to the DOM
 // renderer — useful for flaky GPUs or headless capture.
 const WEBGL_ENABLED = params.get('webgl') !== '0' && !params.has('nowebgl');
@@ -1987,6 +1991,20 @@ window.addEventListener(
   'paste',
   (e: ClipboardEvent) => {
     const items = e.clipboardData?.items;
+    if (PASTE_DEBUG) {
+      const cd = e.clipboardData;
+      let kinds = '(no items)';
+      if (items) {
+        const parts: string[] = [];
+        for (let i = 0; i < items.length; i += 1) parts.push(`${items[i].kind}/${items[i].type}`);
+        kinds = parts.length ? parts.join(',') : '(empty)';
+      }
+      const types = cd && cd.types ? Array.from(cd.types).join('|') : '(none)';
+      activeSession?.debugSend(
+        'paste',
+        `types=[${types}] items=[${kinds}] files=${cd?.files?.length ?? 0}`,
+      );
+    }
     if (!items) return;
     const files: File[] = [];
     for (let i = 0; i < items.length; i += 1) {
