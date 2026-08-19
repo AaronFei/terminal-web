@@ -30,6 +30,11 @@ const IME_DEDUP_MS = 300;
 // queue without bound. 64 KB is far more than any real path/paste.
 const MAX_PENDING_SEQ = 64 * 1024;
 
+// macOS uses ⌘ for copy/paste (never a terminal control key), so xterm passes
+// it through to the browser. Everything else uses Ctrl, which collides with the
+// terminal's ^C/^V — hence the OS-specific copy/paste key handling below.
+const isMac = /Mac|iP(hone|ad|od)/.test(navigator.platform || navigator.userAgent);
+
 const params = new URLSearchParams(window.location.search);
 const IME_DEBUG = (params.get('debug') ?? '').includes('ime');
 // ?debug=vv logs visualViewport metrics (keyboard occlusion / Safari pan) to
@@ -101,6 +106,38 @@ function pasteFromClipboard(): void {
   }
 }
 
+// Rich paste for the Windows/Linux Ctrl+Shift+V chord: unlike Chrome's built-in
+// "paste as plain text" (which drops images) or readText() (text only), the
+// async Clipboard API returns BOTH text and image blobs — so a pasted image
+// uploads and text goes to the shell. Falls back to the text-only path when the
+// Clipboard read API isn't available (non-secure context / older browsers).
+async function pasteRich(): Promise<void> {
+  const clip = navigator.clipboard;
+  if (clip && typeof clip.read === 'function' && window.isSecureContext) {
+    try {
+      const items = await clip.read();
+      let handled = false;
+      for (const it of items) {
+        const imgType = it.types.find((t) => t.startsWith('image/'));
+        if (imgType) {
+          const blob = await it.getType(imgType);
+          const ext = (imgType.split('/')[1] || 'png').replace(/[^a-z0-9]/gi, '') || 'png';
+          void uploadFile(blob, `pasted-image.${ext}`);
+          handled = true;
+        } else if (it.types.includes('text/plain')) {
+          const text = await (await it.getType('text/plain')).text();
+          if (text) activeSession?.sendSeq(text);
+          handled = true;
+        }
+      }
+      if (handled) return;
+    } catch {
+      /* permission denied / not focused — fall back to the legacy paths */
+    }
+  }
+  pasteFromClipboard();
+}
+
 // A small overlay with a real <textarea> the user pastes into, then we forward
 // the text to the active session. Works without the Clipboard API (HTTP/iPad).
 function openPasteBox(): void {
@@ -111,7 +148,7 @@ function openPasteBox(): void {
   box.className = 'paste-box';
   const label = document.createElement('div');
   label.className = 'paste-label';
-  label.textContent = 'Paste here (⌘V / long-press → Paste) — sends automatically';
+  label.textContent = `Paste here (${isMac ? '⌘V' : 'Ctrl+V'} / long-press → Paste) — sends automatically`;
   const ta = document.createElement('textarea');
   ta.className = 'paste-ta';
   ta.setAttribute('autocapitalize', 'off');
@@ -158,9 +195,9 @@ function openPasteBox(): void {
 // button and once automatically on first visit.
 function openHelp(): void {
   if (document.querySelector('.help-overlay')) return;
-  const isMac = /Mac|iP(hone|ad|od)/.test(navigator.platform || navigator.userAgent);
   const selKey = isMac ? '⌥ Option' : 'Shift';
   const pasteKey = isMac ? '⌘V' : 'Ctrl+Shift+V';
+  const copyKey = isMac ? '⌘C' : 'Ctrl+Shift+C';
   const overlay = document.createElement('div');
   overlay.className = 'paste-overlay help-overlay';
   const box = document.createElement('div');
@@ -168,7 +205,7 @@ function openHelp(): void {
   box.innerHTML =
     '<div class="help-title">How to copy / paste / files</div>' +
     '<ul class="help-list">' +
-    `<li><b>Copy</b> — hold <b>${selKey}</b> and drag to select; it copies automatically. (Or select, then tap <b>Copy</b>.)</li>` +
+    `<li><b>Copy</b> — hold <b>${selKey}</b> and drag to select; it copies automatically. (Or select, then <b>${copyKey}</b> / tap <b>Copy</b>.)</li>` +
     `<li><b>Paste</b> — click the terminal, then <b>${pasteKey}</b>. On a phone/tablet, tap <b>Paste</b> and paste into the box that appears.</li>` +
     '<li><b>Attach a file</b> (for Claude Code etc.) — tap the 📎 button, or paste / drag any file (image, PDF, text…): it uploads and inserts the file path. Then press Enter.</li>' +
     '<li><b>Download a file</b> — tap the ⬇ button and enter a path on the host (e.g. <code>~/output/report.zip</code>); it downloads to this device. Tip: run <code>realpath &lt;file&gt;</code> in the terminal to get the path.</li>' +
@@ -339,6 +376,35 @@ class Session {
       } catch {
         /* fall back to the DOM renderer */
       }
+    }
+
+    // Windows/Linux copy-paste. Ctrl+C / Ctrl+V collide with the terminal's own
+    // interrupt (^C) and literal (^V): xterm maps them to control bytes and
+    // cancels the keydown, which ALSO suppresses the browser's native copy/paste
+    // and the paste-to-upload event — so on Windows nothing copies, pastes, or
+    // uploads. macOS avoids this because ⌘ is never a terminal key. So on
+    // non-Mac, wire the Ctrl+Shift+C / Ctrl+Shift+V chords explicitly (as VS
+    // Code / Hyper do): copy the selection (and stop Chrome opening DevTools on
+    // Ctrl+Shift+C), and rich-paste text + images. Plain Ctrl+C stays ^C/SIGINT.
+    if (!isMac) {
+      this.term.attachCustomKeyEventHandler((e) => {
+        if (e.type !== 'keydown' || !e.ctrlKey || !e.shiftKey || e.altKey || e.metaKey) {
+          return true; // not a copy/paste chord — let xterm handle it normally
+        }
+        if (e.code === 'KeyC') {
+          const sel = this.term.getSelection();
+          if (sel) void copyText(sel).then((ok) => flashStatus(ok ? 'copied' : 'copy failed', 1200));
+          else flashStatus('nothing selected', 1200);
+          e.preventDefault(); // block Chrome's Ctrl+Shift+C = open DevTools
+          return false; // handled — don't let xterm process it
+        }
+        if (e.code === 'KeyV') {
+          e.preventDefault(); // we paste via the Clipboard API, not the browser default
+          void pasteRich();
+          return false;
+        }
+        return true;
+      });
     }
 
     // Copy the selection to the clipboard when a drag/touch selection ends.
