@@ -76,6 +76,7 @@ body {
   border-radius: 6px;
   color: #cfcfcf;
   cursor: pointer;
+  touch-action: manipulation; /* let the strip pan under a finger; no dbl-tap zoom */
 }
 .tab.active {
   background: #1e1e1e;
@@ -535,7 +536,13 @@ body {
   width: 100%;
   max-width: 560px;
   max-height: 80vh;
+  /* dvh tracks the *visible* viewport (minus the mobile browser UI), so a long
+     session list's bottom rows + the New button stay on-screen and reachable
+     instead of extending below the fold. */
+  max-height: 85dvh;
   overflow-y: auto;
+  -webkit-overflow-scrolling: touch; /* iOS momentum scroll inside the fixed overlay */
+  overscroll-behavior: contain; /* don't chain the scroll to the locked body */
   background: #252526;
   border-top: 1px solid #3a3a3a;
   border-top-left-radius: 14px;

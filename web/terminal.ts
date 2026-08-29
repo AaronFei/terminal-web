@@ -922,14 +922,16 @@ function buildTab(s: Session): void {
   close.title = 'Close tab & kill session';
   tab.append(dot, label, close);
 
-  // Single tap activates; a second tap within 350ms renames the tab. Manual
-  // detection (rather than a `dblclick` listener) because the pointerdown
-  // preventDefault below suppresses the synthesized click/dblclick events, and
-  // this also gives touch devices a double-tap-to-rename gesture.
+  // Single tap activates; a second tap within 350ms renames. Activate on
+  // pointerUP (not down) and WITHOUT preventDefault so a sideways drag can scroll
+  // the tab strip: a drag that the browser turns into a scroll fires
+  // pointercancel, never pointerup, so reaching pointerup means a genuine tap.
+  // (The old pointerdown+preventDefault cancelled the pan, making the strip
+  // unscrollable once your finger landed on a tab.) touch-action:manipulation on
+  // .tab keeps the strip pannable and drops the double-tap-to-zoom.
   let lastTap = 0;
-  tab.addEventListener('pointerdown', (e) => {
-    if (e.target === close) return;
-    e.preventDefault();
+  tab.addEventListener('pointerup', (e) => {
+    if (e.target === close) return; // the × has its own handler
     const now = performance.now();
     if (now - lastTap < 350) {
       lastTap = 0;
