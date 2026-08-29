@@ -208,7 +208,7 @@ function openHelp(): void {
     `<li><b>Copy</b> — hold <b>${selKey}</b> and drag to select; it copies automatically. (Or select, then <b>${copyKey}</b> / tap <b>Copy</b>.)</li>` +
     `<li><b>Paste</b> — click the terminal, then <b>${pasteKey}</b>. On a phone/tablet, tap <b>Paste</b> and paste into the box that appears.</li>` +
     '<li><b>Attach a file</b> (for Claude Code etc.) — tap the 📎 button, or paste / drag any file (image, PDF, text…): it uploads and inserts the file path. Then press Enter.</li>' +
-    '<li><b>Download a file</b> — tap the ⬇ button and enter a path on the host (e.g. <code>~/output/report.zip</code>); it downloads to this device. Tip: run <code>realpath &lt;file&gt;</code> in the terminal to get the path.</li>' +
+    '<li><b>Download a file</b> — tap the ⬇ button (or <b>⋯ → Download</b> on a phone) and enter a name/relative path from the terminal\'s current folder (e.g. <code>report.zip</code>), or a full path (<code>~/output/report.zip</code>). It downloads to this device.</li>' +
     '<li><b>Scroll</b> — mouse wheel or two-finger swipe scrolls the history.</li>' +
     '<li><b>Tabs</b> — <b>+</b> new session, <b>×</b> closes the tab and kills its session, <b>⟳</b> restarts the session fresh. Double-click (or double-tap) a tab to rename it — the label changes but its tmux session stays the same.</li>' +
     '</ul>' +
@@ -1505,16 +1505,7 @@ dlBtn.innerHTML =
   '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>' +
   '<polyline points="7 10 12 15 17 10"></polyline>' +
   '<line x1="12" y1="15" x2="12" y2="3"></line></svg>';
-dlBtn.addEventListener('click', () => {
-  void (async () => {
-    const p = await domPrompt({
-      label: 'Download a file from the host — enter its full path',
-      value: '~/',
-      okText: 'Download',
-    });
-    if (p) void downloadFromHost(p);
-  })();
-});
+dlBtn.addEventListener('click', () => promptDownload());
 controlsEl.append(dlBtn);
 
 makeButton(controlsEl, 'tb-btn tb-icon', '⤢', 'Toggle fullscreen', toggleFullscreen);
@@ -1863,6 +1854,10 @@ sheet.append(
     closeSheet();
     pasteFromClipboard();
   }),
+  sheetRow('⬇', 'Download a file', () => {
+    closeSheet();
+    promptDownload();
+  }),
   sheetRow('⤢', 'Toggle fullscreen', () => {
     closeSheet();
     toggleFullscreen();
@@ -2025,7 +2020,11 @@ function uploadFile(file: Blob, name?: string): Promise<void> {
 async function downloadFromHost(rawPath: string): Promise<void> {
   const p = rawPath.trim();
   if (!p) return;
-  const url = '/api/download?path=' + encodeURIComponent(p);
+  // Pass the active session so the server can resolve a relative path against
+  // that terminal's current working directory (no absolute path needed).
+  const sess = activeSession?.name;
+  const url =
+    '/api/download?path=' + encodeURIComponent(p) + (sess ? '&session=' + encodeURIComponent(sess) : '');
   showStatus(`preparing ${p}…`);
   let head: Response;
   try {
@@ -2049,6 +2048,21 @@ async function downloadFromHost(rawPath: string): Promise<void> {
   a.click();
   a.remove();
   flashStatus(`downloading ${a.download}${size ? ` (${fmtMB(size)} MB)` : ''}…`, 2500);
+}
+
+// Ask for a path and download it. A bare filename / relative path resolves
+// against the terminal's current directory (server-side), so no absolute path
+// is needed — handy on mobile. Shared by the desktop ⬇ button and the mobile
+// actions sheet.
+function promptDownload(): void {
+  void (async () => {
+    const p = await domPrompt({
+      label: "Download — a filename or relative path (from the terminal's folder), or a full path",
+      value: '',
+      okText: 'Download',
+    });
+    if (p) void downloadFromHost(p);
+  })();
 }
 
 // Capture phase: xterm's own paste handler calls stopPropagation() on its

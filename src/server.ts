@@ -486,19 +486,42 @@ async function handleUpload(
 // same tw_auth cookie / Cloudflare-token rules apply. A leading `~` expands to
 // the server user's home; a bare relative path is resolved against it.
 // ---------------------------------------------------------------------------
+/** The active pane's working directory for a tmux session, or null if unknown. */
+function sessionCwd(session: string | null): Promise<string | null> {
+  if (!session) return Promise.resolve(null);
+  const name = sanitizeSession(session);
+  return new Promise((resolve) => {
+    execFile(
+      "tmux",
+      ["display-message", "-p", "-t", name, "-F", "#{pane_current_path}"],
+      (err, stdout) => resolve(err ? null : stdout.toString().trim() || null)
+    );
+  });
+}
+
 async function handleDownload(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  pathParam: string | null
+  pathParam: string | null,
+  sessionParam: string | null
 ): Promise<void> {
   const raw = (pathParam ?? "").trim();
   if (!raw) {
     sendJsonHttp(res, 400, { error: "missing ?path" });
     return;
   }
-  let p = raw;
-  if (p === "~" || p.startsWith("~/")) p = path.join(os.homedir(), p.slice(1));
-  const abs = path.isAbsolute(p) ? path.resolve(p) : path.resolve(os.homedir(), p);
+  let abs: string;
+  if (raw === "~" || raw.startsWith("~/")) {
+    abs = path.resolve(path.join(os.homedir(), raw.slice(1)));
+  } else if (path.isAbsolute(raw)) {
+    abs = path.resolve(raw);
+  } else {
+    // A bare name / relative path resolves against the tmux session's current
+    // working directory, so you can download from wherever you are in the
+    // terminal without typing an absolute path. Falls back to $HOME.
+    const cwd = await sessionCwd(sessionParam);
+    abs = path.resolve(cwd ?? os.homedir(), raw);
+  }
 
   let stat: fs.Stats;
   try {
@@ -578,7 +601,12 @@ const server = http.createServer((req, res) => {
         (method === "GET" || method === "HEAD") &&
         requestUrl.pathname === "/api/download"
       ) {
-        await handleDownload(req, res, requestUrl.searchParams.get("path"));
+        await handleDownload(
+          req,
+          res,
+          requestUrl.searchParams.get("path"),
+          requestUrl.searchParams.get("session")
+        );
         return;
       }
 
