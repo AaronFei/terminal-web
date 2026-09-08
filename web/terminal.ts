@@ -409,8 +409,26 @@ class Session {
     // Auto-repeat is dropped on both paste chords: holding the key would paste
     // the same block again and again, which at a shell prompt is a duplicated
     // command rather than a typo.
-    if (!isMac) {
+    // On a desktop OS this handler ALSO keeps xterm out of IME composition
+    // entirely — see the compositionend handler in wireInput, which commits the
+    // text itself. xterm sends composed text from three places, and starving
+    // one is not enough:
+    //   1. compositionend        -> _finalizeComposition(true), deferred; reads
+    //                               the textarea a tick later (starved there).
+    //   2. a non-229 keydown mid-composition -> _finalizeComposition(false),
+    //                               SYNCHRONOUS, so blanking the textarea
+    //                               afterwards cannot stop it.
+    //   3. a 229 keydown while not composing -> _handleAnyTextareaChanges().
+    // 2 and 3 both run from _compositionHelper.keydown(), which _keyDown calls
+    // only AFTER consulting this handler — so returning false for any keystroke
+    // belonging to a composition shuts both off. e.isComposing is per-event, so
+    // it cannot latch on if a compositionend is ever missed.
+    if (!(isMac && isTouch)) {
       this.term.attachCustomKeyEventHandler((e) => {
+        if (!isTouch && e.type === 'keydown' && (e.isComposing || e.keyCode === 229)) {
+          return false; // composition keystroke — ours, not xterm's
+        }
+        if (isMac) return true; // ⌘ needs no remapping; the chords below are Ctrl
         if (e.type !== 'keydown' || !e.ctrlKey || e.altKey || e.metaKey) {
           return true; // not a copy/paste chord — let xterm handle it normally
         }
@@ -552,21 +570,25 @@ class Session {
         // that and blank the buffer; xterm's own deferred slice then reads an
         // empty value and sends nothing. Nothing here depends on the IME
         // firing compositionstart per character.
-        const text = e.data;
-        if (text) {
-          ta.value = '';
-          // If xterm's slice still manages to emit the same text, the onData
-          // dedup below drops it.
-          this.lastData = text;
-          this.lastDataAt = performance.now();
-          this.debug('composition-commit', text);
-          this.send(text);
-        } else {
-          // Cancelled composition (Escape): nothing to send, but still reset the
-          // buffer — after xterm's deferred slice has run, so we don't race it.
-          window.setTimeout(() => {
-            if (!this.composing) ta.value = '';
-          }, 0);
+        // Desktop only: soft keyboards keep xterm's own composition handling,
+        // which the iOS keydown rescue below was tuned against.
+        if (!isTouch) {
+          const text = e.data;
+          if (text) {
+            ta.value = '';
+            // If xterm's slice still manages to emit the same text, the onData
+            // dedup below drops it.
+            this.lastData = text;
+            this.lastDataAt = performance.now();
+            this.debug('composition-commit', text);
+            this.send(text);
+          } else {
+            // Cancelled composition (Escape): nothing to send, but still reset
+            // the buffer — after xterm's deferred slice has run, not racing it.
+            window.setTimeout(() => {
+              if (!this.composing) ta.value = '';
+            }, 0);
+          }
         }
         // A reconnect arrived mid-composition and deferred its re-fit/re-focus
         // (see connect's onopen) so it wouldn't cancel the composition; now that
@@ -577,28 +599,29 @@ class Session {
           if (isActive(this)) this.term.focus();
         }
       });
-      // Soft keyboards only. On a desktop OS the keys this rescues arrive as
-      // ordinary keydown/input events anyway, so here it could only ever ADD a
-      // keystroke — a stray character beside what the IME already committed,
-      // whenever a desktop IME reports a real character on its 229 keydown and
-      // its composition starts more than 90ms later.
-      if (isTouch) {
-        ta.addEventListener('keydown', (e) => {
-          const ke = e as KeyboardEvent;
-          if (ke.keyCode !== 229) return; // only IME-routed keys
-          const k = ke.key;
-          if (!k || k.length !== 1) return; // a single printable char (not Enter/Backspace/…)
-          const s = ++seq;
-          pendingKeys.set(s, k);
-          lastSeq = s;
-          window.setTimeout(() => {
-            if (!pendingKeys.has(s)) return; // a composition consumed it
-            pendingKeys.delete(s);
-            this.debug('forward-key', k);
-            this.send(k);
-          }, 90);
-        });
-      }
+      // This is now the direct-insert half of the IME path on EVERY platform.
+      // On desktop the custom key handler stops xterm seeing 229 keydowns at
+      // all, so xterm's own _handleAnyTextareaChanges — which used to deliver
+      // these keys there — no longer runs, and its _inputEvent fallback bails
+      // out whenever a keydown was seen. So the rescue below is what carries a
+      // key the IME commits with no composition, and the compositionend handler
+      // above carries everything that does compose. Nothing sends twice: a
+      // composition cancels the pending forward through cancelLast().
+      ta.addEventListener('keydown', (e) => {
+        const ke = e as KeyboardEvent;
+        if (ke.keyCode !== 229) return; // only IME-routed keys
+        const k = ke.key;
+        if (!k || k.length !== 1) return; // a single printable char (not Enter/Backspace/…)
+        const s = ++seq;
+        pendingKeys.set(s, k);
+        lastSeq = s;
+        window.setTimeout(() => {
+          if (!pendingKeys.has(s)) return; // a composition consumed it
+          pendingKeys.delete(s);
+          this.debug('forward-key', k);
+          this.send(k);
+        }, 90);
+      });
     }
 
     this.term.onData((data: string) => {
