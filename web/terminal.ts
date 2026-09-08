@@ -534,9 +534,40 @@ class Session {
         cancelLast();
       });
       ta.addEventListener('compositionupdate', cancelLast);
-      ta.addEventListener('compositionend', () => {
+      ta.addEventListener('compositionend', (e) => {
         this.composing = false;
         cancelLast();
+        // Commit the composed text ourselves, then empty the textarea.
+        //
+        // xterm clears this textarea only on Enter / ^C / blur, so while you
+        // keep typing it accumulates everything composed so far — and xterm
+        // sends a composition by slicing that buffer:
+        //   value.substring(_compositionPosition.start + _dataAlreadySent.length)
+        // which runs to the END of the value. _compositionPosition.start is
+        // refreshed only on compositionstart, and a Windows IME fires that once
+        // for a whole run of characters, so start freezes while the buffer
+        // grows: every keystroke re-sends a sliding window of everything typed
+        // since — type without pressing Enter and the same block floods in over
+        // and over. compositionend.data is exactly the committed text, so send
+        // that and blank the buffer; xterm's own deferred slice then reads an
+        // empty value and sends nothing. Nothing here depends on the IME
+        // firing compositionstart per character.
+        const text = e.data;
+        if (text) {
+          ta.value = '';
+          // If xterm's slice still manages to emit the same text, the onData
+          // dedup below drops it.
+          this.lastData = text;
+          this.lastDataAt = performance.now();
+          this.debug('composition-commit', text);
+          this.send(text);
+        } else {
+          // Cancelled composition (Escape): nothing to send, but still reset the
+          // buffer — after xterm's deferred slice has run, so we don't race it.
+          window.setTimeout(() => {
+            if (!this.composing) ta.value = '';
+          }, 0);
+        }
         // A reconnect arrived mid-composition and deferred its re-fit/re-focus
         // (see connect's onopen) so it wouldn't cancel the composition; now that
         // we've committed, it's safe to catch up.
