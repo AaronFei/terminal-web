@@ -34,6 +34,9 @@ const MAX_PENDING_SEQ = 64 * 1024;
 // it through to the browser. Everything else uses Ctrl, which collides with the
 // terminal's ^C/^V — hence the OS-specific copy/paste key handling below.
 const isMac = /Mac|iP(hone|ad|od)/.test(navigator.platform || navigator.userAgent);
+// Soft keyboard (phone / tablet) vs. a real one. Only used to scope the IME
+// keydown rescue in wireInput, which is a soft-keyboard workaround.
+const isTouch = window.matchMedia('(pointer: coarse)').matches;
 
 const params = new URLSearchParams(window.location.search);
 const IME_DEBUG = (params.get('debug') ?? '').includes('ime');
@@ -95,7 +98,7 @@ function pasteFromClipboard(): void {
     clip
       .readText()
       .then((t) => {
-        if (t) activeSession?.sendSeq(t);
+        if (t) activeSession?.pasteText(t);
         else openPasteBox();
       })
       .catch(() => openPasteBox());
@@ -106,8 +109,9 @@ function pasteFromClipboard(): void {
   }
 }
 
-// Rich paste for the Windows/Linux Ctrl+Shift+V chord: unlike Chrome's built-in
-// "paste as plain text" (which drops images) or readText() (text only), the
+// Rich paste for the Windows/Linux Ctrl+Shift+V chord (plain Ctrl+V uses the
+// browser's own paste instead): unlike Chrome's built-in "paste as plain text"
+// bound to that chord (which drops images) or readText() (text only), the
 // async Clipboard API returns BOTH text and image blobs — so a pasted image
 // uploads and text goes to the shell. Falls back to the text-only path when the
 // Clipboard read API isn't available (non-secure context / older browsers).
@@ -126,7 +130,7 @@ async function pasteRich(): Promise<void> {
           handled = true;
         } else if (it.types.includes('text/plain')) {
           const text = await (await it.getType('text/plain')).text();
-          if (text) activeSession?.sendSeq(text);
+          if (text) activeSession?.pasteText(text);
           handled = true;
         }
       }
@@ -176,7 +180,7 @@ function openPasteBox(): void {
   };
   const submit = (): void => {
     const t = ta.value;
-    if (t) activeSession?.sendSeq(t);
+    if (t) activeSession?.pasteText(t);
     close();
   };
   send.addEventListener('click', submit);
@@ -196,7 +200,7 @@ function openPasteBox(): void {
 function openHelp(): void {
   if (document.querySelector('.help-overlay')) return;
   const selKey = isMac ? '⌥ Option' : 'Shift';
-  const pasteKey = isMac ? '⌘V' : 'Ctrl+Shift+V';
+  const pasteKey = isMac ? '⌘V' : 'Ctrl+V';
   const copyKey = isMac ? '⌘C' : 'Ctrl+Shift+C';
   const overlay = document.createElement('div');
   overlay.className = 'paste-overlay help-overlay';
@@ -206,7 +210,12 @@ function openHelp(): void {
     '<div class="help-title">How to copy / paste / files</div>' +
     '<ul class="help-list">' +
     `<li><b>Copy</b> — hold <b>${selKey}</b> and drag to select; it copies automatically. (Or select, then <b>${copyKey}</b> / tap <b>Copy</b>.)</li>` +
-    `<li><b>Paste</b> — click the terminal, then <b>${pasteKey}</b>. On a phone/tablet, tap <b>Paste</b> and paste into the box that appears.</li>` +
+    `<li><b>Paste</b> — click the terminal, then <b>${pasteKey}</b>${
+      isMac ? '' : ' (or Ctrl+Shift+V)'
+    }. On a phone/tablet, tap <b>Paste</b> and paste into the box that appears.</li>` +
+    (isMac
+      ? ''
+      : '<li><b>Literal ^V</b> (vim visual-block, readline quoted-insert) — Ctrl+V now pastes, so press <b>Ctrl+Q</b>, which both accept as its alias.</li>') +
     '<li><b>Attach a file</b> (for Claude Code etc.) — tap the 📎 button, or paste / drag any file (image, PDF, text…): it uploads and inserts the file path. Then press Enter.</li>' +
     '<li><b>Download a file</b> — tap the ⬇ button (or <b>⋯ → Download</b> on a phone) and enter a name/relative path from the terminal\'s current folder (e.g. <code>report.zip</code>), or a full path (<code>~/output/report.zip</code>). It downloads to this device.</li>' +
     '<li><b>Scroll</b> — mouse wheel or two-finger swipe scrolls the history.</li>' +
@@ -378,30 +387,53 @@ class Session {
       }
     }
 
-    // Windows/Linux copy-paste. Ctrl+C / Ctrl+V collide with the terminal's own
-    // interrupt (^C) and literal (^V): xterm maps them to control bytes and
-    // cancels the keydown, which ALSO suppresses the browser's native copy/paste
-    // and the paste-to-upload event — so on Windows nothing copies, pastes, or
-    // uploads. macOS avoids this because ⌘ is never a terminal key. So on
-    // non-Mac, wire the Ctrl+Shift+C / Ctrl+Shift+V chords explicitly (as VS
-    // Code / Hyper do): copy the selection (and stop Chrome opening DevTools on
-    // Ctrl+Shift+C), and rich-paste text + images. Plain Ctrl+C stays ^C/SIGINT.
+    // Windows/Linux copy-paste. macOS gets this for free: ⌘ is never a terminal
+    // key, so xterm ignores ⌘V and the browser's own paste runs — text, images
+    // and files all take one path. Ctrl is different: xterm turns Ctrl+V into ^V
+    // and Ctrl+C into ^C and cancels the keydown, which ALSO kills the browser's
+    // copy/paste and the paste-to-upload event. So on non-Mac we take the keys
+    // back:
+    //   Ctrl+V        paste. Returning false WITHOUT preventDefault only stops
+    //                 xterm making it ^V — the browser then pastes natively, so
+    //                 this is the ⌘V path exactly: text, images, files, and it
+    //                 still works over plain HTTP where the Clipboard API can't
+    //                 read. The cost is ^V (readline quoted-insert, vim
+    //                 visual-block), which both accept Ctrl+Q for instead.
+    //                 Windows Terminal and VS Code make the same trade.
+    //   Ctrl+Shift+V  the same, kept for muscle memory and the Linux-terminal
+    //                 convention — but Chrome binds it to "paste as plain text"
+    //                 (which drops images), so this chord reads the clipboard
+    //                 itself rather than letting the browser do it.
+    //   Ctrl+Shift+C  copy the selection (preventDefault so Chrome doesn't open
+    //                 DevTools). Plain Ctrl+C stays ^C / SIGINT.
+    // Auto-repeat is dropped on both paste chords: holding the key would paste
+    // the same block again and again, which at a shell prompt is a duplicated
+    // command rather than a typo.
     if (!isMac) {
       this.term.attachCustomKeyEventHandler((e) => {
-        if (e.type !== 'keydown' || !e.ctrlKey || !e.shiftKey || e.altKey || e.metaKey) {
+        if (e.type !== 'keydown' || !e.ctrlKey || e.altKey || e.metaKey) {
           return true; // not a copy/paste chord — let xterm handle it normally
         }
-        if (e.code === 'KeyC') {
+        // Match the physical key OR the layout's letter, so the chord works on
+        // QWERTY and on layouts that move V/C (AZERTY, Dvorak…).
+        const isKey = (code: string, ch: string): boolean =>
+          e.code === code || (e.key || '').toLowerCase() === ch;
+        if (isKey('KeyV', 'v')) {
+          if (e.repeat) {
+            e.preventDefault(); // a held key must not paste twice
+            return false;
+          }
+          if (!e.shiftKey) return false; // hand it to the browser's native paste
+          e.preventDefault(); // Chrome's own Ctrl+Shift+V would drop images
+          void pasteRich();
+          return false;
+        }
+        if (e.shiftKey && isKey('KeyC', 'c')) {
           const sel = this.term.getSelection();
           if (sel) void copyText(sel).then((ok) => flashStatus(ok ? 'copied' : 'copy failed', 1200));
           else flashStatus('nothing selected', 1200);
           e.preventDefault(); // block Chrome's Ctrl+Shift+C = open DevTools
           return false; // handled — don't let xterm process it
-        }
-        if (e.code === 'KeyV') {
-          e.preventDefault(); // we paste via the Clipboard API, not the browser default
-          void pasteRich();
-          return false;
         }
         return true;
       });
@@ -468,6 +500,22 @@ class Session {
     // starts, and otherwise forward it. English keys (real keyCode) and
     // committed CJK (compositionend → onData) are untouched, so nothing doubles.
     if (ta) {
+      // Keep xterm's hidden textarea empty after a paste. xterm reads the text
+      // off the event's clipboardData and sends it, but never preventDefaults,
+      // so the browser then inserts the same text into that textarea — where it
+      // stays until the next Enter / ^C / blur. That matters because xterm
+      // tracks IME input as offsets into this textarea: compositionstart takes
+      // start = value.length, and the commit sends value.substring(start) — to
+      // the END of the value. Compose on top of a stale paste and those offsets
+      // are wrong, so part of the old block is committed again: type after
+      // pasting and the pasted text reappears. xterm doesn't need the
+      // insertion, so cancel it (only when clipboardData actually carried the
+      // paste, i.e. xterm has already handled it). Scoped to the terminal's own
+      // textarea — the mobile paste box needs its default insertion.
+      ta.addEventListener('paste', (e) => {
+        if (e.clipboardData) e.preventDefault();
+      });
+
       const pendingKeys = new Map<number, string>();
       let lastSeq = -1;
       let seq = 0;
@@ -498,21 +546,28 @@ class Session {
           if (isActive(this)) this.term.focus();
         }
       });
-      ta.addEventListener('keydown', (e) => {
-        const ke = e as KeyboardEvent;
-        if (ke.keyCode !== 229) return; // only IME-routed keys
-        const k = ke.key;
-        if (!k || k.length !== 1) return; // a single printable char (not Enter/Backspace/…)
-        const s = ++seq;
-        pendingKeys.set(s, k);
-        lastSeq = s;
-        window.setTimeout(() => {
-          if (!pendingKeys.has(s)) return; // a composition consumed it
-          pendingKeys.delete(s);
-          this.debug('forward-key', k);
-          this.send(k);
-        }, 90);
-      });
+      // Soft keyboards only. On a desktop OS the keys this rescues arrive as
+      // ordinary keydown/input events anyway, so here it could only ever ADD a
+      // keystroke — a stray character beside what the IME already committed,
+      // whenever a desktop IME reports a real character on its 229 keydown and
+      // its composition starts more than 90ms later.
+      if (isTouch) {
+        ta.addEventListener('keydown', (e) => {
+          const ke = e as KeyboardEvent;
+          if (ke.keyCode !== 229) return; // only IME-routed keys
+          const k = ke.key;
+          if (!k || k.length !== 1) return; // a single printable char (not Enter/Backspace/…)
+          const s = ++seq;
+          pendingKeys.set(s, k);
+          lastSeq = s;
+          window.setTimeout(() => {
+            if (!pendingKeys.has(s)) return; // a composition consumed it
+            pendingKeys.delete(s);
+            this.debug('forward-key', k);
+            this.send(k);
+          }, 90);
+        });
+      }
     }
 
     this.term.onData((data: string) => {
@@ -554,6 +609,24 @@ class Session {
     }
     const buffered = this.pendingSeq.reduce((n, s) => n + s.length, 0);
     if (buffered + seq.length <= MAX_PENDING_SEQ) this.pendingSeq.push(seq);
+  }
+
+  /**
+   * Send clipboard text as a *paste* rather than as typing.
+   *
+   * A native paste (⌘V, and now Ctrl+V) goes through xterm, which turns
+   * newlines into CR and wraps the text in bracketed-paste markers whenever the
+   * running program asked for them. Text pushed straight down the socket has
+   * neither, so a full-screen TUI (Claude Code, vim, tmux copy-mode) sees a
+   * burst of keystrokes instead of one paste: it re-renders per character and
+   * takes every LF as Enter, which reprints the line being edited — on screen
+   * the block looks pasted twice. So every programmatic paste (the Paste
+   * button, the mobile paste box, Ctrl+Shift+V) has to bracket it the same way.
+   */
+  pasteText(text: string): void {
+    if (!text) return;
+    const t = text.replace(/\r?\n/g, '\r');
+    this.sendSeq(this.term.modes.bracketedPasteMode ? `\x1b[200~${t}\x1b[201~` : t);
   }
 
   // One-finger touch scrolling. tmux runs in the alternate screen (no
