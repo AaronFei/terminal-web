@@ -593,14 +593,15 @@ class Session {
           if (isActive(this)) this.term.focus();
         }
       });
-      // This is now the direct-insert half of the IME path on EVERY platform.
-      // On desktop the custom key handler stops xterm seeing 229 keydowns at
-      // all, so xterm's own _handleAnyTextareaChanges — which used to deliver
-      // these keys there — no longer runs, and its _inputEvent fallback bails
-      // out whenever a keydown was seen. So the rescue below is what carries a
-      // key the IME commits with no composition, and the compositionend handler
-      // above carries everything that does compose. Nothing sends twice: a
-      // composition cancels the pending forward through cancelLast().
+      // The direct-insert half of the IME path. The custom key handler stops
+      // xterm seeing 229 keydowns at all, so xterm's own
+      // _handleAnyTextareaChanges — which used to deliver these keys — no
+      // longer runs, and its _inputEvent fallback bails out whenever a keydown
+      // was seen. So this rescue is what carries a key the IME commits with no
+      // composition (full-width punctuation, digits, space), and the
+      // compositionend handler above carries everything that does compose.
+      // Nothing sends twice: a composition cancels the pending forward through
+      // cancelLast().
       ta.addEventListener('keydown', (e) => {
         const ke = e as KeyboardEvent;
         if (ke.keyCode !== 229) return; // only IME-routed keys
