@@ -34,9 +34,6 @@ const MAX_PENDING_SEQ = 64 * 1024;
 // it through to the browser. Everything else uses Ctrl, which collides with the
 // terminal's ^C/^V — hence the OS-specific copy/paste key handling below.
 const isMac = /Mac|iP(hone|ad|od)/.test(navigator.platform || navigator.userAgent);
-// Soft keyboard (phone / tablet) vs. a real one. Only used to scope the IME
-// keydown rescue in wireInput, which is a soft-keyboard workaround.
-const isTouch = window.matchMedia('(pointer: coarse)').matches;
 
 const params = new URLSearchParams(window.location.search);
 const IME_DEBUG = (params.get('debug') ?? '').includes('ime');
@@ -409,8 +406,8 @@ class Session {
     // Auto-repeat is dropped on both paste chords: holding the key would paste
     // the same block again and again, which at a shell prompt is a duplicated
     // command rather than a typo.
-    // On a desktop OS this handler ALSO keeps xterm out of IME composition
-    // entirely — see the compositionend handler in wireInput, which commits the
+    // This handler ALSO keeps xterm out of IME composition entirely, on every
+    // platform — see the compositionend handler in wireInput, which commits the
     // text itself. xterm sends composed text from three places, and starving
     // one is not enough:
     //   1. compositionend        -> _finalizeComposition(true), deferred; reads
@@ -423,39 +420,37 @@ class Session {
     // only AFTER consulting this handler — so returning false for any keystroke
     // belonging to a composition shuts both off. e.isComposing is per-event, so
     // it cannot latch on if a compositionend is ever missed.
-    if (!(isMac && isTouch)) {
-      this.term.attachCustomKeyEventHandler((e) => {
-        if (!isTouch && e.type === 'keydown' && (e.isComposing || e.keyCode === 229)) {
-          return false; // composition keystroke — ours, not xterm's
-        }
-        if (isMac) return true; // ⌘ needs no remapping; the chords below are Ctrl
-        if (e.type !== 'keydown' || !e.ctrlKey || e.altKey || e.metaKey) {
-          return true; // not a copy/paste chord — let xterm handle it normally
-        }
-        // Match the physical key OR the layout's letter, so the chord works on
-        // QWERTY and on layouts that move V/C (AZERTY, Dvorak…).
-        const isKey = (code: string, ch: string): boolean =>
-          e.code === code || (e.key || '').toLowerCase() === ch;
-        if (isKey('KeyV', 'v')) {
-          if (e.repeat) {
-            e.preventDefault(); // a held key must not paste twice
-            return false;
-          }
-          if (!e.shiftKey) return false; // hand it to the browser's native paste
-          e.preventDefault(); // Chrome's own Ctrl+Shift+V would drop images
-          void pasteRich();
+    this.term.attachCustomKeyEventHandler((e) => {
+      if (e.type === 'keydown' && (e.isComposing || e.keyCode === 229)) {
+        return false; // composition keystroke — ours, not xterm's
+      }
+      if (isMac) return true; // ⌘ needs no remapping; the chords below are Ctrl
+      if (e.type !== 'keydown' || !e.ctrlKey || e.altKey || e.metaKey) {
+        return true; // not a copy/paste chord — let xterm handle it normally
+      }
+      // Match the physical key OR the layout's letter, so the chord works on
+      // QWERTY and on layouts that move V/C (AZERTY, Dvorak…).
+      const isKey = (code: string, ch: string): boolean =>
+        e.code === code || (e.key || '').toLowerCase() === ch;
+      if (isKey('KeyV', 'v')) {
+        if (e.repeat) {
+          e.preventDefault(); // a held key must not paste twice
           return false;
         }
-        if (e.shiftKey && isKey('KeyC', 'c')) {
-          const sel = this.term.getSelection();
-          if (sel) void copyText(sel).then((ok) => flashStatus(ok ? 'copied' : 'copy failed', 1200));
-          else flashStatus('nothing selected', 1200);
-          e.preventDefault(); // block Chrome's Ctrl+Shift+C = open DevTools
-          return false; // handled — don't let xterm process it
-        }
-        return true;
-      });
-    }
+        if (!e.shiftKey) return false; // hand it to the browser's native paste
+        e.preventDefault(); // Chrome's own Ctrl+Shift+V would drop images
+        void pasteRich();
+        return false;
+      }
+      if (e.shiftKey && isKey('KeyC', 'c')) {
+        const sel = this.term.getSelection();
+        if (sel) void copyText(sel).then((ok) => flashStatus(ok ? 'copied' : 'copy failed', 1200));
+        else flashStatus('nothing selected', 1200);
+        e.preventDefault(); // block Chrome's Ctrl+Shift+C = open DevTools
+        return false; // handled — don't let xterm process it
+      }
+      return true;
+    });
 
     // Copy the selection to the clipboard when a drag/touch selection ends.
     const copySelection = (): void => {
@@ -570,25 +565,24 @@ class Session {
         // that and blank the buffer; xterm's own deferred slice then reads an
         // empty value and sends nothing. Nothing here depends on the IME
         // firing compositionstart per character.
-        // Desktop only: soft keyboards keep xterm's own composition handling,
-        // which the iOS keydown rescue below was tuned against.
-        if (!isTouch) {
-          const text = e.data;
-          if (text) {
-            ta.value = '';
-            // If xterm's slice still manages to emit the same text, the onData
-            // dedup below drops it.
-            this.lastData = text;
-            this.lastDataAt = performance.now();
-            this.debug('composition-commit', text);
-            this.send(text);
-          } else {
-            // Cancelled composition (Escape): nothing to send, but still reset
-            // the buffer — after xterm's deferred slice has run, not racing it.
-            window.setTimeout(() => {
-              if (!this.composing) ta.value = '';
-            }, 0);
-          }
+        const text = e.data;
+        if (text) {
+          // Synchronously, BEFORE the IME opens its next composition: the log
+          // shows compositionend and the next compositionstart landing in the
+          // same millisecond, so a deferred clear is far too late.
+          ta.value = '';
+          // If xterm's slice still manages to emit the same text, the onData
+          // dedup below drops it.
+          this.lastData = text;
+          this.lastDataAt = performance.now();
+          this.debug('composition-commit', text);
+          this.send(text);
+        } else {
+          // Cancelled composition (Escape): nothing to send, but still reset
+          // the buffer — after xterm's deferred slice has run, not racing it.
+          window.setTimeout(() => {
+            if (!this.composing) ta.value = '';
+          }, 0);
         }
         // A reconnect arrived mid-composition and deferred its re-fit/re-focus
         // (see connect's onopen) so it wouldn't cancel the composition; now that
@@ -925,6 +919,13 @@ class Session {
 
     socket.onopen = () => {
       this.reconnectDelay = MIN_DELAY;
+      if (IME_DEBUG) {
+        this.debugSend(
+          'env',
+          `mac=${isMac} coarse=${window.matchMedia('(pointer: coarse)').matches} ` +
+            `imeOwned=1 ua=${navigator.userAgent.slice(0, 80)}`,
+        );
+      }
       this.everConnected = true;
       this.setConnected(true);
       this.startPing();
