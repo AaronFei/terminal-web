@@ -529,6 +529,24 @@ class Session {
         if (e.clipboardData) e.preventDefault();
       });
 
+      // Keep it empty after a composition commits, too — this is what actually
+      // stops Bopomofo snowballing.
+      //
+      // The browser inserts the committed text into the textarea AFTER the
+      // compositionend dispatch, so clearing from inside that handler is undone
+      // a moment later. Windows Bopomofo then pulls the text sitting there
+      // straight back into its next composition (the log shows compositionstart
+      // immediately followed by a compositionupdate already carrying everything
+      // typed before), commits the lot again, and round it goes — each commit
+      // longer than the last. compositionend is not cancelable, so the
+      // insertion cannot be prevented; the input event that follows it is the
+      // first moment the text is really there with no composition active, which
+      // makes it the place to clear. Guarded on isComposing so the in-progress
+      // composition is never touched.
+      ta.addEventListener('input', (e) => {
+        if (!(e as InputEvent).isComposing && ta.value !== '') ta.value = '';
+      });
+
       const pendingKeys = new Map<number, string>();
       let lastSeq = -1;
       let seq = 0;
@@ -545,6 +563,9 @@ class Session {
       ta.addEventListener('compositionstart', () => {
         this.composing = true;
         cancelLast();
+        // Never let a composition begin on top of leftover text: that is what
+        // the IME reconverts into its own buffer.
+        if (ta.value !== '') ta.value = '';
       });
       ta.addEventListener('compositionupdate', cancelLast);
       ta.addEventListener('compositionend', (e) => {
