@@ -338,6 +338,14 @@ class Session {
   private lastData = '';
   private lastDataAt = 0;
 
+  // The IME's current pre-edit (composing) string, straight from its own
+  // compositionupdate events, with the time it was last seen. Nothing in here
+  // has been committed, so none of it may reach the pty — only the text the IME
+  // hands us at compositionend does, and we send that ourselves. Kept for a
+  // moment after the composition ends because xterm's finalize is deferred.
+  private composingText = '';
+  private composingAt = 0;
+
   // True between compositionstart and compositionend — i.e. while the soft
   // keyboard is mid-composition (e.g. picking a 注音 candidate). A reconnect
   // that re-fits/re-focuses the terminal during this window cancels the iOS
@@ -567,7 +575,13 @@ class Session {
         // the IME reconverts into its own buffer.
         if (ta.value !== '') ta.value = '';
       });
-      ta.addEventListener('compositionupdate', cancelLast);
+      ta.addEventListener('compositionupdate', (e) => {
+        cancelLast();
+        if (e.data) {
+          this.composingText = e.data;
+          this.composingAt = performance.now();
+        }
+      });
       ta.addEventListener('compositionend', (e) => {
         this.composing = false;
         cancelLast();
@@ -643,6 +657,28 @@ class Session {
     this.term.onData((data: string) => {
       this.debug('onData', data);
       const now = performance.now();
+      // Never let the pre-edit string through. Windows Bopomofo keeps ONE
+      // composition open while you type — the log shows compositionupdate
+      // growing by a character at a time and only flushing a chunk now and
+      // then — so at compositionend the textarea still holds uncommitted text.
+      // xterm's finalize assumes the opposite (that what is left is exactly
+      // what was committed) and fires a few ms later on a setTimeout, sending
+      // the remaining pre-edit text: right after our own commit the log shows
+      //   composition-commit "喔喔喔喔喔喔ㄟ"
+      //   onData             "ㄟㄟㄟㄟㄟㄟ一一一一一一喔喔…"
+      // Whatever it sends is a tail of the textarea, hence a tail of the string
+      // the IME is composing, which makes this exact rather than a guess. The
+      // committed text reaches the pty from the compositionend handler, which
+      // calls send() directly and so never passes through here.
+      if (
+        data &&
+        !/[\x00-\x1f]/.test(data) && // never touch control bytes or escapes
+        this.composingText.endsWith(data) &&
+        now - this.composingAt < 500
+      ) {
+        this.debug('onData-DROP-preedit', data);
+        return;
+      }
       // Only dedupe multibyte (IME) content; ASCII/control input is never touched.
       if (
         /[^\x00-\x7F]/.test(data) &&
