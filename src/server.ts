@@ -4,6 +4,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { execFile } from "node:child_process";
+import crypto from "node:crypto";
 import { URL } from "node:url";
 
 import { WebSocketServer, WebSocket } from "ws";
@@ -154,9 +155,40 @@ function resolveStaticPath(pathname: string): string | null {
 }
 
 /**
+ * A short token identifying the currently built client bundle, from the size +
+ * mtime of the files in public/dist. Stamped onto their URLs in index.html so a
+ * rebuild produces URLs nothing can have cached.
+ *
+ * We send Cache-Control: no-cache on every static response, but Cloudflare
+ * rewrites that to its Browser Cache TTL — measured at max-age=14400 — for
+ * requests through the public hostname. A browser that has terminal.js pinned
+ * for four hours then keeps running the old client across deploys, silently:
+ * a plain reload never asks the server, the WebSocket reconnects fine, and only
+ * a hard refresh escapes. Direct tailnet access is unaffected, which is exactly
+ * what makes it easy to miss. The URL changing on each build sidesteps all of
+ * it — for the edge cache and the browser cache alike — without depending on
+ * any Cloudflare setting. index.html itself is served no-cache and comes back
+ * DYNAMIC (uncached) through Cloudflare, so the fresh stamp always arrives.
+ */
+async function bundleVersion(): Promise<string> {
+  try {
+    const parts = await Promise.all(
+      ["terminal.js", "terminal.css"].map(async (name) => {
+        const st = await fsp.stat(path.join(config.publicDir, "dist", name));
+        return `${st.size}-${Math.round(st.mtimeMs)}`;
+      })
+    );
+    return crypto.createHash("sha1").update(parts.join("|")).digest("hex").slice(0, 12);
+  } catch {
+    return ""; // dist missing (never built) — leave the URLs untouched
+  }
+}
+
+/**
  * Serve index.html with the machine's hostname injected into <title>, so each
- * host shows up as a distinct browser tab. The file is tiny, so reading it per
- * request is fine (responses are no-cache anyway).
+ * host shows up as a distinct browser tab, and the bundle URLs stamped with the
+ * current build. The file is tiny, so reading it per request is fine
+ * (responses are no-cache anyway).
  */
 async function serveIndexHtml(
   req: http.IncomingMessage,
@@ -174,6 +206,14 @@ async function serveIndexHtml(
 
   const title = `${escapeHtml(HOST_LABEL)} · terminal-web`;
   html = html.replace(/<title>[^<]*<\/title>/i, `<title>${title}</title>`);
+
+  const version = await bundleVersion();
+  if (version) {
+    html = html.replace(
+      /(["'])(\/dist\/terminal\.(?:js|css))\1/g,
+      (_m, quote: string, url: string) => `${quote}${url}?v=${version}${quote}`
+    );
+  }
 
   const body = Buffer.from(html, "utf8");
   res.writeHead(200, {
