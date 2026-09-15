@@ -13,6 +13,17 @@ const MIN_FONT = 8;
 const MAX_FONT = 28;
 const KEYBAR_HEIGHT = 48; // px when shown
 
+// Floor on the size we will ever report to the server. xterm's FitAddon happily
+// proposes 2x1 whenever the pane momentarily has no layout box (a fullscreen
+// switch, a phone's keyboard eating the viewport, a tab being restored), and
+// that size goes straight through to tmux, which resizes the window for EVERY
+// client attached to that session. A program on the alternate screen (Claude
+// Code) has no scrollback, so whatever no longer fits is destroyed rather than
+// scrolled off. A session found sitting at 11x6 on this machine is what that
+// looks like afterwards. Below this floor we keep the last good size.
+const MIN_COLS = 20;
+const MIN_ROWS = 5;
+
 // Touch "select" mode (toggled from the key bar). tmux runs with `mouse on`, so
 // a finger drag is normally hijacked for scrolling and there is no way to make a
 // text selection by touch (on desktop you hold Option to bypass tmux's mouse
@@ -296,6 +307,13 @@ let currentFont = (() => {
   return 14;
 })();
 
+// The size every pane has. All panes are inset:0 in #terminal and share one
+// font, so a single measurement taken from the pane on screen is the correct
+// size for all of them — including the hidden ones, which are display:none and
+// cannot measure themselves. Written by setPaneDims(); 0 until the first fit.
+let paneCols = 0;
+let paneRows = 0;
+
 function showStatus(text: string): void {
   if (!statusEl) return;
   statusEl.textContent = text;
@@ -474,6 +492,14 @@ class Session {
 
     this.wireInput();
     this.wireTouchScroll();
+  }
+
+  /** Open the socket. Held back until the pane size is known — see init(). */
+  start(): void {
+    if (this.ws || this.disposed) return;
+    // Adopt the size the panes already have, so a tab that has never been shown
+    // still opens its socket — and so spawns its pty — at the right size.
+    if (paneCols && paneRows) this.applyDims(paneCols, paneRows);
     this.connect();
   }
 
@@ -624,7 +650,7 @@ class Session {
         // we've committed, it's safe to catch up.
         if (this.reattachAfterCompose) {
           this.reattachAfterCompose = false;
-          this.fit();
+          this.resync();
           if (isActive(this)) this.term.focus();
         }
       });
@@ -882,19 +908,50 @@ class Session {
     }
   }
 
+  // Measure the pane and publish the result to every session (setPaneDims).
+  // Only the pane on screen can be measured — a hidden one is display:none and
+  // has no box — but they are all the same size, so the others take the number
+  // from here instead of being left at whatever they started with.
   fit(): void {
-    if (this.el.classList.contains('hidden')) return; // don't fit a hidden pane
+    if (this.el.classList.contains('hidden')) return;
+    let dims;
     try {
-      this.fitAddon.fit();
+      dims = this.fitAddon.proposeDimensions();
     } catch {
-      /* not laid out yet */
+      return; // not laid out yet
+    }
+    if (!dims || !Number.isFinite(dims.cols) || !Number.isFinite(dims.rows)) return;
+    // A degenerate box (see MIN_COLS) means the layout is mid-flight, not that
+    // the terminal is really two columns wide. Keep the last good size.
+    if (dims.cols < MIN_COLS || dims.rows < MIN_ROWS) return;
+    try {
+      this.fitAddon.fit(); // resizes to exactly those dims, clearing the renderer first
+    } catch {
+      return;
+    }
+    this.sendResize();
+    setPaneDims(this.term.cols, this.term.rows);
+  }
+
+  /** Adopt the measured pane size and pass it on to the server. */
+  applyDims(cols: number, rows: number): void {
+    if (this.term.cols === cols && this.term.rows === rows) return;
+    try {
+      this.term.resize(cols, rows);
+    } catch {
+      return;
     }
     this.sendResize();
   }
 
+  /** Re-state our size on a freshly opened socket, and re-measure if shown. */
+  private resync(): void {
+    if (this.el.classList.contains('hidden')) this.sendResize();
+    else this.fit(); // re-measures and sends as a side effect
+  }
+
   setFont(px: number): void {
     this.term.options.fontSize = px;
-    this.fit();
   }
 
   setActive(active: boolean): void {
@@ -970,7 +1027,14 @@ class Session {
 
   private connect(): void {
     if (this.disposed) return;
-    const url = `${wsProto}://${window.location.host}/ws?session=${encodeURIComponent(this.name)}`;
+    // Hand the server our size up front so it spawns the pty with it and the
+    // tmux client attaches at the size it is going to keep. Attaching at tmux's
+    // 80x24 default first — what every connect and reconnect used to do —
+    // resizes the window for every other client on that session, and a program
+    // on the alternate screen loses everything that no longer fits.
+    const url =
+      `${wsProto}://${window.location.host}/ws?session=${encodeURIComponent(this.name)}` +
+      `&cols=${this.term.cols}&rows=${this.term.rows}`;
     const socket = new WebSocket(url);
     socket.binaryType = 'arraybuffer';
     this.ws = socket;
@@ -1007,7 +1071,7 @@ class Session {
       if (this.composing) {
         this.reattachAfterCompose = true;
       } else {
-        this.fit();
+        this.resync();
         if (isActive(this)) this.term.focus();
       }
     };
@@ -1141,12 +1205,20 @@ function buildTab(s: Session): void {
   refreshMobileUI();
 }
 
-function addSession(name: string, makeActive: boolean, displayName?: string): Session {
+function addSession(
+  name: string,
+  makeActive: boolean,
+  displayName?: string,
+  // Build the tab but hold its socket, for the caller to start() once the pane
+  // size is known (init only — everywhere else that size is already measured).
+  defer = false,
+): Session {
   let s = sessions.find((x) => x.name === name);
   if (!s) {
     s = new Session(name, displayName);
     sessions.push(s);
     buildTab(s);
+    if (!defer) s.start();
   } else if (displayName && displayName.trim() && displayName.trim() !== s.displayName) {
     setDisplayName(s, displayName.trim());
   }
@@ -1523,6 +1595,29 @@ function fitActive(): void {
   activeSession?.fit();
 }
 
+// Resizing a tmux window makes it reflow its whole history, so the panes nobody
+// is looking at wait for the drag to settle rather than following every frame.
+const BG_RESIZE_DELAY = 250;
+let bgResizeTimer: number | null = null;
+
+// Publish the size measured from the pane on screen to every session. The
+// hidden ones cannot measure themselves, and leaving them at the size they
+// happened to start with is what left every tab you weren't looking at attached
+// to tmux at 80x24 — one reconnect of such a client and tmux resized the window
+// to 80x24 for everyone on it, taking the alternate screen's contents with it.
+function setPaneDims(cols: number, rows: number): void {
+  paneCols = cols;
+  paneRows = rows;
+  // The pane on screen has already resized itself (fit); the rest follow here.
+  if (bgResizeTimer !== null) clearTimeout(bgResizeTimer);
+  bgResizeTimer = window.setTimeout(() => {
+    bgResizeTimer = null;
+    for (const s of sessions) {
+      if (!isActive(s)) s.applyDims(paneCols, paneRows);
+    }
+  }, BG_RESIZE_DELAY);
+}
+
 // Below this width the key bar wraps to several rows (see styles.css) instead
 // of being one horizontally-scrollable row, so its height is no longer fixed.
 const mobileMQ = window.matchMedia('(max-width: 640px)');
@@ -1609,6 +1704,7 @@ function changeFont(delta: number): void {
     /* ignore */
   }
   for (const s of sessions) s.setFont(currentFont);
+  fitActive(); // the cell size changed: re-measure and push the new size to all panes
   activeSession?.focus();
 }
 
@@ -2381,10 +2477,22 @@ async function init(): Promise<void> {
   }
   defaultSessionName = urlSession ?? initialTabs[0]?.name ?? 'web';
 
-  for (const t of initialTabs) addSession(t.name, false, t.displayName);
+  // Build every tab first (creation order is tab order) but hold the sockets:
+  // activating the tab we are about to show measures the pane, and every session
+  // needs that size before it attaches. A tmux client that attaches at the wrong
+  // size resizes the window for every other client on that session, and a
+  // program on the alternate screen (Claude Code) has no scrollback to restore
+  // from — whatever no longer fits is gone for good.
+  for (const t of initialTabs) addSession(t.name, false, t.displayName, true);
 
   const activeName = urlSession ?? cached.active ?? initialTabs[0].name;
   activateSession(sessions.find((s) => s.name === activeName) ?? sessions[0]);
+  // setActive measures inside a rAF; ours is queued behind it, so the size has
+  // landed by the time this resolves.
+  await new Promise<void>((resolve) => {
+    requestAnimationFrame(() => resolve());
+  });
+  for (const s of sessions) s.start();
 }
 
 void init();

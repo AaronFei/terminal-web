@@ -690,9 +690,26 @@ server.requestTimeout = 0;
 // WebSocket terminal bridge
 // ---------------------------------------------------------------------------
 
+// Only a fallback for a client that doesn't state its size: every terminal-web
+// client sends the size it will actually use as ?cols=&rows= (see below).
 const DEFAULT_COLS = 80;
 const DEFAULT_ROWS = 24;
+// Sanity bounds on a client-supplied size. The low end matters: tmux sizes a
+// window to its most recently used client, so one client attaching at a silly
+// size resizes the window for everyone else on that session — and a program on
+// the alternate screen (Claude Code) has no scrollback, so everything that no
+// longer fits is destroyed rather than scrolled off.
+const MIN_DIM = 10;
+const MAX_COLS = 1000;
+const MAX_ROWS = 500;
 const HEARTBEAT_MS = 20_000;
+
+/** Parse a ?cols=/?rows= param, falling back when absent or out of bounds. */
+function parseDim(raw: string | null, fallback: number, max: number): number {
+  const n = Number.parseInt(raw ?? "", 10);
+  if (!Number.isInteger(n) || n < MIN_DIM || n > max) return fallback;
+  return n;
+}
 
 // This server's own configuration env vars. They must NOT leak into the user's
 // shell: e.g. zsh's `%m` prompt escape reads $HOST, so an exported HOST (the
@@ -738,11 +755,18 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
   const ws = rawWs as LiveSocket;
   ws.isAlive = true;
 
-  // Resolve the requested session from the query string.
+  // Resolve the requested session — and the size to attach at — from the query
+  // string. Spawning at the client's real size rather than 80x24 keeps the tmux
+  // window steady: it used to shrink to 80x24 on every connect and reconnect,
+  // for a beat, for every client attached to that session.
   let requested: string | null = null;
+  let cols = DEFAULT_COLS;
+  let rows = DEFAULT_ROWS;
   try {
     const u = new URL(req.url ?? "/ws", "http://localhost");
     requested = u.searchParams.get("session");
+    cols = parseDim(u.searchParams.get("cols"), DEFAULT_COLS, MAX_COLS);
+    rows = parseDim(u.searchParams.get("rows"), DEFAULT_ROWS, MAX_ROWS);
   } catch {
     requested = null;
   }
@@ -772,8 +796,8 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
   try {
     proc = pty.spawn("tmux", tmuxArgs(session, config.tmuxConfPath), {
       name: "xterm-256color",
-      cols: DEFAULT_COLS,
-      rows: DEFAULT_ROWS,
+      cols,
+      rows,
       cwd: os.homedir(),
       env: buildChildEnv(),
     });
@@ -906,11 +930,16 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
       if (!isClientMessage(parsed)) return;
 
       if (parsed.type === "resize") {
-        const cols = Math.max(1, Math.floor(parsed.cols));
-        const rows = Math.max(1, Math.floor(parsed.rows));
-        if (Number.isFinite(cols) && Number.isFinite(rows)) {
+        // Same bounds as the query-string size: a client that asks for a
+        // degenerate window would shrink it for every other client on the
+        // session, destroying whatever is on the alternate screen.
+        const next = {
+          cols: parseDim(String(parsed.cols), 0, MAX_COLS),
+          rows: parseDim(String(parsed.rows), 0, MAX_ROWS),
+        };
+        if (next.cols && next.rows) {
           try {
-            proc.resize(cols, rows);
+            proc.resize(next.cols, next.rows);
           } catch (err) {
             console.error("[ws] resize error:", err);
           }
