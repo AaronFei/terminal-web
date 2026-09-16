@@ -1795,8 +1795,6 @@ addBtn.addEventListener('pointerdown', (e) => {
 // picker instead. Hidden on phones (<=640px), which already have a ☰ in
 // #mobilebar; shown on tablet/desktop where the drawer CSS is global anyway.
 makeButton(controlsEl, 'tb-btn tb-icon', '☰', 'Sessions', () => openDrawer());
-makeButton(controlsEl, 'tb-btn', 'A−', 'Smaller font', () => changeFont(-1));
-makeButton(controlsEl, 'tb-btn', 'A+', 'Larger font', () => changeFont(1));
 const keysBtn = makeButton(controlsEl, 'tb-btn tb-icon', '⌨', 'Toggle on-screen keys', () => {
   setKeybarVisible(keybarEl.classList.contains('hidden'));
   activeSession?.focus();
@@ -1850,25 +1848,12 @@ fileInput.addEventListener('change', () => {
   }
   fileInput.value = '';
 });
-// Monochrome paperclip icon (matches the other glyphs; uses currentColor).
-const fileBtn = document.createElement('button');
-fileBtn.className = 'tb-btn tb-icon';
-fileBtn.type = 'button';
-fileBtn.title = 'Attach a file (upload + insert path)';
-fileBtn.setAttribute('aria-label', 'Attach a file');
-fileBtn.innerHTML =
-  '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" ' +
-  'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
-  '<path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 ' +
-  '5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>';
-// Use a real click (not pointerdown+preventDefault): iOS blocks opening a file
-// picker from a preventDefaulted pointer event, so the attach button did nothing
-// on phones.
-fileBtn.addEventListener('click', () => fileInput.click());
-controlsEl.append(fileBtn);
+// The button that opens this picker lives in the ⋯ sheet — on a phone the
+// mobile bar has its own 📎 as well, since attaching is what that device is
+// mostly used for.
 
-// Reverse of the attach button: pull a file OFF the host back to this device.
-// A tray-with-down-arrow glyph, monochrome like the paperclip.
+// Pull a file OFF the host back to this device — the reverse of attaching one.
+// A tray-with-down-arrow glyph, monochrome like the rest.
 const dlBtn = document.createElement('button');
 dlBtn.className = 'tb-btn tb-icon';
 dlBtn.type = 'button';
@@ -1883,8 +1868,11 @@ dlBtn.innerHTML =
 dlBtn.addEventListener('click', () => promptDownload());
 controlsEl.append(dlBtn);
 
-makeButton(controlsEl, 'tb-btn tb-icon', '⤢', 'Toggle fullscreen', toggleFullscreen);
 makeButton(controlsEl, 'tb-btn tb-icon', '?', 'Help: copy / paste / files', openHelp);
+// Everything that isn't reached often — font size, attach, fullscreen, help —
+// sits behind this, in the same actions sheet the phone bar opens. The bar
+// keeps only what gets used mid-session.
+makeButton(controlsEl, 'tb-btn tb-icon', '⋯', 'More actions', () => openSheet());
 
 // --- on-screen key bar (sends to the active session) -----------------------
 interface KeyDef {
@@ -2221,7 +2209,15 @@ for (const def of LAYOUT_BUTTONS) {
   sheetLayoutButtons.set(def.mode, b);
 }
 
-function sheetRow(ico: string, label: string, onTap: () => void): HTMLButtonElement {
+function sheetRow(
+  ico: string,
+  label: string,
+  onTap: () => void,
+  // Opening a file picker needs a real click: iOS blocks one started from a
+  // preventDefaulted pointer event, which is what every other row uses to keep
+  // the soft keyboard from dropping.
+  useClick = false,
+): HTMLButtonElement {
   const b = document.createElement('button');
   b.className = 'sheet-row';
   b.type = 'button';
@@ -2231,10 +2227,14 @@ function sheetRow(ico: string, label: string, onTap: () => void): HTMLButtonElem
   const t = document.createElement('span');
   t.textContent = label;
   b.append(i, t);
-  b.addEventListener('pointerdown', (e) => {
-    e.preventDefault();
-    onTap();
-  });
+  if (useClick) {
+    b.addEventListener('click', () => onTap());
+  } else {
+    b.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      onTap();
+    });
+  }
   return b;
 }
 
@@ -2252,6 +2252,15 @@ sheet.append(
     closeSheet();
     pasteFromClipboard();
   }),
+  sheetRow(
+    '📎',
+    'Attach a file',
+    () => {
+      closeSheet();
+      fileInput.click();
+    },
+    true,
+  ),
   sheetRow('⬇', 'Download a file', () => {
     closeSheet();
     promptDownload();
