@@ -299,3 +299,36 @@ export async function sessionAgeSeconds(session: string): Promise<number | null>
   if (!Number.isInteger(created) || created <= 0) return null;
   return Math.max(0, Math.floor(Date.now() / 1000) - created);
 }
+
+// ---------------------------------------------------------------------------
+// Forcing a repaint.
+//
+// tmux only ever sends differences: it keeps a model of what each client's
+// screen holds and skips anything it believes is already right. That makes a
+// divergence permanent — once the browser's grid and tmux's model disagree,
+// nothing corrects it. It shows up as a pane divider drawn a column or two off
+// on a few rows, in whichever colour it had at the time (a border that is grey
+// on some rows and green on others is the giveaway: tmux paints the whole
+// border in one style per frame, so those rows are leftovers from different
+// repaints). refresh-client throws that model away and redraws everything.
+// ---------------------------------------------------------------------------
+
+/**
+ * The tty of the tmux client a pty is running, found by matching the pty's pid:
+ * node-pty spawns the `tmux new-session -A` client itself, so the pid it
+ * reports IS the client's. Null when tmux can't be asked, or the client is gone.
+ */
+export async function findClientTty(pid: number): Promise<string | null> {
+  const out = await runTmux(["list-clients", "-F", "#{client_pid} #{client_tty}"]);
+  if (out === null) return null;
+  for (const line of out.split("\n")) {
+    const [clientPid, tty] = line.trim().split(" ");
+    if (tty && Number(clientPid) === pid) return tty;
+  }
+  return null;
+}
+
+/** Redraw a client's whole screen, absolutely, from tmux's own grid. */
+export async function refreshClient(tty: string): Promise<void> {
+  await runTmux(["refresh-client", "-t", tty]);
+}

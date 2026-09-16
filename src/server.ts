@@ -21,6 +21,8 @@ import {
   applyLayout,
   readLayout,
   sessionAgeSeconds,
+  findClientTty,
+  refreshClient,
 } from "./tmux.js";
 import type { WindowLayout } from "./tmux.js";
 import type { ServerMessage } from "./types.js";
@@ -731,6 +733,9 @@ const MAX_ROWS = 500;
 // At or above this width a split view goes side by side; below it, stacked —
 // half of 80 columns is not a terminal anyone can use.
 const WIDE_COLS = 100;
+// How long after the last resize (or split-view switch) to make tmux repaint.
+// Long enough that dragging a window costs one repaint rather than sixty.
+const REPAINT_DELAY_MS = 400;
 const HEARTBEAT_MS = 20_000;
 
 /** Parse a ?cols=/?rows= param, falling back when absent or out of bounds. */
@@ -856,6 +861,27 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
 
   let closed = false;
 
+  // tmux sends only differences, so a browser grid that has drifted from tmux's
+  // model of it never gets corrected — that is the pane divider drawn a column
+  // or two off on a few rows, and it stays for as long as the page is open (see
+  // tmux.ts). The two moments the two can come apart are a resize and a
+  // split-view switch, because the divider column itself moves; both schedule a
+  // full repaint here. Coalesced, so dragging a window costs one.
+  let clientTty: string | null = null;
+  let repaintTimer: NodeJS.Timeout | null = null;
+  const scheduleRepaint = (): void => {
+    if (repaintTimer) clearTimeout(repaintTimer);
+    repaintTimer = setTimeout(() => {
+      repaintTimer = null;
+      if (closed) return;
+      void (async () => {
+        // The tty is stable for the life of this pty, so it is looked up once.
+        if (!clientTty) clientTty = await findClientTty(proc.pid);
+        if (clientTty && !closed) await refreshClient(clientTty);
+      })();
+    }, REPAINT_DELAY_MS);
+  };
+
   // Tell this client which of the tab's panes is on screen, and give a session
   // we just created its second pane straight away — splitting costs nothing
   // while nothing is running in it, so every tab made from here on has both
@@ -917,6 +943,10 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
   const cleanup = (): void => {
     if (closed) return;
     closed = true;
+    if (repaintTimer) {
+      clearTimeout(repaintTimer);
+      repaintTimer = null;
+    }
     liveSessions.delete(session);
     livePtys.delete(proc);
     try {
@@ -1000,9 +1030,15 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
           cols: parseDim(String(parsed.cols), 0, MAX_COLS),
           rows: parseDim(String(parsed.rows), 0, MAX_ROWS),
         };
-        if (next.cols && next.rows) {
+        // Clients re-state their size on every reconnect, so most of these
+        // messages ask for the size we already have: acting on those would
+        // make tmux redraw, and mark this client the "latest" one, for nothing.
+        if (next.cols && next.rows && (next.cols !== cols || next.rows !== rows)) {
+          cols = next.cols;
+          rows = next.rows;
           try {
-            proc.resize(next.cols, next.rows);
+            proc.resize(cols, rows);
+            scheduleRepaint();
           } catch (err) {
             console.error("[ws] resize error:", err);
           }
@@ -1013,6 +1049,7 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
         const want = parsed.orient === "v" ? "v" : "h";
         void applyLayout(session, parsed.mode, want).then((state) => {
           if (state) broadcastLayout(session, state);
+          scheduleRepaint();
         });
       } else if (parsed.type === "ping") {
         sendJson(ws, { type: "pong" });
