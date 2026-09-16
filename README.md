@@ -288,8 +288,9 @@ adds two bars:
 
 - **Top bar** — session **tabs** on the left (see below) and controls on the
   right: `A−`/`A+` (font size, persisted), `⌨` (toggle the key bar), `⟳`
-  (restart the session), a **📎 attach** button (attach any file), `⤢`
-  (fullscreen), and `?` (a help overlay — also shown once on first visit).
+  (restart the session), the **`1` `2` `⊞` split view** (see below), a
+  **📎 attach** button (attach any file), `⤢` (fullscreen), and `?` (a help
+  overlay — also shown once on first visit).
 - **Bottom key bar** — `Copy Paste Esc Tab Ctrl Alt ← ↑ ↓ → Home End PgUp PgDn
   ^C | ~ / -`, horizontally scrollable. `Ctrl` and `Alt` are **sticky**: tap to
   arm them (they highlight), then the next key is sent with that modifier — e.g.
@@ -315,6 +316,31 @@ session (with a live connection dot).
 - **`⟳`** restarts the active session: kills it and reconnects into a fresh one.
 - Open tabs and the active tab are remembered (localStorage) and restored on
   reload.
+
+### Split view: two windows per tab
+
+Every tab's tmux window holds **two panes** — two windows, as the UI calls
+them — and the `1` `2` `⊞` control in the top bar (or **Split view** in the
+phone's ⋯ sheet) picks which you are looking at:
+
+| | |
+|---|---|
+| `1` | window 1 fills the tab; window 2 keeps running out of sight |
+| `2` | window 2 fills the tab; window 1 keeps running out of sight |
+| `⊞` | both at once — side by side on a wide screen, stacked below ~100 columns |
+
+Showing one window is tmux's **zoom**, not a close: the other pane and
+everything running in it are untouched. Neither window can be closed from the
+web UI at all — only closing the tab (`×`) ends them, along with the session.
+
+New tabs are given their second pane the moment they are created, so both views
+are there from the start with only window 1 shown. A session that already
+existed when this landed keeps its single pane until you press `2` or `⊞`:
+splitting takes rows or columns away from the pane being split, and a program on
+the alternate screen (Claude Code, for one) has no scrollback, so whatever no
+longer fits is destroyed rather than scrolled off. The same is true each time
+you switch — a zoom or unzoom resizes both panes — so the control does nothing
+when you ask for the mode you are already in.
 
 You can also pick the session for a fresh page with the `session` query
 parameter (handy for bookmarks/links):

@@ -24,6 +24,15 @@ const KEYBAR_HEIGHT = 48; // px when shown
 const MIN_COLS = 20;
 const MIN_ROWS = 5;
 
+// Every tab's tmux window holds two panes — "windows", in the UI's words — and
+// this is which of them you are looking at: the first alone, the second alone,
+// or both. Showing one is tmux's zoom, so the other keeps running out of sight;
+// nothing here closes a pane, only closing the tab does that.
+type LayoutMode = 'one' | 'two' | 'both';
+// At or above this width both windows go side by side; below it they stack.
+// Half of 80 columns is not a terminal anyone can use.
+const WIDE_COLS = 100;
+
 // Touch "select" mode (toggled from the key bar). tmux runs with `mouse on`, so
 // a finger drag is normally hijacked for scrolling and there is no way to make a
 // text selection by touch (on desktop you hold Option to bypass tmux's mouse
@@ -376,6 +385,16 @@ class Session {
   // not OPEN, flushed on the next reconnect (see connect's onopen). Raw typing
   // is never buffered — only these one-shot sends routed through sendSeq().
   private pendingSeq: string[] = [];
+
+  // Which of this tab's two panes is on screen and how many panes the window
+  // actually has (1 until the second one is made), both as tmux last reported
+  // them — never as what this device last asked for, so a switch made on
+  // another device, or in tmux itself, shows up here too.
+  layout: LayoutMode = 'one';
+  layoutPanes = 1;
+  // The split direction we last asked for, so a resize that crosses WIDE_COLS
+  // can re-lay the split without overriding one arranged by hand.
+  private layoutOrient: 'h' | 'v' | null = null;
 
   constructor(name: string, displayName?: string) {
     this.name = name;
@@ -944,6 +963,31 @@ class Session {
     this.sendResize();
   }
 
+  /** The split direction this pane's width calls for. */
+  private wantOrient(): 'h' | 'v' {
+    return this.term.cols >= WIDE_COLS ? 'h' : 'v';
+  }
+
+  /**
+   * Ask tmux to show one of this tab's windows or both. The second pane is
+   * created on demand; showing a single one only zooms it, so neither window
+   * is ever closed — the server refuses to do that (see src/tmux.ts).
+   */
+  setLayout(mode: LayoutMode): void {
+    const orient = this.wantOrient();
+    this.layoutOrient = orient;
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: 'layout', mode, orient }));
+    }
+  }
+
+  /** Restack a side-by-side split (or unstack it) once the width changes. */
+  relayoutForWidth(): void {
+    if (this.layout !== 'both') return;
+    if (this.wantOrient() === this.layoutOrient) return;
+    this.setLayout('both');
+  }
+
   /** Re-state our size on a freshly opened socket, and re-measure if shown. */
   private resync(): void {
     if (this.el.classList.contains('hidden')) this.sendResize();
@@ -1083,13 +1127,27 @@ class Session {
       }
       if (typeof ev.data === 'string') {
         try {
-          const msg = JSON.parse(ev.data) as { type?: string };
+          const msg = JSON.parse(ev.data) as {
+            type?: string;
+            mode?: LayoutMode;
+            panes?: number;
+          };
           // The session was closed (killed) here or on another device: drop the
           // tab and do NOT reconnect — reconnecting would recreate the session
           // via `new-session -A`, resurrecting what was just closed.
           if (msg && msg.type === 'closed') {
             recentlyClosed.set(this.name, performance.now());
             removeLocalSession(this);
+          } else if (msg && msg.type === 'layout' && msg.mode) {
+            this.layout = msg.mode;
+            if (typeof msg.panes === 'number') this.layoutPanes = msg.panes;
+            // First word from tmux about this session: take its current split
+            // as the one we asked for, so a later resize doesn't re-lay a
+            // layout somebody arranged by hand.
+            if (this.layoutOrient === null && msg.mode === 'both') {
+              this.layoutOrient = this.wantOrient();
+            }
+            if (isActive(this)) refreshLayoutUI();
           }
         } catch {
           /* ignore */
@@ -1238,6 +1296,7 @@ function activateSession(s: Session): void {
   s.tabEl?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   reflectActiveStatus();
   refreshMobileUI();
+  refreshLayoutUI();
   saveTabs();
 }
 
@@ -1615,6 +1674,9 @@ function setPaneDims(cols: number, rows: number): void {
     for (const s of sessions) {
       if (!isActive(s)) s.applyDims(paneCols, paneRows);
     }
+    // A window that got narrow enough (or wide enough) wants its two panes
+    // stacked rather than side by side, or the other way round.
+    activeSession?.relayoutForWidth();
   }, BG_RESIZE_DELAY);
 }
 
@@ -1743,6 +1805,37 @@ makeButton(controlsEl, 'tb-btn tb-icon', '⟳', 'Restart this session', () => {
   activeSession?.restart();
   activeSession?.focus();
 });
+
+// Split view. Each tab's tmux window holds two windows (panes): this picks
+// whether you see the first, the second, or both at once. Showing one zooms it
+// and leaves the other running out of sight — neither can be closed, only the
+// whole tab can. The second pane is made the first time it's needed.
+const LAYOUT_BUTTONS: { mode: LayoutMode; label: string; title: string }[] = [
+  { mode: 'one', label: '1', title: 'Window 1 only (window 2 keeps running)' },
+  { mode: 'two', label: '2', title: 'Window 2 only (window 1 keeps running)' },
+  { mode: 'both', label: '⊞', title: 'Show both windows' },
+];
+const layoutButtons = new Map<LayoutMode, HTMLElement>();
+const sheetLayoutButtons = new Map<LayoutMode, HTMLElement>();
+
+function refreshLayoutUI(): void {
+  const mode = activeSession?.layout ?? 'one';
+  for (const [m, b] of layoutButtons) b.classList.toggle('active', m === mode);
+  for (const [m, b] of sheetLayoutButtons) b.classList.toggle('active', m === mode);
+}
+
+const layoutSeg = document.createElement('div');
+layoutSeg.className = 'tb-seg';
+for (const def of LAYOUT_BUTTONS) {
+  layoutButtons.set(
+    def.mode,
+    makeButton(layoutSeg, 'tb-btn', def.label, def.title, () => {
+      activeSession?.setLayout(def.mode);
+      activeSession?.focus();
+    }),
+  );
+}
+controlsEl.append(layoutSeg);
 
 // Reliable file attach for every platform (incl. iPad) and over plain HTTP —
 // no clipboard needed: pick any file(s), each uploads and its path is inserted.
@@ -2106,6 +2199,28 @@ fontPlus.addEventListener('pointerdown', (e) => {
 });
 fontRow.append(fontMinus, fontVal, fontPlus);
 
+// The same split-view control, at touch size, for the phone's actions sheet
+// (the desktop top bar is hidden at that width).
+const splitRow = document.createElement('div');
+splitRow.className = 'sheet-seg';
+const splitLabel = document.createElement('div');
+splitLabel.className = 'ss-lbl';
+splitLabel.textContent = 'Split view';
+splitRow.append(splitLabel);
+for (const def of LAYOUT_BUTTONS) {
+  const b = document.createElement('button');
+  b.className = 'sf-btn';
+  b.type = 'button';
+  b.textContent = def.label;
+  b.title = def.title;
+  b.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    activeSession?.setLayout(def.mode);
+  });
+  splitRow.append(b);
+  sheetLayoutButtons.set(def.mode, b);
+}
+
 function sheetRow(ico: string, label: string, onTap: () => void): HTMLButtonElement {
   const b = document.createElement('button');
   b.className = 'sheet-row';
@@ -2127,6 +2242,7 @@ sheet.append(
   sheetGrip,
   sheetTitle,
   fontRow,
+  splitRow,
   sheetRow('⟳', 'Restart this session', () => {
     closeSheet();
     activeSession?.restart();

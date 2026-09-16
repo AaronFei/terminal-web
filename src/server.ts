@@ -18,7 +18,11 @@ import {
   tagWebSession,
   setWebTabLabel,
   listWebTabs,
+  applyLayout,
+  readLayout,
+  sessionAgeSeconds,
 } from "./tmux.js";
+import type { WindowLayout } from "./tmux.js";
 import type { ServerMessage } from "./types.js";
 import { isClientMessage } from "./types.js";
 import { gateHttp, isAuthed } from "./auth.js";
@@ -76,6 +80,28 @@ function broadcastClosed(name: string, except: WebSocket): void {
     if (peer !== except) sendJson(peer, { type: "closed" });
   }
 }
+
+/**
+ * Tell every client of `name` — this device included — which of the tab's two
+ * panes is on screen, so the control always shows what tmux is actually doing
+ * and a switch made on one device lands on the others too.
+ */
+function broadcastLayout(name: string, state: WindowLayout): void {
+  const set = sessionClients.get(name);
+  if (!set) return;
+  for (const peer of set) {
+    sendJson(peer, { type: "layout", mode: state.mode, panes: state.panes });
+  }
+}
+
+// Sessions whose second pane is being created right now, so two devices
+// attaching to the same brand-new session can't both split it.
+const splitting = new Set<string>();
+
+// A session younger than this was created by the connection that is asking, so
+// nothing is running in it yet and its second pane is free to make. Anything
+// older keeps whatever layout it has until the user asks for a change.
+const FRESH_SESSION_SECONDS = 10;
 
 // Short hostname of the machine running this server, used to label the page
 // title so several hosts open in different tabs are easy to tell apart. Strip
@@ -702,6 +728,9 @@ const DEFAULT_ROWS = 24;
 const MIN_DIM = 10;
 const MAX_COLS = 1000;
 const MAX_ROWS = 500;
+// At or above this width a split view goes side by side; below it, stacked —
+// half of 80 columns is not a terminal anyone can use.
+const WIDE_COLS = 100;
 const HEARTBEAT_MS = 20_000;
 
 /** Parse a ?cols=/?rows= param, falling back when absent or out of bounds. */
@@ -827,6 +856,40 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
 
   let closed = false;
 
+  // Tell this client which of the tab's panes is on screen, and give a session
+  // we just created its second pane straight away — splitting costs nothing
+  // while nothing is running in it, so every tab made from here on has both
+  // views available with only the main one shown. A session that already
+  // existed is left exactly as it is: splitting a pane that is running
+  // something takes rows or columns away from it, and on the alternate screen
+  // those are destroyed rather than scrolled off. Those get their second pane
+  // the first time the user asks for it. Retried while tmux registers the
+  // session, same as tagWebSession.
+  const orient: "h" | "v" = cols >= WIDE_COLS ? "h" : "v";
+  const reportLayout = async (attempt = 0): Promise<void> => {
+    if (closed) return;
+    let state = await readLayout(session);
+    if (!state) {
+      if (attempt < 10) setTimeout(() => void reportLayout(attempt + 1), 150);
+      return;
+    }
+    if (state.panes < 2 && !splitting.has(session)) {
+      const age = await sessionAgeSeconds(session);
+      if (age !== null && age <= FRESH_SESSION_SECONDS) {
+        splitting.add(session);
+        try {
+          state = (await applyLayout(session, "one", orient, true)) ?? state;
+        } finally {
+          splitting.delete(session);
+        }
+        broadcastLayout(session, state);
+        return;
+      }
+    }
+    sendJson(ws, { type: "layout", mode: state.mode, panes: state.panes });
+  };
+  void reportLayout();
+
   // xterm.js auto-answers the terminal-identity queries (DA1 ESC[?..c /
   // DA2 ESC[>..c) tmux sends when a client attaches. tmux 3.6 only *consumes*
   // those replies for ~3s after attach; one that arrives later (phone waking
@@ -944,6 +1007,13 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
             console.error("[ws] resize error:", err);
           }
         }
+      } else if (parsed.type === "layout") {
+        // Switch which pane is on screen. Never closes one: showing a single
+        // pane is tmux's zoom, so the other keeps running out of sight.
+        const want = parsed.orient === "v" ? "v" : "h";
+        void applyLayout(session, parsed.mode, want).then((state) => {
+          if (state) broadcastLayout(session, state);
+        });
       } else if (parsed.type === "ping") {
         sendJson(ws, { type: "pong" });
       } else if (parsed.type === "restart") {

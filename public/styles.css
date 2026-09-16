@@ -184,6 +184,28 @@ body {
   color: #fff;
 }
 
+/* Split view: which of a tab's two tmux panes is on screen. Three states, not
+   two, so it is a segmented group rather than a toggle — the buttons butt
+   together so the trio reads as one control. */
+.tb-seg {
+  display: inline-flex;
+  margin: 0 2px;
+}
+.tb-seg .tb-btn {
+  border-radius: 0;
+  padding: 4px 9px;
+  min-width: 26px;
+}
+.tb-seg .tb-btn:first-child {
+  border-radius: 6px 0 0 6px;
+}
+.tb-seg .tb-btn:last-child {
+  border-radius: 0 6px 6px 0;
+}
+.tb-seg .tb-btn + .tb-btn {
+  border-left-color: #2a2a2c;
+}
+
 /* destructive action (e.g. "Close & kill" in the confirm dialog) */
 .tb-btn.danger {
   background: #5a1d1d;
@@ -678,6 +700,24 @@ body {
   font-size: 15px;
   color: #cfcfcf;
 }
+/* The same split-view control in the phone's actions sheet, at touch size. */
+.sheet-seg {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 2px 10px;
+}
+.ss-lbl {
+  flex: 1 1 auto;
+  font-size: 15px;
+  color: #cfcfcf;
+}
+.sf-btn.active {
+  background: #2472c8;
+  border-color: #3b8eea;
+  color: #fff;
+}
+
 .sheet-row {
   display: flex;
   align-items: center;
