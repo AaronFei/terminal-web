@@ -33,6 +33,26 @@ type LayoutMode = 'one' | 'two' | 'both';
 // Half of 80 columns is not a terminal anyone can use.
 const WIDE_COLS = 100;
 
+// A split tab is still ONE xterm grid — the divider is a column of glyphs in
+// it, not a boundary — so xterm's ordinary selection flows straight across it
+// and a drag in one window highlights, and copies, the other one's text on the
+// same rows. xterm has a second selection mode that stays inside the columns
+// you drag, which is exactly what a split needs; these reach it. The value is
+// xterm's SelectionMode.COLUMN, a const enum inlined as 3 at build time, so it
+// cannot be imported.
+const COLUMN_SELECTION_MODE = 3;
+
+interface SelectionInternals {
+  _activeSelectionMode: number;
+  _model: {
+    selectionStart: [number, number] | undefined;
+    selectionEnd: [number, number] | undefined;
+    selectionStartLength: number;
+  };
+  shouldColumnSelect(event: MouseEvent | KeyboardEvent): boolean;
+  refresh(isLinuxMouseSelection?: boolean): void;
+}
+
 // Touch "select" mode (toggled from the key bar). tmux runs with `mouse on`, so
 // a finger drag is normally hijacked for scrolling and there is no way to make a
 // text selection by touch (on desktop you hold Option to bypass tmux's mouse
@@ -392,6 +412,9 @@ class Session {
   // another device, or in tmux itself, shows up here too.
   layout: LayoutMode = 'one';
   layoutPanes = 1;
+  // 0-based column of the divider while both windows are side by side, else
+  // null. Selections are clipped to the window they start in using this.
+  dividerCol: number | null = null;
   // The split direction we last asked for, so a resize that crosses WIDE_COLS
   // can re-lay the split without overriding one arranged by hand.
   private layoutOrient: 'h' | 'v' | null = null;
@@ -511,6 +534,7 @@ class Session {
 
     this.wireInput();
     this.wireTouchScroll();
+    this.wireSplitSelection();
   }
 
   /** Open the socket. Held back until the pane size is known — see init(). */
@@ -867,6 +891,15 @@ class Session {
           if (eRow < sRow || (eRow === sRow && eCol < sCol)) {
             [sCol, sRow, eCol, eRow] = [eCol, eRow, sCol, sRow];
           }
+          // While the tab is split, keep the drag inside the window it started
+          // in and select a block, so it can't run through the divider into the
+          // other window's text.
+          if (this.dividerCol !== null) {
+            const [first, last] = this.windowCols(anchorCol);
+            const lo = Math.max(first, Math.min(last, Math.min(sCol, eCol)));
+            const hi = Math.max(first, Math.min(last, Math.max(sCol, eCol)));
+            if (this.selectBlock(lo, sRow, hi, eRow)) return;
+          }
           const length = (eRow - sRow) * this.term.cols + (eCol - sCol) + 1;
           this.term.select(sCol, sRow, length);
           return;
@@ -961,6 +994,61 @@ class Session {
       return;
     }
     this.sendResize();
+  }
+
+  /**
+   * xterm's selection service. Private API, so everything that uses it checks
+   * what it got and falls back to the ordinary selection: an xterm upgrade that
+   * moves this should cost the split-tab clipping, not the ability to select.
+   */
+  private selection(): SelectionInternals | null {
+    const core = (this.term as unknown as { _core?: { _selectionService?: unknown } })._core;
+    const svc = core?._selectionService as SelectionInternals | undefined;
+    if (!svc || typeof svc.refresh !== 'function' || !svc._model) return null;
+    return svc;
+  }
+
+  /**
+   * Make a drag-selection stay inside one window while the tab is split.
+   *
+   * xterm decides between its two selection modes at mousedown, and refuses the
+   * column one on macOS whenever macOptionClickForcesSelection is set — which is
+   * how Option-drag makes a selection here at all (tmux's mouse mode owns a
+   * plain drag). So the question gets answered here instead: column select
+   * whenever the two windows are side by side, xterm's own rule otherwise.
+   */
+  private wireSplitSelection(): void {
+    const svc = this.selection();
+    if (!svc || typeof svc.shouldColumnSelect !== 'function') return;
+    const xtermsRule = svc.shouldColumnSelect.bind(svc);
+    svc.shouldColumnSelect = (event) => this.dividerCol !== null || xtermsRule(event);
+  }
+
+  /** First and last column of the window that `col` falls in. */
+  private windowCols(col: number): [number, number] {
+    const divider = this.dividerCol;
+    if (divider === null) return [0, this.term.cols - 1];
+    return col < divider ? [0, divider - 1] : [divider + 1, this.term.cols - 1];
+  }
+
+  /**
+   * Select a block of cells: every row from sRow to eRow, clipped to the
+   * columns sCol..eCol. term.select() only makes the flowing kind, and the
+   * block kind is otherwise reachable only from an Alt-drag, so the selection
+   * model is set here directly. Returns false if xterm's internals have moved,
+   * leaving the caller to fall back.
+   */
+  private selectBlock(sCol: number, sRow: number, eCol: number, eRow: number): boolean {
+    const svc = this.selection();
+    if (!svc) return false;
+    this.term.clearSelection();
+    svc._model.selectionStart = [sCol, sRow];
+    svc._model.selectionStartLength = 0;
+    // The end column is exclusive, and must stay inside the grid.
+    svc._model.selectionEnd = [Math.min(this.term.cols, eCol + 1), eRow];
+    svc._activeSelectionMode = COLUMN_SELECTION_MODE;
+    svc.refresh(true);
+    return true;
   }
 
   /** The split direction this pane's width calls for. */
@@ -1131,6 +1219,7 @@ class Session {
             type?: string;
             mode?: LayoutMode;
             panes?: number;
+            divider?: number | null;
           };
           // The session was closed (killed) here or on another device: drop the
           // tab and do NOT reconnect — reconnecting would recreate the session
@@ -1141,6 +1230,7 @@ class Session {
           } else if (msg && msg.type === 'layout' && msg.mode) {
             this.layout = msg.mode;
             if (typeof msg.panes === 'number') this.layoutPanes = msg.panes;
+            this.dividerCol = typeof msg.divider === 'number' ? msg.divider : null;
             // First word from tmux about this session: take its current split
             // as the one we asked for, so a later resize doesn't re-lay a
             // layout somebody arranged by hand.

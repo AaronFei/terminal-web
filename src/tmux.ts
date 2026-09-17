@@ -184,6 +184,9 @@ interface PaneList {
   /** Index into `ids` of the pane that has the focus. */
   activeIndex: number;
   zoomed: boolean;
+  /** Each pane's top row and rightmost column, both 0-based. */
+  tops: number[];
+  rights: number[];
 }
 
 /** What the UI needs to know about a window's layout. */
@@ -191,9 +194,17 @@ export interface WindowLayout {
   mode: LayoutMode;
   /** Panes the window has right now: 1 until the second one is created. */
   panes: number;
+  /**
+   * 0-based column of the vertical divider when the two windows are side by
+   * side, else null (stacked, zoomed, or a single pane). The browser needs it
+   * because a split tab is still one terminal grid: without knowing where the
+   * divider is, a drag-selection runs straight through it into the other
+   * window's text — see web/terminal.ts.
+   */
+  divider: number | null;
 }
 
-const PANE_FMT = "#{pane_id} #{pane_active} #{window_zoomed_flag}";
+const PANE_FMT = "#{pane_id} #{pane_active} #{window_zoomed_flag} #{pane_top} #{pane_right}";
 
 /** Run tmux; resolve its stdout, or null if it failed. Never throws. */
 function runTmux(args: string[]): Promise<string | null> {
@@ -206,24 +217,36 @@ async function listPanes(session: string): Promise<PaneList | null> {
   const out = await runTmux(["list-panes", "-t", session, "-F", PANE_FMT]);
   if (out === null) return null;
   const ids: string[] = [];
+  const tops: number[] = [];
+  const rights: number[] = [];
   let activeIndex = 0;
   let zoomed = false;
   for (const line of out.split("\n")) {
     if (!line.trim()) continue;
-    const [id, active, zoom] = line.trim().split(" ");
+    const [id, active, zoom, top, right] = line.trim().split(" ");
     if (!id) continue;
     if (active === "1") activeIndex = ids.length;
     if (zoom === "1") zoomed = true;
     ids.push(id);
+    tops.push(Number.parseInt(top ?? "", 10) || 0);
+    rights.push(Number.parseInt(right ?? "", 10) || 0);
   }
-  return ids.length ? { ids, activeIndex, zoomed } : null;
+  return ids.length ? { ids, activeIndex, zoomed, tops, rights } : null;
 }
 
 /** Read the mode a pane list amounts to. */
 function modeOf(list: PaneList): WindowLayout {
-  if (list.ids.length < 2) return { mode: "one", panes: list.ids.length };
-  if (!list.zoomed) return { mode: "both", panes: list.ids.length };
-  return { mode: list.activeIndex === 0 ? "one" : "two", panes: list.ids.length };
+  const panes = list.ids.length;
+  if (panes < 2) return { mode: "one", panes, divider: null };
+  if (list.zoomed) {
+    // Zoomed: one pane fills the window, so there is no divider on screen.
+    return { mode: list.activeIndex === 0 ? "one" : "two", panes, divider: null };
+  }
+  // Side by side when the two panes start on the same row; the divider is the
+  // column just past the first one. Stacked panes have no vertical divider, and
+  // every row belongs to exactly one of them, so nothing needs clipping there.
+  const sideBySide = list.tops[0] === list.tops[1];
+  return { mode: "both", panes, divider: sideBySide ? list.rights[0] + 1 : null };
 }
 
 /** The layout a session's window is in, or null if tmux couldn't be asked. */

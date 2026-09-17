@@ -92,7 +92,12 @@ function broadcastLayout(name: string, state: WindowLayout): void {
   const set = sessionClients.get(name);
   if (!set) return;
   for (const peer of set) {
-    sendJson(peer, { type: "layout", mode: state.mode, panes: state.panes });
+    sendJson(peer, {
+      type: "layout",
+      mode: state.mode,
+      panes: state.panes,
+      divider: state.divider,
+    });
   }
 }
 
@@ -878,6 +883,10 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
         // The tty is stable for the life of this pty, so it is looked up once.
         if (!clientTty) clientTty = await findClientTty(proc.pid);
         if (clientTty && !closed) await refreshClient(clientTty);
+        // A resize moves the divider, and the browser clips its selections to
+        // it, so hand out the column it ended up at.
+        const state = await readLayout(session);
+        if (state && !closed) broadcastLayout(session, state);
       })();
     }, REPAINT_DELAY_MS);
   };
@@ -912,7 +921,12 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
         return;
       }
     }
-    sendJson(ws, { type: "layout", mode: state.mode, panes: state.panes });
+    sendJson(ws, {
+      type: "layout",
+      mode: state.mode,
+      panes: state.panes,
+      divider: state.divider,
+    });
   };
   void reportLayout();
 

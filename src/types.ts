@@ -66,6 +66,12 @@ export interface LayoutStateMessage {
   mode: LayoutMode;
   /** Panes the window has right now: 1 until the second one is created. */
   panes: number;
+  /**
+   * 0-based column of the vertical divider when both windows are side by side,
+   * else null. A split tab is one terminal grid, so the browser needs this to
+   * keep a drag-selection inside the window it started in.
+   */
+  divider: number | null;
 }
 
 /** Server -> Client: reply to a PingMessage. */
