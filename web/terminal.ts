@@ -1823,10 +1823,13 @@ const mobileMQ = window.matchMedia('(max-width: 640px)');
 function updateKeybarHeight(): void {
   if (keybarEl.classList.contains('hidden')) {
     root.style.setProperty('--keybar-h', '0px');
-    return;
+  } else {
+    const h = mobileMQ.matches ? keybarEl.offsetHeight : KEYBAR_HEIGHT;
+    root.style.setProperty('--keybar-h', `${h}px`);
   }
-  const h = mobileMQ.matches ? keybarEl.offsetHeight : KEYBAR_HEIGHT;
-  root.style.setProperty('--keybar-h', `${h}px`);
+  // The terminal's height is measured from the key bar, and is set in JS now
+  // rather than by CSS, so it has to be re-measured whenever the bar changes.
+  updateKeyboardOffset();
 }
 
 function setKeybarVisible(visible: boolean): void {
@@ -1844,22 +1847,28 @@ function setKeybarVisible(visible: boolean): void {
   });
 }
 
-// How much of the window the visual viewport does not cover. With no keyboard
-// this is not zero everywhere: a standalone PWA counts the status bar and home
-// indicator in innerHeight but not in visualViewport.height (~100px), and an
-// iPad with a hardware keyboard still shows a shortcut bar. Only what exceeds
-// the resting value is a keyboard actually covering the terminal.
-function viewportGap(): number {
+// Where the bottom of what you can actually see sits, in the coordinate space
+// our fixed elements live in (the layout viewport). Browsers split two ways
+// over a soft keyboard: iOS Safari leaves the layout viewport alone and shrinks
+// only the visual one, while Chrome on iPadOS shrinks the layout viewport
+// itself. Measuring the visible bottom covers both without asking which is
+// which — the first reports a smaller visual viewport, the second a smaller
+// innerHeight, and this number drops either way.
+function visibleBottom(): number {
   const vv = window.visualViewport;
-  if (!vv) return 0;
-  return Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+  if (!vv) return window.innerHeight;
+  return Math.min(window.innerHeight, vv.offsetTop + vv.height);
 }
 
-// The resting gap for this device and orientation, learned rather than assumed:
-// the smallest gap seen since the last layout change is the one with no
-// keyboard up. It used to be a flat 150px threshold, which both missed the
-// iPad's shorter keyboards and over-reported by the safe-area amount in a PWA.
-let restingGap: number | null = null;
+function cssPx(el: HTMLElement, prop: string): number {
+  return parseFloat(getComputedStyle(el).getPropertyValue(prop)) || 0;
+}
+
+// The terminal's height with no keyboard up. Everything the keyboard does is
+// measured against this, and the terminal keeps it while a keyboard is open so
+// the pty is never resized by one — a resize would send tmux a SIGWINCH, and a
+// program on the alternate screen has no scrollback to put the lost rows back.
+let restingTermH: number | null = null;
 // Below this, treat it as noise rather than a keyboard. Low enough to catch an
 // iPad's shortcut bar (~45-55px) when a hardware keyboard is attached, which
 // covers the prompt just as effectively as a full keyboard does.
@@ -1868,31 +1877,46 @@ const KEYBOARD_MIN_PX = 40;
 const KEYBOARD_MIN_VISIBLE_PX = 72;
 
 function updateKeyboardOffset(): void {
-  const gap = viewportGap();
+  const bottom = visibleBottom();
+  const top = cssPx(termArea, 'top');
+  const keybarH = cssPx(root, '--keybar-h');
+  const available = Math.max(0, bottom - keybarH - top);
+
   // A soft keyboard is only up while something is focused, so with nothing
-  // focused this gap IS the resting one — take it outright. While typing, keep
-  // the smallest seen: rotating with the keyboard up leaves a stale value, and
-  // this pulls it back down without waiting for the keyboard to be dismissed.
+  // focused this IS the resting height. While typing, take any increase: the
+  // keyboard can only ever cost room, so more room means the resting value was
+  // stale (rotated mid-type, say) rather than that the keyboard grew.
   const el = document.activeElement;
   const typing = el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement;
-  if (!typing) restingGap = gap;
-  else if (restingGap === null || gap < restingGap) restingGap = gap;
-  const covered = gap - restingGap;
-  const room = Math.max(0, termArea.clientHeight - KEYBOARD_MIN_VISIBLE_PX);
+  if (!typing || restingTermH === null || available > restingTermH) {
+    restingTermH = available;
+  }
+  root.style.setProperty('--term-h', `${Math.round(restingTermH)}px`);
+
+  // How far the layout viewport runs on below what is visible. Zero on a
+  // browser that shrank the layout viewport for the keyboard; the keyboard's
+  // height on one that did not. The key bar sits on this.
+  root.style.setProperty('--kb-gap', `${Math.round(Math.max(0, window.innerHeight - bottom))}px`);
+
+  const covered = restingTermH - available;
+  const room = Math.max(0, restingTermH - KEYBOARD_MIN_VISIBLE_PX);
   const offset = covered > KEYBOARD_MIN_PX ? Math.min(Math.round(covered), room) : 0;
   root.style.setProperty('--kb-offset', `${offset}px`);
+
   if (VV_DEBUG) {
     const vv = window.visualViewport;
     activeSession?.debugSend(
       'vv',
       `ih=${window.innerHeight} vvh=${Math.round(vv?.height ?? 0)} ` +
-        `vvTop=${Math.round(vv?.offsetTop ?? 0)} gap=${Math.round(gap)} ` +
-        `resting=${Math.round(restingGap ?? 0)} covered=${Math.round(covered)} off=${offset}`,
+        `vvTop=${Math.round(vv?.offsetTop ?? 0)} bottom=${Math.round(bottom)} ` +
+        `top=${Math.round(top)} keybar=${Math.round(keybarH)} avail=${Math.round(available)} ` +
+        `resting=${Math.round(restingTermH)} covered=${Math.round(covered)} off=${offset} ` +
+        `typing=${typing ? 1 : 0}`,
     );
   }
-  // Deliberately no fit(): the keyboard moves the terminal, it does not resize
-  // it, so the pty's size is none of its business. Real size changes (rotation,
-  // the key bar, a desktop window drag) still come through the ResizeObserver.
+  // Deliberately no fit() here: the keyboard slides the terminal, it never
+  // resizes it. A change to --term-h is a real size change and reaches fit()
+  // through the ResizeObserver on #terminal.
 }
 
 // ---------------------------------------------------------------------------
@@ -2467,10 +2491,6 @@ refreshMobileUI();
 // ---------------------------------------------------------------------------
 window.addEventListener('resize', () => {
   updateKeybarHeight(); // rows may re-wrap when the width changes
-  // Rotating, or the browser's own chrome coming and going, changes what "no
-  // keyboard" looks like; updateKeyboardOffset re-reads it whenever nothing is
-  // focused, which is the case for every one of those except rotating mid-type.
-  updateKeyboardOffset();
   fitActive();
 });
 // Re-measure when crossing the mobile breakpoint (e.g. rotating the phone),

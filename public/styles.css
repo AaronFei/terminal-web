@@ -3,7 +3,12 @@
     "Liberation Mono", "Courier New", monospace;
   --topbar-h: 38px;
   --keybar-h: 0px; /* set to the real height by JS when the key bar is shown */
-  --kb-offset: 0px; /* how far the soft keyboard covers, via visualViewport */
+  --kb-offset: 0px; /* how far the keyboard covers the terminal — see below */
+  --kb-gap: 0px; /* how far the layout viewport extends below what is visible */
+  /* The terminal's height with no keyboard up, measured in JS. Held there while
+     a keyboard is open so the pty is never resized by one; this value is only a
+     starting point for the first frame. */
+  --term-h: calc(100dvh - var(--topbar-h) - var(--keybar-h) - env(safe-area-inset-top));
 }
 
 html,
@@ -231,7 +236,7 @@ body {
   left: 0;
   right: 0;
   top: calc(var(--topbar-h) + env(safe-area-inset-top));
-  bottom: var(--keybar-h);
+  height: var(--term-h);
   background: #1e1e1e;
   /* The soft keyboard slides the terminal up; it does not shrink it. Shrinking
      is what the height used to do, and it meant a SIGWINCH every time you
@@ -286,7 +291,11 @@ body {
   position: fixed;
   left: 0;
   right: 0;
-  bottom: var(--kb-offset);
+  /* Not --kb-offset: on a browser that shrinks the layout viewport for the
+     keyboard (Chrome on iPadOS) the bottom of that viewport is already above
+     the keyboard, and --kb-gap is 0 there. On one that does not (iOS Safari)
+     it is the keyboard's height, which is what lifts the bar clear of it. */
+  bottom: var(--kb-gap);
   height: var(--keybar-h);
   display: flex;
   align-items: center;
