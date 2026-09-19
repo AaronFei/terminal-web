@@ -1844,25 +1844,55 @@ function setKeybarVisible(visible: boolean): void {
   });
 }
 
-function updateKeyboardOffset(): void {
+// How much of the window the visual viewport does not cover. With no keyboard
+// this is not zero everywhere: a standalone PWA counts the status bar and home
+// indicator in innerHeight but not in visualViewport.height (~100px), and an
+// iPad with a hardware keyboard still shows a shortcut bar. Only what exceeds
+// the resting value is a keyboard actually covering the terminal.
+function viewportGap(): number {
   const vv = window.visualViewport;
-  const raw = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) : 0;
-  // Only a real soft keyboard (>~250px) takes up meaningful height. In a
-  // standalone PWA, window.innerHeight includes the status-bar + home-indicator
-  // areas that visualViewport.height excludes, so with no keyboard `raw` is the
-  // safe-area sum (~95–110px) — ignore anything below 150px so that isn't
-  // mistaken for a keyboard and left as a gap at the bottom.
-  const offset = raw > 150 ? raw : 0;
+  if (!vv) return 0;
+  return Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+}
+
+// The resting gap for this device and orientation, learned rather than assumed:
+// the smallest gap seen since the last layout change is the one with no
+// keyboard up. It used to be a flat 150px threshold, which both missed the
+// iPad's shorter keyboards and over-reported by the safe-area amount in a PWA.
+let restingGap: number | null = null;
+// Below this, treat it as noise rather than a keyboard. Low enough to catch an
+// iPad's shortcut bar (~45-55px) when a hardware keyboard is attached, which
+// covers the prompt just as effectively as a full keyboard does.
+const KEYBOARD_MIN_PX = 40;
+// Never slide so far that there is nothing left to read.
+const KEYBOARD_MIN_VISIBLE_PX = 72;
+
+function updateKeyboardOffset(): void {
+  const gap = viewportGap();
+  // A soft keyboard is only up while something is focused, so with nothing
+  // focused this gap IS the resting one — take it outright. While typing, keep
+  // the smallest seen: rotating with the keyboard up leaves a stale value, and
+  // this pulls it back down without waiting for the keyboard to be dismissed.
+  const el = document.activeElement;
+  const typing = el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement;
+  if (!typing) restingGap = gap;
+  else if (restingGap === null || gap < restingGap) restingGap = gap;
+  const covered = gap - restingGap;
+  const room = Math.max(0, termArea.clientHeight - KEYBOARD_MIN_VISIBLE_PX);
+  const offset = covered > KEYBOARD_MIN_PX ? Math.min(Math.round(covered), room) : 0;
   root.style.setProperty('--kb-offset', `${offset}px`);
-  if (VV_DEBUG && vv) {
+  if (VV_DEBUG) {
+    const vv = window.visualViewport;
     activeSession?.debugSend(
       'vv',
-      `ih=${window.innerHeight} vvh=${Math.round(vv.height)} ` +
-        `vvTop=${Math.round(vv.offsetTop)} pageY=${Math.round(window.pageYOffset)} ` +
-        `raw=${Math.round(raw)} off=${Math.round(offset)}`,
+      `ih=${window.innerHeight} vvh=${Math.round(vv?.height ?? 0)} ` +
+        `vvTop=${Math.round(vv?.offsetTop ?? 0)} gap=${Math.round(gap)} ` +
+        `resting=${Math.round(restingGap ?? 0)} covered=${Math.round(covered)} off=${offset}`,
     );
   }
-  fitActive();
+  // Deliberately no fit(): the keyboard moves the terminal, it does not resize
+  // it, so the pty's size is none of its business. Real size changes (rotation,
+  // the key bar, a desktop window drag) still come through the ResizeObserver.
 }
 
 // ---------------------------------------------------------------------------
@@ -2437,6 +2467,10 @@ refreshMobileUI();
 // ---------------------------------------------------------------------------
 window.addEventListener('resize', () => {
   updateKeybarHeight(); // rows may re-wrap when the width changes
+  // Rotating, or the browser's own chrome coming and going, changes what "no
+  // keyboard" looks like; updateKeyboardOffset re-reads it whenever nothing is
+  // focused, which is the case for every one of those except rotating mid-type.
+  updateKeyboardOffset();
   fitActive();
 });
 // Re-measure when crossing the mobile breakpoint (e.g. rotating the phone),
@@ -2453,9 +2487,12 @@ if (typeof ResizeObserver !== 'undefined') {
 if (window.visualViewport) {
   window.visualViewport.addEventListener('resize', updateKeyboardOffset);
   window.visualViewport.addEventListener('scroll', updateKeyboardOffset);
-  // Baseline snapshot (keyboard closed) once the WS is likely open, so the log
-  // shows the resting numbers before any keyboard event fires.
-  if (VV_DEBUG) window.setTimeout(updateKeyboardOffset, 1500);
+  // Read the resting gap now, before anything is focused. Without this the
+  // first reading would be taken as the keyboard opened, and a keyboard-sized
+  // resting gap means the terminal never moves out from under it.
+  updateKeyboardOffset();
+  // Once more after layout settles (a PWA's safe areas, Safari's chrome).
+  window.setTimeout(updateKeyboardOffset, 1200);
 }
 window.addEventListener('beforeunload', () => {
   for (const s of sessions) s.dispose();

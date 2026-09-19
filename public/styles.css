@@ -3,7 +3,7 @@
     "Liberation Mono", "Courier New", monospace;
   --topbar-h: 38px;
   --keybar-h: 0px; /* set to the real height by JS when the key bar is shown */
-  --kb-offset: 0px; /* iOS soft-keyboard offset, tracked via visualViewport */
+  --kb-offset: 0px; /* how far the soft keyboard covers, via visualViewport */
 }
 
 html,
@@ -231,8 +231,17 @@ body {
   left: 0;
   right: 0;
   top: calc(var(--topbar-h) + env(safe-area-inset-top));
-  bottom: calc(var(--keybar-h) + var(--kb-offset));
+  bottom: var(--keybar-h);
   background: #1e1e1e;
+  /* The soft keyboard slides the terminal up; it does not shrink it. Shrinking
+     is what the height used to do, and it meant a SIGWINCH every time you
+     tapped into the prompt — with a program on the alternate screen (Claude
+     Code) having no scrollback, the rows that no longer fit were destroyed
+     rather than scrolled off, so typing on a phone quietly ate the screen.
+     Panning leaves the pty exactly as it was: the last row ends up directly
+     above the keyboard and the top slides behind the bar, which is opaque and
+     above this in the stacking order. */
+  transform: translateY(calc(-1 * var(--kb-offset)));
 }
 
 /* one pane per session; only the active pane is shown */
