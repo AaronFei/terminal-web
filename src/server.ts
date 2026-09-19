@@ -193,9 +193,24 @@ function resolveStaticPath(pathname: string): string | null {
 }
 
 /**
- * A short token identifying the currently built client bundle, from the size +
- * mtime of the files in public/dist. Stamped onto their URLs in index.html so a
- * rebuild produces URLs nothing can have cached.
+ * Every asset index.html links to, relative to publicDir — the files whose URLs
+ * carry the build stamp. That has to be all of them and not just the bundle:
+ * one unstamped file is enough to pair a new client with an old copy of itself,
+ * and nothing about the result says so.
+ *
+ * styles.css was the one left out. It holds the touch-selection handles and the
+ * selection action bar, so an iPad partway through a Browser Cache TTL ran the
+ * new terminal.js against a stylesheet that had never heard of either: the bar
+ * was created and unhidden, then laid out as an unstyled block at the top of
+ * the document, behind the fixed terminal. ?debug=sel measured it at 0,0
+ * 1210x22 where the rules would have put a small box above the key bar.
+ */
+const STAMPED_ASSETS = ["dist/terminal.js", "dist/terminal.css", "styles.css"];
+
+/**
+ * A short token identifying the currently built client, from the size + mtime
+ * of the assets above. Stamped onto their URLs in index.html so a rebuild
+ * produces URLs nothing can have cached.
  *
  * We send Cache-Control: no-cache on every static response, but Cloudflare
  * rewrites that to its Browser Cache TTL — measured at max-age=14400 — for
@@ -208,23 +223,23 @@ function resolveStaticPath(pathname: string): string | null {
  * any Cloudflare setting. index.html itself is served no-cache and comes back
  * DYNAMIC (uncached) through Cloudflare, so the fresh stamp always arrives.
  */
-async function bundleVersion(): Promise<string> {
+async function assetVersion(): Promise<string> {
   try {
     const parts = await Promise.all(
-      ["terminal.js", "terminal.css"].map(async (name) => {
-        const st = await fsp.stat(path.join(config.publicDir, "dist", name));
+      STAMPED_ASSETS.map(async (rel) => {
+        const st = await fsp.stat(path.join(config.publicDir, rel));
         return `${st.size}-${Math.round(st.mtimeMs)}`;
       })
     );
     return crypto.createHash("sha1").update(parts.join("|")).digest("hex").slice(0, 12);
   } catch {
-    return ""; // dist missing (never built) — leave the URLs untouched
+    return ""; // not built yet — leave the URLs untouched
   }
 }
 
 /**
  * Serve index.html with the machine's hostname injected into <title>, so each
- * host shows up as a distinct browser tab, and the bundle URLs stamped with the
+ * host shows up as a distinct browser tab, and the asset URLs stamped with the
  * current build. The file is tiny, so reading it per request is fine
  * (responses are no-cache anyway).
  */
@@ -245,12 +260,14 @@ async function serveIndexHtml(
   const title = `${escapeHtml(HOST_LABEL)} · terminal-web`;
   html = html.replace(/<title>[^<]*<\/title>/i, `<title>${title}</title>`);
 
-  const version = await bundleVersion();
+  const version = await assetVersion();
   if (version) {
-    html = html.replace(
-      /(["'])(\/dist\/terminal\.(?:js|css))\1/g,
-      (_m, quote: string, url: string) => `${quote}${url}?v=${version}${quote}`
-    );
+    // Driven off the same list the stamp is computed from, so an asset added to
+    // one can't be missed by the other.
+    for (const rel of STAMPED_ASSETS) {
+      const href = new RegExp(`(["'])(/${rel.replace(/\./g, "\\.")})\\1`, "g");
+      html = html.replace(href, `$1$2?v=${version}$1`);
+    }
   }
 
   const body = Buffer.from(html, "utf8");

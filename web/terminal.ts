@@ -95,12 +95,12 @@ const SEL_DEBUG = (params.get('debug') ?? '').includes('sel');
 
 // Whether this device is touched rather than pointed at.
 //
-// NOT `(pointer: coarse)`. An iPad browses as a desktop by default — Safari and
-// iPadOS Chrome both — and in that mode it answers that query like a mouse, so
-// every touch-only affordance here quietly switched itself off on the one
-// device that needs them most: no selection handles, the key bar hidden by
-// default, and the soft keyboard popping up on every tab switch. maxTouchPoints
-// still tells the truth there.
+// maxTouchPoints rather than `(pointer: coarse)`: it is a count of digitizers,
+// not a judgement about the primary input, so it does not move when a tablet
+// decides to present itself as a desktop. (The iPad here answers coarse=1
+// maxTouch=5 — see ?debug=sel — so the missing selection handles it was blamed
+// for were really a stale stylesheet; the query is just the shakier question to
+// be asking.)
 const TOUCH_DEVICE = navigator.maxTouchPoints > 0;
 
 const encoder = new TextEncoder();
@@ -660,7 +660,7 @@ class Session {
     // Only for a selection made by touch: a pointer puts one where it wants
     // first time, and two blue circles on a desktop terminal are in the way.
     // Judged by how this selection was made rather than by what the device
-    // claims to be, which an iPad in desktop mode gets wrong.
+    // claims to be — a machine with both gets each kind right that way.
     if (!this.lastInputWasTouch) {
       if (SEL_DEBUG) this.debugSend('sel-handles', 'skipped: last input was not touch');
       return;
