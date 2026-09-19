@@ -368,11 +368,11 @@ class Session {
   tabLabel: HTMLElement | null = null;
   tabDot: HTMLElement | null = null;
   connected = false;
-  // True once the socket has opened at least once — i.e. the server has seen
-  // (and registered) this session. The cross-device sync only ever removes
-  // sessions that have connected, so a brand-new tab mid-connect is never
-  // mistaken for one closed elsewhere.
-  everConnected = false;
+  // True once this tab has been looked at and so has attached. Tabs are not
+  // connected until then: a page with a dozen of them used to open a dozen
+  // WebSockets, spawn a dozen ptys and attach a dozen tmux clients, all for
+  // sessions nobody was looking at.
+  started = false;
 
   private readonly fitAddon = new FitAddon();
   private ws: WebSocket | null = null;
@@ -537,12 +537,19 @@ class Session {
     this.wireSplitSelection();
   }
 
-  /** Open the socket. Held back until the pane size is known — see init(). */
+  /**
+   * Attach this tab: open its socket, which spawns its pty and its tmux client.
+   * Called the first time the tab is shown (see setActive), never before — a
+   * tab you have not looked at costs nothing. Idempotent; a reconnect in flight
+   * counts as started.
+   */
   start(): void {
-    if (this.ws || this.disposed) return;
-    // Adopt the size the panes already have, so a tab that has never been shown
-    // still opens its socket — and so spawns its pty — at the right size.
+    if (this.started || this.disposed) return;
+    this.started = true;
+    // Adopt the size the panes already have, so the socket opens — and so the
+    // pty spawns — at the size this tab is actually going to be.
     if (paneCols && paneRows) this.applyDims(paneCols, paneRows);
+    updateTabDot(this);
     this.connect();
   }
 
@@ -1091,6 +1098,9 @@ class Session {
     if (active) {
       requestAnimationFrame(() => {
         this.fit();
+        // Attach now, not at page load: this is the first frame where the pane
+        // is laid out, so fit() has the real size to hand the server.
+        this.start();
         // On touch (phones / iOS PWA), don't auto-focus the terminal when a
         // session becomes active: focusing xterm's hidden textarea pops up the
         // soft keyboard, so every tab switch forced the keyboard open and the
@@ -1115,10 +1125,15 @@ class Session {
   }
 
   // Ask the server to kill this tmux session for good (used on tab close).
+  // Over HTTP, not this tab's socket: a tab that was never opened has none.
   kill(): void {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: 'kill' }));
-    }
+    void fetch('/api/sessions/kill', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: this.name }),
+    }).catch(() => {
+      /* ignore — the tab is already gone locally */
+    });
   }
 
   private startPing(): void {
@@ -1180,7 +1195,6 @@ class Session {
             `imeOwned=1 ua=${navigator.userAgent.slice(0, 80)}`,
         );
       }
-      this.everConnected = true;
       this.setConnected(true);
       this.startPing();
       // Flush injections buffered while the socket was down (e.g. an uploaded
@@ -1296,12 +1310,18 @@ function isActive(s: Session): boolean {
 }
 
 function reflectActiveStatus(): void {
-  if (activeSession && activeSession.connected) hideStatus();
+  if (!activeSession || activeSession.connected) hideStatus();
+  // A tab being opened for the first time is attaching, not reconnecting; its
+  // socket opens on the next frame (see setActive).
+  else if (!activeSession.started) hideStatus();
   else showStatus('reconnecting…');
 }
 
 function updateTabDot(s: Session): void {
   s.tabDot?.classList.toggle('connected', s.connected);
+  // A tab nobody has opened yet is not "disconnected" — there is nothing wrong
+  // with it, it just hasn't attached. Hollow dot rather than a grey one.
+  s.tabDot?.classList.toggle('idle', !s.started);
   refreshMobileUI();
 }
 
@@ -1353,20 +1373,20 @@ function buildTab(s: Session): void {
   refreshMobileUI();
 }
 
-function addSession(
-  name: string,
-  makeActive: boolean,
-  displayName?: string,
-  // Build the tab but hold its socket, for the caller to start() once the pane
-  // size is known (init only — everywhere else that size is already measured).
-  defer = false,
-): Session {
+// Tabs built here moments ago. A tab attaches only when it is first looked at,
+// so the server may not know about a brand-new one yet; without this the next
+// sync would read its absence from the server's list as "closed on another
+// device" and drop it.
+const recentlyCreated = new Map<string, number>();
+const CREATE_GUARD_MS = 6000;
+
+function addSession(name: string, makeActive: boolean, displayName?: string): Session {
   let s = sessions.find((x) => x.name === name);
   if (!s) {
     s = new Session(name, displayName);
     sessions.push(s);
     buildTab(s);
-    if (!defer) s.start();
+    recentlyCreated.set(name, performance.now());
   } else if (displayName && displayName.trim() && displayName.trim() !== s.displayName) {
     setDisplayName(s, displayName.trim());
   }
@@ -1664,6 +1684,26 @@ async function fetchServerTabs(timeoutMs = 2500): Promise<SavedTab[] | null> {
 
 // Best-effort: tell the server a tab was renamed so other devices pick it up.
 // The local label is already updated; a failure just delays cross-device sync.
+/**
+ * Ask the server to re-adopt these sessions as web tabs. The tab list lives on
+ * the tmux sessions (a @twtab option) and is written when a tab attaches —
+ * which, now that a tab only attaches when you open it, would leave sessions
+ * tmux-resurrect restored after a reboot untagged and about to be swept out of
+ * the list by the next sync. The server only tags ones that really exist, so a
+ * tab closed on another device is not resurrected by this device's cache.
+ */
+async function adoptOnServer(names: string[]): Promise<void> {
+  try {
+    await fetch('/api/sessions/adopt', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ names }),
+    });
+  } catch {
+    /* ignore — the next sync will simply show what the server does know */
+  }
+}
+
 function renameOnServer(name: string, displayName: string): void {
   void fetch('/api/sessions/rename', {
     method: 'POST',
@@ -1704,10 +1744,13 @@ async function syncFromServer(): Promise<void> {
     if (!serverTabs) return; // unreachable — keep what we have
     const byName = new Map(serverTabs.map((t) => [t.name, t]));
 
-    // Expire stale close-guards first so re-opening a name later still works.
+    // Expire stale guards first so re-opening a name later still works.
     const now = performance.now();
     for (const [name, at] of recentlyClosed) {
       if (now - at > CLOSE_GUARD_MS) recentlyClosed.delete(name);
+    }
+    for (const [name, at] of recentlyCreated) {
+      if (now - at > CREATE_GUARD_MS) recentlyCreated.delete(name);
     }
 
     // Add tabs opened elsewhere; adopt display-name changes from elsewhere.
@@ -1721,11 +1764,11 @@ async function syncFromServer(): Promise<void> {
       }
     }
 
-    // Remove tabs closed elsewhere. Only sessions that have actually connected
-    // (so the server knows them) are eligible — never a still-connecting new tab.
+    // Remove tabs closed elsewhere. A tab we built moments ago is exempt: it
+    // may not have attached yet, so the server would not list it either.
     for (const s of sessions.slice()) {
       if (byName.has(s.name)) continue;
-      if (!s.everConnected) continue;
+      if (recentlyCreated.has(s.name)) continue;
       if (recentlyClosed.has(s.name)) continue;
       removeLocalSession(s);
     }
@@ -2680,7 +2723,14 @@ let defaultSessionName = urlSession ?? cached.tabs[0]?.name ?? 'web';
 async function init(): Promise<void> {
   // The server's list is authoritative; fall back to the local cache, then to
   // a single default session when both are empty.
-  const server = await fetchServerTabs();
+  let server = await fetchServerTabs();
+  if (!server?.length && cached.tabs.length) {
+    // The server knows of no tabs but this device remembers some: the usual
+    // cause is a reboot, with tmux-resurrect having brought the sessions back
+    // untagged. Hand it the names and use whatever it can vouch for.
+    await adoptOnServer(cached.tabs.map((t) => t.name));
+    server = await fetchServerTabs();
+  }
   let initialTabs: SavedTab[] =
     server && server.length
       ? server
@@ -2692,22 +2742,14 @@ async function init(): Promise<void> {
   }
   defaultSessionName = urlSession ?? initialTabs[0]?.name ?? 'web';
 
-  // Build every tab first (creation order is tab order) but hold the sockets:
-  // activating the tab we are about to show measures the pane, and every session
-  // needs that size before it attaches. A tmux client that attaches at the wrong
-  // size resizes the window for every other client on that session, and a
-  // program on the alternate screen (Claude Code) has no scrollback to restore
-  // from — whatever no longer fits is gone for good.
-  for (const t of initialTabs) addSession(t.name, false, t.displayName, true);
+  // Build every tab (creation order is tab order). None of them attaches here:
+  // activating one is what opens its socket, on the frame after its pane has
+  // been laid out and measured — so a tab attaches at the size it will really
+  // have, and a tab nobody opens costs nothing at all.
+  for (const t of initialTabs) addSession(t.name, false, t.displayName);
 
   const activeName = urlSession ?? cached.active ?? initialTabs[0].name;
   activateSession(sessions.find((s) => s.name === activeName) ?? sessions[0]);
-  // setActive measures inside a rAF; ours is queued behind it, so the size has
-  // landed by the time this resolves.
-  await new Promise<void>((resolve) => {
-    requestAnimationFrame(() => resolve());
-  });
-  for (const s of sessions) s.start();
 }
 
 void init();

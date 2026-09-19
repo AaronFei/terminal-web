@@ -93,6 +93,13 @@ body {
 .tab .tab-dot.connected {
   background: #23d18b; /* green = connected */
 }
+/* A tab only attaches when you first open it, so most of them start out not
+   connected to anything — which is not the same as having lost a connection.
+   Hollow and dim, so amber keeps meaning "this one is trying to reconnect". */
+.tab .tab-dot.idle {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px #6a6a6a;
+}
 .tab .tab-label {
   overflow: hidden;
   text-overflow: ellipsis;

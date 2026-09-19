@@ -27,14 +27,6 @@ export interface RestartMessage {
 }
 
 /**
- * Client -> Server: kill this connection's tmux session for good (used when the
- * user closes the tab). Unlike restart, nothing is recreated.
- */
-export interface KillMessage {
-  type: "kill";
-}
-
-/**
  * Which of a tab's two tmux panes is on screen. A tab's window holds two panes
  * ("windows", in the UI's words) and the mode picks what you see: the first
  * alone, the second alone, or both side by side. Showing one is tmux's zoom, so
@@ -111,7 +103,6 @@ export type ClientMessage =
   | ResizeMessage
   | PingMessage
   | RestartMessage
-  | KillMessage
   | LayoutMessage
   | DebugMessage;
 
@@ -131,7 +122,6 @@ export function isClientMessage(value: unknown): value is ClientMessage {
   const v = value as Record<string, unknown>;
   if (v.type === "ping") return true;
   if (v.type === "restart") return true;
-  if (v.type === "kill") return true;
   if (v.type === "debug") return typeof v.event === "string";
   if (v.type === "layout") {
     return v.mode === "one" || v.mode === "two" || v.mode === "both";

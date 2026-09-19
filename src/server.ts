@@ -18,6 +18,7 @@ import {
   tagWebSession,
   setWebTabLabel,
   listWebTabs,
+  listTmuxSessions,
   applyLayout,
   readLayout,
   sessionAgeSeconds,
@@ -74,8 +75,12 @@ function removeSessionClient(name: string, ws: WebSocket): void {
   if (set.size === 0) sessionClients.delete(name);
 }
 
-/** Tell every client of `name` except `except` that the session was closed. */
-function broadcastClosed(name: string, except: WebSocket): void {
+/**
+ * Tell every client of `name` that the session was closed, so its tab goes away
+ * on every device instead of being recreated by a reconnect. `except` skips the
+ * socket that asked, where there is one — closing over HTTP has none.
+ */
+function broadcastClosed(name: string, except?: WebSocket): void {
   const set = sessionClients.get(name);
   if (!set) return;
   for (const peer of set) {
@@ -435,6 +440,88 @@ async function handleRenameSession(
   sendJsonHttp(res, 200, { ok: true });
 }
 
+/**
+ * Re-adopt as web tabs the sessions a device remembers having.
+ *
+ * The tab list lives on the tmux sessions themselves (@twtab), and that tag is
+ * written when a tab attaches. tmux-resurrect brings sessions back after a
+ * reboot WITHOUT it, and a tab only attaches when you open it now — so nothing
+ * would re-tag the restored ones and the whole list would disappear on the next
+ * sync. A device that still remembers them says so here instead.
+ *
+ * Only sessions that really exist in tmux are tagged, so a tab closed on
+ * another device stays closed rather than being resurrected by a stale cache.
+ */
+async function handleAdoptSessions(
+  req: http.IncomingMessage,
+  res: http.ServerResponse
+): Promise<void> {
+  let body: unknown;
+  try {
+    body = JSON.parse((await readBody(req, 8192)).toString("utf8"));
+  } catch {
+    sendJsonHttp(res, 400, { error: "invalid body" });
+    return;
+  }
+  const names = (body as { names?: unknown })?.names;
+  if (!Array.isArray(names)) {
+    sendJsonHttp(res, 400, { error: "missing names" });
+    return;
+  }
+  const existing = await listTmuxSessions();
+  if (!existing) {
+    sendJsonHttp(res, 200, { adopted: [] }); // tmux unreachable — say nothing
+    return;
+  }
+  const alive = new Set(existing);
+  const adopted: string[] = [];
+  for (const raw of names.slice(0, 64)) {
+    if (typeof raw !== "string") continue;
+    const name = sanitizeSession(raw);
+    if (!alive.has(name) || adopted.includes(name)) continue;
+    tagWebSession(name);
+    adopted.push(name);
+  }
+  if (adopted.length) {
+    console.log(`[api] re-adopted as web tabs: ${adopted.join(", ")}`);
+  }
+  sendJsonHttp(res, 200, { adopted });
+}
+
+/**
+ * Close a tab for good: kill its tmux session, with everything running in it.
+ *
+ * Over HTTP rather than the session's own socket, because a tab need not have
+ * one — a tab only attaches when you first look at it, so most of them are
+ * sitting there unconnected. The clients that DO have one are told first, so
+ * they drop the tab rather than reconnecting into a session `new-session -A`
+ * would recreate.
+ */
+async function handleKillSession(
+  req: http.IncomingMessage,
+  res: http.ServerResponse
+): Promise<void> {
+  let body: unknown;
+  try {
+    body = JSON.parse((await readBody(req, 4096)).toString("utf8"));
+  } catch {
+    sendJsonHttp(res, 400, { error: "invalid body" });
+    return;
+  }
+  const obj = body as { name?: unknown };
+  if (typeof obj?.name !== "string") {
+    sendJsonHttp(res, 400, { error: "missing name" });
+    return;
+  }
+  const name = sanitizeSession(obj.name);
+  broadcastClosed(name);
+  liveSessions.delete(name);
+  execFile("tmux", ["kill-session", "-t", name], (err) => {
+    if (err) console.error(`[api] kill-session "${name}" failed:`, err.message);
+  });
+  sendJsonHttp(res, 200, { ok: true });
+}
+
 // Matches the files we generate (clip-<ISO-stamp>-<rand>...), regardless of the
 // original name/extension appended after, so pruning only ever touches ours.
 const UPLOAD_NAME_RE = /^clip-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}-[a-z0-9]/i;
@@ -667,6 +754,16 @@ const server = http.createServer((req, res) => {
 
       if (method === "POST" && requestUrl.pathname === "/api/sessions/rename") {
         await handleRenameSession(req, res);
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/sessions/kill") {
+        await handleKillSession(req, res);
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/sessions/adopt") {
+        await handleAdoptSessions(req, res);
         return;
       }
 
@@ -1078,22 +1175,6 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
               err.message
             );
             sendJson(ws, { type: "info", message: "Restart failed." });
-          }
-        });
-      } else if (parsed.type === "kill") {
-        // Close-tab: kill the session for good (nothing is recreated). Killing
-        // the tmux session drops its @twtab tag with it, so the tab disappears
-        // from every device's list automatically. Tell the other devices first
-        // (before the kill drops their sockets) so they remove the tab instead
-        // of auto-reconnecting and recreating the session.
-        broadcastClosed(session, ws);
-        liveSessions.delete(session);
-        execFile("tmux", ["kill-session", "-t", session], (err) => {
-          if (err) {
-            console.error(
-              `[ws] kill: kill-session "${session}" failed:`,
-              err.message
-            );
           }
         });
       } else if (parsed.type === "debug") {
