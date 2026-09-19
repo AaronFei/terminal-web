@@ -1922,11 +1922,24 @@ const KEYBOARD_MIN_PX = 40;
 // Never slide so far that there is nothing left to read.
 const KEYBOARD_MIN_VISIBLE_PX = 72;
 
+// How much of us the keyboard covers according to the page that frames us. A
+// frame's own visualViewport does not track the top-level one, so when embedded
+// (entry's launcher) none of the measurements above notice a keyboard at all —
+// only the framing page can see it, and it says so by postMessage.
+let framedCovered = 0;
+
 function updateKeyboardOffset(): void {
-  const bottom = visibleBottom();
   const top = cssPx(termArea, 'top');
   const keybarH = cssPx(root, '--keybar-h');
-  const available = Math.max(0, bottom - keybarH - top);
+  // Everything hidden below what can be seen, however we came to know about it:
+  // a shrunken visual viewport, a shrunken layout viewport, or a framing page
+  // telling us. Only one of the three is ever non-zero.
+  const hiddenBelow = Math.max(
+    0,
+    window.innerHeight - visibleBottom(),
+    framedCovered,
+  );
+  const available = Math.max(0, window.innerHeight - hiddenBelow - keybarH - top);
 
   // A soft keyboard is only up while something is focused, so with nothing
   // focused this IS the resting height. While typing, take any increase: the
@@ -1939,10 +1952,10 @@ function updateKeyboardOffset(): void {
   }
   root.style.setProperty('--term-h', `${Math.round(restingTermH)}px`);
 
-  // How far the layout viewport runs on below what is visible. Zero on a
-  // browser that shrank the layout viewport for the keyboard; the keyboard's
-  // height on one that did not. The key bar sits on this.
-  root.style.setProperty('--kb-gap', `${Math.round(Math.max(0, window.innerHeight - bottom))}px`);
+  // What the key bar has to clear to stay above the keyboard. Zero on a browser
+  // that shrank the layout viewport for it — the bottom of that viewport is
+  // already above the keyboard.
+  root.style.setProperty('--kb-gap', `${Math.round(hiddenBelow)}px`);
 
   const covered = restingTermH - available;
   const room = Math.max(0, restingTermH - KEYBOARD_MIN_VISIBLE_PX);
@@ -1954,10 +1967,10 @@ function updateKeyboardOffset(): void {
     activeSession?.debugSend(
       'vv',
       `ih=${window.innerHeight} vvh=${Math.round(vv?.height ?? 0)} ` +
-        `vvTop=${Math.round(vv?.offsetTop ?? 0)} bottom=${Math.round(bottom)} ` +
-        `top=${Math.round(top)} keybar=${Math.round(keybarH)} avail=${Math.round(available)} ` +
-        `resting=${Math.round(restingTermH)} covered=${Math.round(covered)} off=${offset} ` +
-        `typing=${typing ? 1 : 0}`,
+        `vvTop=${Math.round(vv?.offsetTop ?? 0)} hidden=${Math.round(hiddenBelow)} ` +
+        `framed=${framedCovered} top=${Math.round(top)} keybar=${Math.round(keybarH)} ` +
+        `avail=${Math.round(available)} resting=${Math.round(restingTermH)} ` +
+        `covered=${Math.round(covered)} off=${offset} typing=${typing ? 1 : 0}`,
     );
   }
   // Deliberately no fit() here: the keyboard slides the terminal, it never
@@ -2613,6 +2626,26 @@ if (typeof ResizeObserver !== 'undefined') {
   areaObserver = new ResizeObserver(() => fitActive());
   areaObserver.observe(termArea);
 }
+// Embedded: the framing page is the only one that can see the keyboard, so it
+// tells us. Nothing else here can, and a wrong guess is worse than none.
+if (window.parent !== window) {
+  window.addEventListener('message', (e: MessageEvent) => {
+    const d = e.data as { source?: unknown; type?: unknown; covered?: unknown } | null;
+    if (!d || d.source !== 'entry' || d.type !== 'viewport') return;
+    const n = typeof d.covered === 'number' && Number.isFinite(d.covered) ? d.covered : 0;
+    const covered = Math.max(0, Math.min(2000, Math.round(n)));
+    if (covered === framedCovered) return;
+    framedCovered = covered;
+    updateKeyboardOffset();
+  });
+  // We may have finished loading after the last one was sent.
+  try {
+    window.parent.postMessage({ source: 'terminal-web', type: 'viewport-please' }, '*');
+  } catch {
+    /* a frame we cannot talk back to — nothing to do */
+  }
+}
+
 if (window.visualViewport) {
   window.visualViewport.addEventListener('resize', updateKeyboardOffset);
   window.visualViewport.addEventListener('scroll', updateKeyboardOffset);
