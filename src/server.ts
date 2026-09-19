@@ -514,10 +514,15 @@ async function handleKillSession(
     return;
   }
   const name = sanitizeSession(obj.name);
+  // Killing a session is the only irreversible thing this server does, so it
+  // says so either way. Logging just the failures left no record of what had
+  // been killed, which is not what you want when sessions have gone missing.
+  console.log(`[api] kill-session "${name}" requested`);
   broadcastClosed(name);
   liveSessions.delete(name);
   execFile("tmux", ["kill-session", "-t", name], (err) => {
     if (err) console.error(`[api] kill-session "${name}" failed:`, err.message);
+    else console.log(`[api] kill-session "${name}" done`);
   });
   sendJsonHttp(res, 200, { ok: true });
 }
@@ -1313,6 +1318,50 @@ const ptyLeakWatchdog = setInterval(() => {
   }
 }, HEARTBEAT_MS);
 ptyLeakWatchdog.unref();
+
+// ---------------------------------------------------------------------------
+// Session snapshots.
+//
+// tmux/web.tmux.conf loads tmux-resurrect and tmux-continuum so a snapshot is
+// taken every 15 minutes and a dead tmux server costs nothing. That has never
+// actually happened: continuum drives its save off the status line being
+// redrawn, and this config hides the status line (`set -g status off`) for an
+// edge-to-edge terminal, so the hook it installs is never evaluated. Both
+// plugins were installed, enabled, and silently doing nothing — when a tmux
+// server died on the NUC the newest snapshot turned out to be ten weeks old,
+// which made the loss total.
+//
+// So the save runs from here, where it depends on nothing being drawn. This
+// service is already running on every machine that has the sessions.
+// ---------------------------------------------------------------------------
+const SNAPSHOT_MS = 15 * 60_000;
+// The first one is early: a machine that has just come up should have a recent
+// snapshot without waiting out a full interval.
+const FIRST_SNAPSHOT_MS = 90_000;
+const RESURRECT_SAVE = path.join(
+  os.homedir(),
+  ".tmux/plugins/tmux-resurrect/scripts/save.sh"
+);
+
+async function snapshotSessions(): Promise<void> {
+  try {
+    await fsp.access(RESURRECT_SAVE, fs.constants.X_OK);
+  } catch {
+    return; // resurrect isn't installed here — nothing to do
+  }
+  // Never snapshot an empty tmux: that would overwrite the last good one with
+  // nothing, which is exactly the moment a snapshot is worth having.
+  const names = await listTmuxSessions();
+  if (!names || names.length === 0) return;
+  execFile(RESURRECT_SAVE, ["quiet"], (err) => {
+    if (err) console.error("[snapshot] resurrect save failed:", err.message);
+    else console.log(`[snapshot] saved ${names.length} tmux session(s)`);
+  });
+}
+
+setTimeout(() => void snapshotSessions(), FIRST_SNAPSHOT_MS).unref();
+const snapshotTimer = setInterval(() => void snapshotSessions(), SNAPSHOT_MS);
+snapshotTimer.unref();
 
 // ---------------------------------------------------------------------------
 // Startup & graceful shutdown
