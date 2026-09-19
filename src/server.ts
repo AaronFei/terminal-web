@@ -1338,10 +1338,32 @@ const SNAPSHOT_MS = 15 * 60_000;
 // The first one is early: a machine that has just come up should have a recent
 // snapshot without waiting out a full interval.
 const FIRST_SNAPSHOT_MS = 90_000;
+const RESURRECT_DIR = path.join(os.homedir(), ".local/share/tmux/resurrect");
 const RESURRECT_SAVE = path.join(
   os.homedir(),
   ".tmux/plugins/tmux-resurrect/scripts/save.sh"
 );
+
+/**
+ * Count the pane lines in the snapshot resurrect just wrote, so the log can
+ * say what was really saved rather than that the script exited 0.
+ *
+ * The first version of this saved a 20-byte file holding "state_terminal-web_"
+ * and nothing else, and reported success. resurrect's format is tab-separated,
+ * and tmux rewrites control characters in -F output to "_" unless the locale
+ * is UTF-8 — which the bare environment a service gets is not. Every field
+ * merged into one, every pane was dropped, and the `last` symlink moved to
+ * point at the result. Hence the UTF-8 environment below, and this check: a
+ * snapshot nobody has verified is how we got here.
+ */
+async function countSnapshotPanes(): Promise<number | null> {
+  try {
+    const text = await fsp.readFile(path.join(RESURRECT_DIR, "last"), "utf8");
+    return text.split("\n").filter((line) => line.startsWith("pane\t")).length;
+  } catch {
+    return null;
+  }
+}
 
 async function snapshotSessions(): Promise<void> {
   try {
@@ -1353,9 +1375,25 @@ async function snapshotSessions(): Promise<void> {
   // nothing, which is exactly the moment a snapshot is worth having.
   const names = await listTmuxSessions();
   if (!names || names.length === 0) return;
-  execFile(RESURRECT_SAVE, ["quiet"], (err) => {
-    if (err) console.error("[snapshot] resurrect save failed:", err.message);
-    else console.log(`[snapshot] saved ${names.length} tmux session(s)`);
+  // buildChildEnv for the locale: resurrect's format is tab-separated and tmux
+  // only emits real tabs under a UTF-8 locale (see countSnapshotPanes).
+  execFile(RESURRECT_SAVE, ["quiet"], { env: buildChildEnv() }, (err) => {
+    if (err) {
+      console.error("[snapshot] resurrect save failed:", err.message);
+      return;
+    }
+    void countSnapshotPanes().then((panes) => {
+      if (panes === null) {
+        console.error("[snapshot] saved, but the snapshot could not be read back");
+      } else if (panes === 0) {
+        console.error(
+          `[snapshot] SAVED NOTHING: ${names.length} session(s) live but the ` +
+            "snapshot holds no panes — it cannot be restored from"
+        );
+      } else {
+        console.log(`[snapshot] saved ${panes} pane(s) across ${names.length} session(s)`);
+      }
+    });
   });
 }
 
