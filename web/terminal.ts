@@ -2724,11 +2724,17 @@ async function init(): Promise<void> {
   // The server's list is authoritative; fall back to the local cache, then to
   // a single default session when both are empty.
   let server = await fetchServerTabs();
-  if (!server?.length && cached.tabs.length) {
-    // The server knows of no tabs but this device remembers some: the usual
-    // cause is a reboot, with tmux-resurrect having brought the sessions back
-    // untagged. Hand it the names and use whatever it can vouch for.
-    await adoptOnServer(cached.tabs.map((t) => t.name));
+  // Any tab this device remembers that the server does not list: hand over the
+  // names and let it re-adopt the ones whose sessions really exist. That is
+  // what a tmux-resurrect restore leaves behind — resurrect brings the sessions
+  // back but not their @twtab option, and with tabs only attaching when opened,
+  // nothing else would ever re-tag them. It happens for a partial restore too,
+  // where the server lists the sessions that survived and none of the rest, so
+  // this is not conditional on the list being empty.
+  const listed = new Set((server ?? []).map((t) => t.name));
+  const unlisted = cached.tabs.filter((t) => !listed.has(t.name)).map((t) => t.name);
+  if (unlisted.length) {
+    await adoptOnServer(unlisted);
     server = await fetchServerTabs();
   }
   let initialTabs: SavedTab[] =

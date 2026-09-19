@@ -880,6 +880,45 @@ interface LiveSocket extends WebSocket {
   isAlive: boolean;
 }
 
+// ---------------------------------------------------------------------------
+// Noticing that the tmux server has died.
+//
+// A tmux client exits 1 the moment its server disappears, so a burst of ptys
+// exiting that way is not a dozen sessions closing — it is the whole tmux
+// server going down, taking every session's contents with it. That happened on
+// the NUC and left no trace beyond a scattering of "pty exited (code 1)" lines
+// that had to be read backwards to work out what they meant. One line instead.
+// ---------------------------------------------------------------------------
+const SERVER_DEATH_WINDOW_MS = 3000;
+const SERVER_DEATH_MIN_EXITS = 3;
+let abnormalExits: number[] = [];
+let lastDeathReport = 0;
+
+function noteAbnormalPtyExit(): void {
+  const now = Date.now();
+  abnormalExits = abnormalExits.filter((at) => now - at < SERVER_DEATH_WINDOW_MS);
+  abnormalExits.push(now);
+  if (abnormalExits.length < SERVER_DEATH_MIN_EXITS) return;
+  if (now - lastDeathReport < SERVER_DEATH_WINDOW_MS) return; // one line per event
+  lastDeathReport = now;
+  const count = abnormalExits.length;
+  void listTmuxSessions().then((names) => {
+    if (names === null) {
+      console.error(
+        `[tmux] THE TMUX SERVER IS GONE — ${count} clients exited at once and ` +
+          "no server is answering. Every session's contents are lost; what " +
+          `survives is the last snapshot in ${RESURRECT_DIR}.`
+      );
+    } else {
+      console.error(
+        `[tmux] ${count} tmux clients exited at once. A server is answering ` +
+          `again with ${names.length} session(s) — if they are empty, the old ` +
+          "one died and these are new."
+      );
+    }
+  });
+}
+
 const wss = new WebSocketServer({ noServer: true });
 
 function sendJson(ws: WebSocket, msg: ServerMessage): void {
@@ -1099,6 +1138,8 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
     console.log(
       `[ws] pty for "${session}" exited (code ${exitCode}, signal ${signal ?? "none"})`
     );
+    // Exit 1 with no signal is what a tmux client does when its server goes.
+    if (exitCode === 1 && !signal) noteAbnormalPtyExit();
     closed = true; // pty is already gone; avoid kill() in cleanup
     liveSessions.delete(session);
     livePtys.delete(proc);
@@ -1334,7 +1375,7 @@ ptyLeakWatchdog.unref();
 // So the save runs from here, where it depends on nothing being drawn. This
 // service is already running on every machine that has the sessions.
 // ---------------------------------------------------------------------------
-const SNAPSHOT_MS = 15 * 60_000;
+const SNAPSHOT_MS = 5 * 60_000;
 // The first one is early: a machine that has just come up should have a recent
 // snapshot without waiting out a full interval.
 const FIRST_SNAPSHOT_MS = 90_000;
@@ -1356,14 +1397,28 @@ const RESURRECT_SAVE = path.join(
  * point at the result. Hence the UTF-8 environment below, and this check: a
  * snapshot nobody has verified is how we got here.
  */
-async function countSnapshotPanes(): Promise<number | null> {
+async function readSnapshot(): Promise<{ panes: number; sessions: number; ageMs: number } | null> {
+  const file = path.join(RESURRECT_DIR, "last");
   try {
-    const text = await fsp.readFile(path.join(RESURRECT_DIR, "last"), "utf8");
-    return text.split("\n").filter((line) => line.startsWith("pane\t")).length;
+    const [text, stat] = await Promise.all([
+      fsp.readFile(file, "utf8"),
+      fsp.stat(file),
+    ]);
+    const lines = text.split("\n").filter((line) => line.startsWith("pane\t"));
+    const sessions = new Set(lines.map((line) => line.split("\t")[1]));
+    return { panes: lines.length, sessions: sessions.size, ageMs: Date.now() - stat.mtimeMs };
   } catch {
     return null;
   }
 }
+
+// A snapshot taken right after a disaster overwrites the one taken before it,
+// and `last` is what continuum restores from on the next boot. So a sudden
+// collapse in the number of sessions is treated as "something just went very
+// wrong" and the save is skipped, loudly, rather than writing over the only
+// record of what was there. Bounded in time: once the smaller set has been the
+// truth for this long, it IS the truth and snapshots resume.
+const COLLAPSE_GRACE_MS = 2 * 60 * 60_000;
 
 async function snapshotSessions(): Promise<void> {
   try {
@@ -1375,14 +1430,30 @@ async function snapshotSessions(): Promise<void> {
   // nothing, which is exactly the moment a snapshot is worth having.
   const names = await listTmuxSessions();
   if (!names || names.length === 0) return;
+  const previous = await readSnapshot();
+  if (
+    previous &&
+    previous.ageMs < COLLAPSE_GRACE_MS &&
+    previous.sessions >= 2 &&
+    names.length * 2 <= previous.sessions
+  ) {
+    console.error(
+      `[snapshot] NOT saving: ${names.length} session(s) live but the last ` +
+        `snapshot holds ${previous.sessions} — keeping it rather than writing ` +
+        "over the only record of what was there. Restore from " +
+        `${RESURRECT_DIR} if this was not deliberate.`
+    );
+    return;
+  }
   // buildChildEnv for the locale: resurrect's format is tab-separated and tmux
-  // only emits real tabs under a UTF-8 locale (see countSnapshotPanes).
+  // only emits real tabs under a UTF-8 locale (see readSnapshot).
   execFile(RESURRECT_SAVE, ["quiet"], { env: buildChildEnv() }, (err) => {
     if (err) {
       console.error("[snapshot] resurrect save failed:", err.message);
       return;
     }
-    void countSnapshotPanes().then((panes) => {
+    void readSnapshot().then((snap) => {
+      const panes = snap?.panes ?? null;
       if (panes === null) {
         console.error("[snapshot] saved, but the snapshot could not be read back");
       } else if (panes === 0) {
