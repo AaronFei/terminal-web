@@ -93,6 +93,16 @@ const WEBGL_ENABLED = params.get('webgl') !== '0' && !params.has('nowebgl');
 // goes wrong on a device you cannot open a console on.
 const SEL_DEBUG = (params.get('debug') ?? '').includes('sel');
 
+// Whether this device is touched rather than pointed at.
+//
+// NOT `(pointer: coarse)`. An iPad browses as a desktop by default — Safari and
+// iPadOS Chrome both — and in that mode it answers that query like a mouse, so
+// every touch-only affordance here quietly switched itself off on the one
+// device that needs them most: no selection handles, the key bar hidden by
+// default, and the soft keyboard popping up on every tab switch. maxTouchPoints
+// still tells the truth there.
+const TOUCH_DEVICE = navigator.maxTouchPoints > 0;
+
 const encoder = new TextEncoder();
 
 /** Sanitize a session name to [A-Za-z0-9_-]{1,64}; null if nothing usable. */
@@ -533,6 +543,9 @@ class Session {
     // pointer and letting go is a deliberate end to it. Touch does not — see
     // the selection bar, which lets an imprecise drag be redone before it
     // decides anything.
+    this.el.addEventListener('mousedown', () => {
+      this.lastInputWasTouch = false;
+    });
     this.el.addEventListener('mouseup', copySelection);
 
     this.wireInput();
@@ -639,10 +652,12 @@ class Session {
 
   private positionHandles(sCol: number, sRow: number, eCol: number, eRow: number): void {
     if (!this.handleA || !this.handleB) return;
-    // Touch only. A pointer puts the selection where it wants first time, and
-    // two blue circles on a desktop terminal would just be in the way.
-    if (!window.matchMedia('(pointer: coarse)').matches) {
-      if (SEL_DEBUG) this.debugSend('sel-handles', 'skipped: pointer is not coarse');
+    // Only for a selection made by touch: a pointer puts one where it wants
+    // first time, and two blue circles on a desktop terminal are in the way.
+    // Judged by how this selection was made rather than by what the device
+    // claims to be, which an iPad in desktop mode gets wrong.
+    if (!this.lastInputWasTouch) {
+      if (SEL_DEBUG) this.debugSend('sel-handles', 'skipped: last input was not touch');
       return;
     }
     if (SEL_DEBUG) this.debugSend('sel-handles', `at ${sCol},${sRow}-${eCol},${eRow}`);
@@ -1020,6 +1035,7 @@ class Session {
           return;
         }
         cancelPress();
+        this.lastInputWasTouch = true;
         const t = e.touches[0];
         startX = t.clientX;
         startY = lastY = t.clientY;
@@ -1046,6 +1062,7 @@ class Session {
             'sel-touchstart',
             `cell=${pressAt[0]},${pressAt[1]} mode=${touchSelectMode ? 1 : 0} ` +
               `coarse=${window.matchMedia('(pointer: coarse)').matches ? 1 : 0} ` +
+              `touchDevice=${TOUCH_DEVICE ? 1 : 0} maxTouch=${navigator.maxTouchPoints} ` +
               `cols=${this.term.cols} rows=${this.term.rows} target=${(e.target as HTMLElement).className}`,
           );
         }
@@ -1240,6 +1257,9 @@ class Session {
   // moved afterwards. A drag on a phone lands where it lands — the finger is
   // over the text it is choosing — so being able to nudge an edge afterwards is
   // most of what makes selecting on a touchscreen bearable.
+  // Set by whichever kind of event last landed on this pane. Handles belong to
+  // a selection made with a finger, and nothing about the device says that.
+  private lastInputWasTouch = false;
   private selA: [number, number] | null = null;
   private selB: [number, number] | null = null;
   private handleA: HTMLElement | null = null;
@@ -1352,7 +1372,7 @@ class Session {
         // coarse pointer — tapping the terminal still focuses it (and raises the
         // keyboard) when the user actually wants to type. Desktop keeps the
         // immediate focus so you can type right after switching.
-        if (!window.matchMedia('(pointer: coarse)').matches) this.term.focus();
+        if (!TOUCH_DEVICE) this.term.focus();
       });
     }
   }
@@ -1436,6 +1456,7 @@ class Session {
         this.debugSend(
           'env',
           `mac=${isMac} coarse=${window.matchMedia('(pointer: coarse)').matches} ` +
+            `touch=${TOUCH_DEVICE} maxTouch=${navigator.maxTouchPoints} ` +
             `imeOwned=1 ua=${navigator.userAgent.slice(0, 80)}`,
         );
       }
@@ -2647,7 +2668,7 @@ function closeDrawer(): void {
   // focus, was the real culprit: focus() outside a user gesture doesn't raise
   // the keyboard on iOS.) The drawer is mobile-only, so skip focus entirely on
   // a coarse pointer; tap the terminal when you actually want to type.
-  if (!window.matchMedia('(pointer: coarse)').matches) activeSession?.focus();
+  if (!TOUCH_DEVICE) activeSession?.focus();
 }
 
 // --- Actions sheet (font / restart / paste / fullscreen / help) ------------
@@ -3179,6 +3200,6 @@ const keybarDefault = (() => {
   } catch {
     /* ignore */
   }
-  return window.matchMedia('(pointer: coarse)').matches;
+  return TOUCH_DEVICE;
 })();
 setKeybarVisible(keybarDefault);
