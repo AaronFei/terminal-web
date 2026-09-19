@@ -269,11 +269,6 @@ function openHelp(): void {
   overlay.addEventListener('click', (e) => {
     if (e.target === overlay) close();
   });
-  try {
-    localStorage.setItem('tw.helpSeen', '1');
-  } catch {
-    /* ignore */
-  }
 }
 
 const THEME = {
@@ -2838,10 +2833,3 @@ const keybarDefault = (() => {
   return window.matchMedia('(pointer: coarse)').matches;
 })();
 setKeybarVisible(keybarDefault);
-
-// First visit: show the copy/paste/image hint once.
-try {
-  if (!localStorage.getItem('tw.helpSeen')) window.setTimeout(openHelp, 700);
-} catch {
-  /* ignore */
-}

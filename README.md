@@ -289,8 +289,7 @@ adds two bars:
 - **Top bar** — session **tabs** on the left (see below) and, on the right,
   the controls that get used mid-session: `☰` (session list), `⌨` (toggle the
   key bar), `⟳` (restart the session), the **`1` `2` `⊞` split view** (see
-  below), `⬇` (download a file from the host), `?` (a help overlay — also shown
-  once on first visit), and `⋯`. **`⋯` opens the actions sheet**, which holds
+  below), `⬇` (download a file from the host), `?` (a help overlay), and `⋯`. **`⋯` opens the actions sheet**, which holds
   everything that isn't reached often: font size (persisted), the split view
   again, restart, paste, **📎 attach a file**, download, and fullscreen. It is
   the same sheet the phone's ⋯ opens.
