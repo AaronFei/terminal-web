@@ -87,6 +87,11 @@ const PASTE_DEBUG = (params.get('debug') ?? '').includes('paste');
 // WebGL renderer is on by default; ?webgl=0 (or ?nowebgl) falls back to the DOM
 // renderer — useful for flaky GPUs or headless capture.
 const WEBGL_ENABLED = params.get('webgl') !== '0' && !params.has('nowebgl');
+// ?debug=sel traces touch selection — where a touch landed, whether the long
+// press fired, what word it found, what ended up selected — to the server log.
+// Selecting is several steps deep and every one of them is invisible when it
+// goes wrong on a device you cannot open a console on.
+const SEL_DEBUG = (params.get('debug') ?? '').includes('sel');
 
 const encoder = new TextEncoder();
 
@@ -597,6 +602,13 @@ class Session {
     this.selA = a;
     this.selB = b;
     this.applySelectionRange();
+    if (SEL_DEBUG) {
+      this.debugSend(
+        'sel-range',
+        `a=${a[0]},${a[1]} b=${b[0]},${b[1]} divider=${this.dividerCol} ` +
+          `len=${this.term.getSelection().length} has=${this.term.hasSelection() ? 1 : 0}`,
+      );
+    }
   }
 
   /** Re-apply the stored range, ordered, and move the handles onto its ends. */
@@ -629,7 +641,11 @@ class Session {
     if (!this.handleA || !this.handleB) return;
     // Touch only. A pointer puts the selection where it wants first time, and
     // two blue circles on a desktop terminal would just be in the way.
-    if (!window.matchMedia('(pointer: coarse)').matches) return;
+    if (!window.matchMedia('(pointer: coarse)').matches) {
+      if (SEL_DEBUG) this.debugSend('sel-handles', 'skipped: pointer is not coarse');
+      return;
+    }
+    if (SEL_DEBUG) this.debugSend('sel-handles', `at ${sCol},${sRow}-${eCol},${eRow}`);
     const cell = this.cellSize();
     const viewTop = this.term.buffer.active.viewportY;
     const place = (h: HTMLElement, col: number, row: number, below: boolean): void => {
@@ -1025,9 +1041,25 @@ class Session {
         }
         this.noteTouchColumn(cellAt(t.clientX, t.clientY)[0]);
         const pressAt = cellAt(t.clientX, t.clientY);
+        if (SEL_DEBUG) {
+          this.debugSend(
+            'sel-touchstart',
+            `cell=${pressAt[0]},${pressAt[1]} mode=${touchSelectMode ? 1 : 0} ` +
+              `coarse=${window.matchMedia('(pointer: coarse)').matches ? 1 : 0} ` +
+              `cols=${this.term.cols} rows=${this.term.rows} target=${(e.target as HTMLElement).className}`,
+          );
+        }
         pressTimer = window.setTimeout(() => {
           pressTimer = null;
           const range = this.wordRangeAt(pressAt[0], pressAt[1]);
+          if (SEL_DEBUG) {
+            const line = this.term.buffer.active.getLine(pressAt[1]);
+            this.debugSend(
+              'sel-press',
+              `fired at ${pressAt[0]},${pressAt[1]} range=${range ? JSON.stringify(range) : 'null'} ` +
+                `line=${JSON.stringify((line?.translateToString(true) ?? '').slice(0, 60))}`,
+            );
+          }
           if (!range) return;
           tracking = false;
           pressFired = true;
@@ -1056,6 +1088,7 @@ class Session {
             return; // ignore jitter until it's clearly a drag
           }
           selMoved = true;
+          if (SEL_DEBUG) this.debugSend('sel-drag', `to ${cellAt(t.clientX, t.clientY).join(',')}`);
           // Ordering, clipping to one window of a split tab, and placing the
           // handles all live in setSelectionRange — the drag just says where
           // the two ends are, exactly as dragging a handle afterwards does.
