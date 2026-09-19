@@ -293,6 +293,12 @@ adds two bars:
   everything that isn't reached often: font size (persisted), the split view
   again, restart, paste, **📎 attach a file**, download, and fullscreen. It is
   the same sheet the phone's ⋯ opens.
+- **Selection bar (touch)** — dragging with **選取** armed no longer copies the
+  moment you lift your finger. The selection stays up and a small bar appears
+  above the key bar: **複製** copies it, **全選** extends it to the whole screen
+  (to one window of a split tab — the one you last touched), **取消** drops it.
+  Drag again to redo the selection before committing to it. **Copy the screen**
+  in the `⋯` sheet does the select-all and the copy in one tap.
 - **Bottom key bar** — `Copy Paste Esc Tab Ctrl Alt ← ↑ ↓ → Home End PgUp PgDn
   ^C | ~ / -`, horizontally scrollable. `Ctrl` and `Alt` are **sticky**: tap to
   arm them (they highlight), then the next key is sent with that modifier — e.g.

@@ -229,6 +229,54 @@ body {
 }
 
 /* --------------------------------------------------------------------------
+   Actions for a touch selection. Lifting your finger no longer copies — the
+   selection stays up and these appear, so an imprecise drag can be redone and
+   you can see what you are about to get. Rides above the key bar, and --kb-gap
+   keeps it clear of the keyboard on a browser that does not shrink the layout
+   viewport for one.
+   -------------------------------------------------------------------------- */
+#selbar {
+  position: fixed;
+  left: 50%;
+  bottom: calc(var(--keybar-h) + var(--kb-gap) + 12px);
+  transform: translateX(-50%);
+  display: flex;
+  gap: 8px;
+  padding: 6px;
+  background: #2d2d30;
+  border: 1px solid #454548;
+  border-radius: 10px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+  z-index: 30;
+}
+#selbar.hidden {
+  display: none;
+}
+.sel-btn {
+  appearance: none;
+  -webkit-appearance: none;
+  min-width: 72px;
+  height: 40px;
+  padding: 0 14px;
+  background: #3a3a3c;
+  color: #e5e5e5;
+  border: 1px solid #4a4a4c;
+  border-radius: 8px;
+  font-size: 15px;
+  font-family: var(--mono);
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.sel-btn.primary {
+  background: #2472c8;
+  border-color: #3b8eea;
+  color: #fff;
+}
+.sel-btn:active {
+  filter: brightness(1.25);
+}
+
+/* --------------------------------------------------------------------------
    Terminal: sits between the top bar and the (optional) key bar
    -------------------------------------------------------------------------- */
 #terminal {

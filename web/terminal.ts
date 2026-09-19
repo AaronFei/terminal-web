@@ -524,8 +524,11 @@ class Session {
         });
       }
     };
+    // Desktop keeps select-to-copy: the selection is made with a precise
+    // pointer and letting go is a deliberate end to it. Touch does not — see
+    // the selection bar, which lets an imprecise drag be redone before it
+    // decides anything.
     this.el.addEventListener('mouseup', copySelection);
-    this.el.addEventListener('touchend', copySelection);
 
     this.wireInput();
     this.wireTouchScroll();
@@ -863,9 +866,12 @@ class Session {
           selecting = true;
           selMoved = false;
           [anchorCol, anchorRow] = cellAt(t.clientX, t.clientY);
+          this.noteTouchColumn(anchorCol);
           this.term.clearSelection();
+          hideSelectionBar();
           return;
         }
+        this.noteTouchColumn(cellAt(t.clientX, t.clientY)[0]);
         tracking = true;
         scrolling = false;
         // Cell under the finger, so tmux targets the right pane if it's split.
@@ -902,6 +908,7 @@ class Session {
             const hi = Math.max(first, Math.min(last, Math.max(sCol, eCol)));
             if (this.selectBlock(lo, sRow, hi, eRow)) return;
           }
+          this.useFlowingSelection();
           const length = (eRow - sRow) * this.term.cols + (eCol - sCol) + 1;
           this.term.select(sCol, sRow, length);
           return;
@@ -940,6 +947,9 @@ class Session {
     // left the selection cleared, so nothing is copied. Select mode stays armed
     // until toggled off again.
     const end = (): void => {
+      // A drag that actually selected something leaves the selection up along
+      // with its actions, so it can be redone before anything is copied.
+      if (selecting && selMoved && this.term.hasSelection()) showSelectionBar();
       tracking = false;
       scrolling = false;
       selecting = false;
@@ -1026,11 +1036,51 @@ class Session {
     svc.shouldColumnSelect = (event) => this.dividerCol !== null || xtermsRule(event);
   }
 
+  // Column of the last touch or click in this pane, so "select everything" and
+  // the split-tab clipping both know which of the two windows you mean.
+  private lastTouchCol = 0;
+
+  /** Note where a gesture landed; the column decides which window it is in. */
+  noteTouchColumn(col: number): void {
+    this.lastTouchCol = col;
+  }
+
+  /**
+   * Select everything on screen — clipped to one window when the tab is split,
+   * the one last touched. This is the copy most often wanted on a phone, where
+   * dragging out an exact range is the hard part.
+   */
+  selectVisible(): boolean {
+    const top = this.term.buffer.active.viewportY;
+    const bottom = top + this.term.rows - 1;
+    const [first, last] = this.windowCols(this.lastTouchCol);
+    if (this.selectBlock(first, top, last, bottom)) return true;
+    // Without xterm's internals, fall back to the flowing kind over the screen.
+    this.useFlowingSelection();
+    try {
+      this.term.select(first, top, (bottom - top) * this.term.cols + (last - first) + 1);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /** First and last column of the window that `col` falls in. */
   private windowCols(col: number): [number, number] {
     const divider = this.dividerCol;
     if (divider === null) return [0, this.term.cols - 1];
     return col < divider ? [0, divider - 1] : [divider + 1, this.term.cols - 1];
+  }
+
+  /**
+   * Put xterm back in its ordinary flowing selection mode. term.select() sets
+   * the selection but not the mode, so without this a flowing drag made after a
+   * block one would be read back a column at a time — the right cells
+   * highlighted, the wrong text copied.
+   */
+  private useFlowingSelection(): void {
+    const svc = this.selection();
+    if (svc) svc._activeSelectionMode = 0; // SelectionMode.NORMAL
   }
 
   /**
@@ -1399,6 +1449,7 @@ function activateSession(s: Session): void {
   // (e.g. after picking it from the drawer); scroll it back into view. inline/
   // block: 'nearest' only scrolls #tabs horizontally, never the page/terminal.
   s.tabEl?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  hideSelectionBar(); // a selection belongs to the tab it was made in
   reflectActiveStatus();
   refreshMobileUI();
   refreshLayoutUI();
@@ -2056,6 +2107,61 @@ makeButton(controlsEl, 'tb-btn tb-icon', '?', 'Help: copy / paste / files', open
 // keeps only what gets used mid-session.
 makeButton(controlsEl, 'tb-btn tb-icon', '⋯', 'More actions', () => openSheet());
 
+// --- selection actions (touch) ---------------------------------------------
+// Copying used to happen the instant you lifted your finger, so one imprecise
+// drag decided everything: overshoot and the whole thing started over, and
+// there was never a moment where you could see what you were about to get. The
+// selection stays up now and these appear above the key bar.
+const selBar = document.createElement('div');
+selBar.id = 'selbar';
+selBar.className = 'hidden';
+
+function showSelectionBar(): void {
+  selBar.classList.remove('hidden');
+}
+function hideSelectionBar(): void {
+  selBar.classList.add('hidden');
+}
+
+/** Turn touch-select mode on or off, keeping the key and the bar in step. */
+function setTouchSelectMode(on: boolean): void {
+  touchSelectMode = on;
+  selectBtn?.classList.toggle('armed', on);
+  if (!on) {
+    activeSession?.term.clearSelection();
+    hideSelectionBar();
+  }
+}
+
+/** Copy whatever is selected, then leave select mode. */
+function copySelectionNow(): void {
+  const sel = activeSession?.term.getSelection() ?? '';
+  if (!sel) {
+    flashStatus('沒有選到東西', 1400);
+    return;
+  }
+  void copyText(sel).then((ok) => flashStatus(ok ? `已複製 ${sel.length} 字` : '複製失敗', 1600));
+  setTouchSelectMode(false);
+}
+
+function selBarButton(label: string, cls: string, onTap: () => void): void {
+  const b = document.createElement('button');
+  b.className = `sel-btn ${cls}`;
+  b.type = 'button';
+  b.textContent = label;
+  // A real click, in the gesture: Safari only lets the clipboard be written
+  // from one, and a preventDefaulted pointerdown is not it.
+  b.addEventListener('click', onTap);
+  selBar.append(b);
+}
+
+selBarButton('複製', 'primary', () => copySelectionNow());
+selBarButton('全選', '', () => {
+  if (!activeSession?.selectVisible()) flashStatus('無法全選', 1400);
+});
+selBarButton('取消', '', () => setTouchSelectMode(false));
+document.body.append(selBar);
+
 // --- on-screen key bar (sends to the active session) -----------------------
 interface KeyDef {
   label?: string;
@@ -2138,10 +2244,8 @@ for (const def of KEYS) {
       // Toggle touch-select mode. While on, dragging the terminal selects text
       // (and lifting copies it) instead of scrolling; tap again to go back to
       // scrolling. Never refocus — that would pop the soft keyboard.
-      touchSelectMode = !touchSelectMode;
-      selectBtn?.classList.toggle('armed', touchSelectMode);
-      if (!touchSelectMode) activeSession?.term.clearSelection();
-      flashStatus(touchSelectMode ? '選取模式:拖曳選字→放開複製' : '選取關閉', 1600);
+      setTouchSelectMode(!touchSelectMode);
+      flashStatus(touchSelectMode ? '選取模式:拖曳選字,放開後再按複製' : '選取關閉', 1800);
       return;
     }
     if (def.action === 'copy') {
@@ -2434,6 +2538,16 @@ sheet.append(
     closeSheet();
     pasteFromClipboard();
   }),
+  sheetRow(
+    '⧉',
+    'Copy the screen',
+    () => {
+      closeSheet();
+      if (activeSession?.selectVisible()) copySelectionNow();
+      else flashStatus('無法全選', 1400);
+    },
+    true,
+  ),
   sheetRow(
     '📎',
     'Attach a file',
