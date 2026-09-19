@@ -648,6 +648,11 @@ class Session {
       }
     }
     this.positionHandles(sCol, sRow, eCol, eRow);
+    // Whatever made or changed this selection — a drag, a handle, a long press,
+    // 全選 — if it was a finger then its actions belong on screen. Leaving that
+    // to each caller is how a path ends up with a selection and no way to copy
+    // it, which is exactly what happened.
+    if (this.lastInputWasTouch && this.term.hasSelection()) showSelectionBar();
   }
 
   private positionHandles(sCol: number, sRow: number, eCol: number, eRow: number): void {
@@ -2351,8 +2356,19 @@ selBar.className = 'hidden';
 
 function showSelectionBar(): void {
   selBar.classList.remove('hidden');
+  if (SEL_DEBUG) {
+    const r = selBar.getBoundingClientRect();
+    activeSession?.debugSend(
+      'sel-bar',
+      `show at ${Math.round(r.left)},${Math.round(r.top)} ${Math.round(r.width)}x${Math.round(r.height)} ` +
+        `inDom=${selBar.isConnected ? 1 : 0} kbGap=${cssPx(root, '--kb-gap')} keybar=${cssPx(root, '--keybar-h')}`,
+    );
+  }
 }
 function hideSelectionBar(): void {
+  if (SEL_DEBUG && !selBar.classList.contains('hidden')) {
+    activeSession?.debugSend('sel-bar', 'hide');
+  }
   selBar.classList.add('hidden');
 }
 
