@@ -1976,14 +1976,41 @@ async function adoptOnServer(names: string[]): Promise<void> {
   }
 }
 
-function renameOnServer(name: string, displayName: string): void {
-  void fetch('/api/sessions/rename', {
+function postRename(name: string, displayName: string): Promise<unknown> {
+  return fetch('/api/sessions/rename', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name, displayName }),
   }).catch(() => {
     /* ignore — local UI already reflects the change */
   });
+}
+
+function renameOnServer(name: string, displayName: string): void {
+  void postRename(name, displayName);
+}
+
+/**
+ * Hand back the tabs the server does not list, and put their labels back with
+ * them.
+ *
+ * Both the tab tag and the label are tmux session options, written when a tab
+ * attaches or is renamed, and a session can be alive without either: resurrect
+ * restores them after a reboot bare, and a tmux server that restarts under a
+ * page that is already open does the same. Nothing re-tags them any more —
+ * that used to be a side effect of every tab holding a socket.
+ *
+ * The label needs saying again because the list the server hands back is what
+ * the tab strip shows: a tab adopted without it comes back named after its
+ * session and overwrites the name you gave it.
+ */
+async function readoptTabs(tabs: SavedTab[]): Promise<void> {
+  await adoptOnServer(tabs.map((t) => t.name));
+  await Promise.all(
+    tabs
+      .filter((t) => t.displayName && t.displayName !== t.name)
+      .map((t) => postRename(t.name, t.displayName))
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -2132,12 +2159,28 @@ async function syncFromServer(): Promise<void> {
 
     // Remove tabs closed elsewhere. A tab we built moments ago is exempt: it
     // may not have attached yet, so the server would not list it either.
-    for (const s of sessions.slice()) {
-      if (byName.has(s.name)) continue;
-      if (recentlyCreated.has(s.name)) continue;
-      if (recentlyClosed.has(s.name)) continue;
-      removeLocalSession(s);
+    let missing = sessions.filter(
+      (s) => !byName.has(s.name) && !recentlyCreated.has(s.name) && !recentlyClosed.has(s.name)
+    );
+    // Absent from the list is not the same as gone. The list is built from a
+    // tag the tmux session carries, and a session can lose it while this page
+    // is open — a tmux server that dies and comes back through resurrect brings
+    // every session back bare. While each tab held its own socket that fixed
+    // itself, because attaching is what writes the tag; with tabs attaching
+    // only when opened, the next sweep would take every unopened tab instead,
+    // five seconds later, with nothing to undo it.
+    //
+    // So offer the names back before dropping any of them. Only sessions that
+    // really exist get adopted, which leaves a tab closed on another device
+    // missing from the re-read as well — and it still goes.
+    if (missing.length) {
+      await readoptTabs(missing.map((s) => ({ name: s.name, displayName: s.displayName })));
+      const after = await fetchServerTabs();
+      if (!after) return; // unreachable now — keep every tab we have
+      const listed = new Set(after.map((t) => t.name));
+      missing = missing.filter((s) => !listed.has(s.name));
     }
+    for (const s of missing) removeLocalSession(s);
 
     if (sessions.length === 0) addSession(defaultSessionName, true);
     saveTabs();
@@ -3274,9 +3317,9 @@ async function init(): Promise<void> {
   // where the server lists the sessions that survived and none of the rest, so
   // this is not conditional on the list being empty.
   const listed = new Set((server ?? []).map((t) => t.name));
-  const unlisted = cached.tabs.filter((t) => !listed.has(t.name)).map((t) => t.name);
+  const unlisted = cached.tabs.filter((t) => !listed.has(t.name));
   if (unlisted.length) {
-    await adoptOnServer(unlisted);
+    await readoptTabs(unlisted);
     server = await fetchServerTabs();
   }
   let initialTabs: SavedTab[] =
