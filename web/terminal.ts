@@ -533,6 +533,138 @@ class Session {
     this.wireInput();
     this.wireTouchScroll();
     this.wireSplitSelection();
+    this.wireHandles();
+  }
+
+  /**
+   * A cell's size and where the grid starts, in CSS pixels. The pane is padded,
+   * so its border box is a few pixels wider than the terminal inside it — worth
+   * allowing for when the cells themselves are only about eight across.
+   */
+  private cellSize(): { w: number; h: number; left: number; top: number } {
+    const rect = this.el.getBoundingClientRect();
+    const style = getComputedStyle(this.el);
+    const padX = parseFloat(style.paddingLeft) || 0;
+    const padY = parseFloat(style.paddingTop) || 0;
+    return {
+      w: Math.max(1, rect.width - padX * 2) / Math.max(1, this.term.cols),
+      h: Math.max(1, rect.height - padY * 2) / Math.max(1, this.term.rows),
+      left: rect.left + padX,
+      top: rect.top + padY,
+    };
+  }
+
+  /**
+   * The two drag handles that sit at the ends of a touch selection, the way
+   * every native text selection has them. Only ever shown on touch: a pointer
+   * can put the selection where it wants first time.
+   */
+  private wireHandles(): void {
+    const make = (which: 'a' | 'b'): HTMLElement => {
+      const h = document.createElement('div');
+      h.className = `sel-handle sel-${which}`;
+      h.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        h.setPointerCapture(e.pointerId);
+        const move = (ev: PointerEvent): void => {
+          const cell = this.cellSize();
+          const col = Math.max(0, Math.min(this.term.cols - 1, Math.floor((ev.clientX - cell.left) / cell.w)));
+          const row = Math.max(0, Math.min(this.term.rows - 1, Math.floor((ev.clientY - cell.top) / cell.h)));
+          const at: [number, number] = [col, this.term.buffer.active.viewportY + row];
+          if (which === 'a') this.selA = at;
+          else this.selB = at;
+          this.applySelectionRange();
+        };
+        const up = (): void => {
+          h.removeEventListener('pointermove', move);
+          h.removeEventListener('pointerup', up);
+          h.removeEventListener('pointercancel', up);
+        };
+        h.addEventListener('pointermove', move);
+        h.addEventListener('pointerup', up);
+        h.addEventListener('pointercancel', up);
+      });
+      this.el.append(h);
+      return h;
+    };
+    this.handleA = make('a');
+    this.handleB = make('b');
+  }
+
+  /** Set the selection to the range between two cells and show its handles. */
+  setSelectionRange(a: [number, number], b: [number, number]): void {
+    this.selA = a;
+    this.selB = b;
+    this.applySelectionRange();
+  }
+
+  /** Re-apply the stored range, ordered, and move the handles onto its ends. */
+  private applySelectionRange(): void {
+    if (!this.selA || !this.selB) return;
+    let [sCol, sRow] = this.selA;
+    let [eCol, eRow] = this.selB;
+    if (eRow < sRow || (eRow === sRow && eCol < sCol)) {
+      [sCol, sRow, eCol, eRow] = [eCol, eRow, sCol, sRow];
+    }
+    if (this.dividerCol !== null) {
+      // Split tab: stay inside the window the selection started in.
+      const [first, last] = this.windowCols(this.selA[0]);
+      const lo = Math.max(first, Math.min(last, Math.min(sCol, eCol)));
+      const hi = Math.max(first, Math.min(last, Math.max(sCol, eCol)));
+      this.selectBlock(lo, sRow, hi, eRow);
+    } else {
+      this.useFlowingSelection();
+      const length = (eRow - sRow) * this.term.cols + (eCol - sCol) + 1;
+      try {
+        this.term.select(sCol, sRow, length);
+      } catch {
+        /* out of range after a redraw — leave the selection as it was */
+      }
+    }
+    this.positionHandles(sCol, sRow, eCol, eRow);
+  }
+
+  private positionHandles(sCol: number, sRow: number, eCol: number, eRow: number): void {
+    if (!this.handleA || !this.handleB) return;
+    // Touch only. A pointer puts the selection where it wants first time, and
+    // two blue circles on a desktop terminal would just be in the way.
+    if (!window.matchMedia('(pointer: coarse)').matches) return;
+    const cell = this.cellSize();
+    const viewTop = this.term.buffer.active.viewportY;
+    const place = (h: HTMLElement, col: number, row: number, below: boolean): void => {
+      h.style.left = `${col * cell.w}px`;
+      h.style.top = `${(row - viewTop + (below ? 1 : 0)) * cell.h}px`;
+      h.classList.add('visible');
+    };
+    place(this.handleA, sCol, sRow, false);
+    place(this.handleB, eCol + 1, eRow, true);
+  }
+
+  /** Drop the selection and its handles. */
+  clearSelectionRange(): void {
+    this.selA = null;
+    this.selB = null;
+    this.handleA?.classList.remove('visible');
+    this.handleB?.classList.remove('visible');
+    this.term.clearSelection();
+  }
+
+  /** The run of word-ish characters around a cell, as a range. */
+  wordRangeAt(col: number, row: number): [[number, number], [number, number]] | null {
+    const line = this.term.buffer.active.getLine(row);
+    if (!line) return null;
+    const text = line.translateToString(false);
+    const isWord = (ch: string): boolean => !!ch && !/\s/.test(ch);
+    if (!isWord(text[col] ?? '')) return null;
+    let a = col;
+    let b = col;
+    while (a > 0 && isWord(text[a - 1] ?? '')) a -= 1;
+    while (b < text.length - 1 && isWord(text[b + 1] ?? '')) b += 1;
+    return [
+      [a, row],
+      [b, row],
+    ];
   }
 
   /**
@@ -830,6 +962,16 @@ class Session {
     // stays correct even when the view is scrolled into the scrollback).
     let selecting = false;
     let selMoved = false;
+    // Long-press picks the word under your finger, so pulling one string out of
+    // the screen does not mean arming a mode and then dragging over it exactly.
+    let pressTimer: number | null = null;
+    let pressFired = false;
+    const cancelPress = (): void => {
+      if (pressTimer !== null) {
+        clearTimeout(pressTimer);
+        pressTimer = null;
+      }
+    };
     let anchorCol = 0;
     let anchorRow = 0;
     let cellW = 1;
@@ -847,19 +989,29 @@ class Session {
     this.el.addEventListener(
       'touchstart',
       (e: TouchEvent) => {
+        // A touch that lands on a selection handle is that handle's to deal
+        // with; the terminal must not also start scrolling or a long-press.
+        if ((e.target as HTMLElement | null)?.classList?.contains('sel-handle')) {
+          tracking = false;
+          selecting = false;
+          cancelPress();
+          return;
+        }
         if (e.touches.length !== 1) {
           tracking = false;
           selecting = false;
+          cancelPress();
           return;
         }
+        cancelPress();
         const t = e.touches[0];
         startX = t.clientX;
         startY = lastY = t.clientY;
-        const rect = this.el.getBoundingClientRect();
-        cellW = rect.width / Math.max(1, this.term.cols);
-        cellH = rect.height / Math.max(1, this.term.rows);
-        rectLeft = rect.left;
-        rectTop = rect.top;
+        const cell = this.cellSize();
+        cellW = cell.w;
+        cellH = cell.h;
+        rectLeft = cell.left;
+        rectTop = cell.top;
         if (touchSelectMode) {
           // Begin a selection drag; suspend scrolling for this gesture.
           tracking = false;
@@ -867,11 +1019,22 @@ class Session {
           selMoved = false;
           [anchorCol, anchorRow] = cellAt(t.clientX, t.clientY);
           this.noteTouchColumn(anchorCol);
-          this.term.clearSelection();
+          this.clearSelectionRange();
           hideSelectionBar();
           return;
         }
         this.noteTouchColumn(cellAt(t.clientX, t.clientY)[0]);
+        const pressAt = cellAt(t.clientX, t.clientY);
+        pressTimer = window.setTimeout(() => {
+          pressTimer = null;
+          const range = this.wordRangeAt(pressAt[0], pressAt[1]);
+          if (!range) return;
+          tracking = false;
+          pressFired = true;
+          this.noteTouchColumn(pressAt[0]);
+          this.setSelectionRange(range[0], range[1]);
+          showSelectionBar();
+        }, 500);
         tracking = true;
         scrolling = false;
         // Cell under the finger, so tmux targets the right pane if it's split.
@@ -893,26 +1056,13 @@ class Session {
             return; // ignore jitter until it's clearly a drag
           }
           selMoved = true;
-          let [sCol, sRow] = [anchorCol, anchorRow];
-          let [eCol, eRow] = cellAt(t.clientX, t.clientY);
-          // Order start-before-end so the length is positive whichever way you drag.
-          if (eRow < sRow || (eRow === sRow && eCol < sCol)) {
-            [sCol, sRow, eCol, eRow] = [eCol, eRow, sCol, sRow];
-          }
-          // While the tab is split, keep the drag inside the window it started
-          // in and select a block, so it can't run through the divider into the
-          // other window's text.
-          if (this.dividerCol !== null) {
-            const [first, last] = this.windowCols(anchorCol);
-            const lo = Math.max(first, Math.min(last, Math.min(sCol, eCol)));
-            const hi = Math.max(first, Math.min(last, Math.max(sCol, eCol)));
-            if (this.selectBlock(lo, sRow, hi, eRow)) return;
-          }
-          this.useFlowingSelection();
-          const length = (eRow - sRow) * this.term.cols + (eCol - sCol) + 1;
-          this.term.select(sCol, sRow, length);
+          // Ordering, clipping to one window of a split tab, and placing the
+          // handles all live in setSelectionRange — the drag just says where
+          // the two ends are, exactly as dragging a handle afterwards does.
+          this.setSelectionRange([anchorCol, anchorRow], cellAt(t.clientX, t.clientY));
           return;
         }
+        if (Math.abs(t.clientX - startX) > 8 || Math.abs(t.clientY - startY) > 8) cancelPress();
         if (!tracking) return;
         if (!scrolling) {
           const dyTotal = t.clientY - startY;
@@ -950,10 +1100,23 @@ class Session {
       // A drag that actually selected something leaves the selection up along
       // with its actions, so it can be redone before anything is copied.
       if (selecting && selMoved && this.term.hasSelection()) showSelectionBar();
+      cancelPress();
       tracking = false;
       scrolling = false;
       selecting = false;
     };
+    // A long-press has already done its job by the time the finger lifts; the
+    // tap the browser would synthesise from it would go on to tmux as a click.
+    this.el.addEventListener(
+      'touchend',
+      (e: TouchEvent) => {
+        if (!pressFired) return;
+        pressFired = false;
+        e.preventDefault();
+        e.stopPropagation();
+      },
+      { capture: true, passive: false },
+    );
     this.el.addEventListener('touchend', end, { capture: true, passive: true });
     this.el.addEventListener('touchcancel', end, { capture: true, passive: true });
   }
@@ -1040,6 +1203,15 @@ class Session {
   // the split-tab clipping both know which of the two windows you mean.
   private lastTouchCol = 0;
 
+  // The selection as two cells in buffer coordinates, kept so either end can be
+  // moved afterwards. A drag on a phone lands where it lands — the finger is
+  // over the text it is choosing — so being able to nudge an edge afterwards is
+  // most of what makes selecting on a touchscreen bearable.
+  private selA: [number, number] | null = null;
+  private selB: [number, number] | null = null;
+  private handleA: HTMLElement | null = null;
+  private handleB: HTMLElement | null = null;
+
   /** Note where a gesture landed; the column decides which window it is in. */
   noteTouchColumn(col: number): void {
     this.lastTouchCol = col;
@@ -1054,15 +1226,8 @@ class Session {
     const top = this.term.buffer.active.viewportY;
     const bottom = top + this.term.rows - 1;
     const [first, last] = this.windowCols(this.lastTouchCol);
-    if (this.selectBlock(first, top, last, bottom)) return true;
-    // Without xterm's internals, fall back to the flowing kind over the screen.
-    this.useFlowingSelection();
-    try {
-      this.term.select(first, top, (bottom - top) * this.term.cols + (last - first) + 1);
-      return true;
-    } catch {
-      return false;
-    }
+    this.setSelectionRange([first, top], [last, bottom]);
+    return this.term.hasSelection();
   }
 
   /** First and last column of the window that `col` falls in. */
@@ -1140,6 +1305,7 @@ class Session {
 
   setActive(active: boolean): void {
     this.el.classList.toggle('hidden', !active);
+    if (!active) this.clearSelectionRange(); // a selection belongs to its tab
     if (active) {
       requestAnimationFrame(() => {
         this.fit();
@@ -2141,7 +2307,7 @@ function setTouchSelectMode(on: boolean): void {
   touchSelectMode = on;
   selectBtn?.classList.toggle('armed', on);
   if (!on) {
-    activeSession?.term.clearSelection();
+    activeSession?.clearSelectionRange();
     hideSelectionBar();
   }
 }
@@ -2172,7 +2338,10 @@ selBarButton('複製', 'primary', () => copySelectionNow());
 selBarButton('全選', '', () => {
   if (!activeSession?.selectVisible()) flashStatus('無法全選', 1400);
 });
-selBarButton('取消', '', () => setTouchSelectMode(false));
+selBarButton('取消', '', () => {
+  activeSession?.clearSelectionRange();
+  setTouchSelectMode(false);
+});
 document.body.append(selBar);
 
 // --- on-screen key bar (sends to the active session) -----------------------

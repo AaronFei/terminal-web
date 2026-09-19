@@ -235,6 +235,28 @@ body {
    keeps it clear of the keyboard on a browser that does not shrink the layout
    viewport for one.
    -------------------------------------------------------------------------- */
+/* Drag handles at the ends of a touch selection, the way a native one has
+   them. A finger is over the text it is choosing, so the drag that made the
+   selection is always approximate — these are how it gets corrected without
+   starting again. Touch only; positioned from web/terminal.ts. */
+.sel-handle {
+  position: absolute;
+  width: 20px;
+  height: 20px;
+  margin-left: -10px;
+  margin-top: -10px;
+  border-radius: 50%;
+  background: #3b8eea;
+  border: 2px solid #fff;
+  box-shadow: 0 1px 5px rgba(0, 0, 0, 0.55);
+  touch-action: none;
+  z-index: 6;
+  display: none;
+}
+.sel-handle.visible {
+  display: block;
+}
+
 #selbar {
   position: fixed;
   left: 50%;
@@ -302,6 +324,9 @@ body {
   position: absolute;
   inset: 0;
   padding: 4px;
+  /* A long press here selects a word (see wordRangeAt); without this iOS puts
+     its own callout up over that, offering to select the same text again. */
+  -webkit-touch-callout: none;
 }
 .term-pane.hidden {
   display: none;
