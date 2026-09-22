@@ -24,33 +24,48 @@ const KEYBAR_HEIGHT = 48; // px when shown
 const MIN_COLS = 20;
 const MIN_ROWS = 5;
 
-// Every tab's tmux window holds two panes — "windows", in the UI's words — and
-// this is which of them you are looking at: the first alone, the second alone,
-// or both. Showing one is tmux's zoom, so the other keeps running out of sight;
-// nothing here closes a pane, only closing the tab does that.
+// A tab can show two terminals: its own session, and a second one beside it.
+// This is which you are looking at — the first alone, the second alone, or both
+// at once. Neither is ever closed by switching; closing the tab closes both.
 type LayoutMode = 'one' | 'two' | 'both';
-// At or above this width both windows go side by side; below it they stack.
-// Half of 80 columns is not a terminal anyone can use.
-const WIDE_COLS = 100;
+// Below this pane width the two go one above the other rather than side by
+// side. Half of 80 columns is not a terminal anyone can use.
+const WIDE_PX = 760;
 
-// A split tab is still ONE xterm grid — the divider is a column of glyphs in
-// it, not a boundary — so xterm's ordinary selection flows straight across it
-// and a drag in one window highlights, and copies, the other one's text on the
-// same rows. xterm has a second selection mode that stays inside the columns
-// you drag, which is exactly what a split needs; these reach it. The value is
-// xterm's SelectionMode.COLUMN, a const enum inlined as 3 at build time, so it
-// cannot be imported.
-const COLUMN_SELECTION_MODE = 3;
+// The second terminal is a SESSION OF ITS OWN, named after the first.
+//
+// It used to be tmux's own split: one window, two panes, drawn into one xterm
+// grid with the divider as a column of glyphs inside it. That divider was
+// content, and tmux only ever sends differences — so once the browser's grid
+// and tmux's model of it disagreed, the border stayed drawn a column or two off
+// on a few rows for as long as the page was open. Everything downstream had to
+// know where that column was: selections had to be clipped to one side of it,
+// which took a block-selection mode reachable only through xterm's private
+// selection service, and every resize had to force a full repaint.
+//
+// Two sessions side by side have no divider to get wrong. Each gets its own
+// pty at its own size, its own selection, and its own clipboard, and the gap
+// between them is a CSS gap. What tmux is asked for is an attach and nothing
+// else.
+//
+// The pairing is in the NAME rather than a tmux option, because options are
+// what a tmux-resurrect restore drops — the same way it drops @twtab — and a
+// name survives it. `work` has `work__b`; nothing else needs storing.
+const MATE_SUFFIX = '__b';
 
-interface SelectionInternals {
-  _activeSelectionMode: number;
-  _model: {
-    selectionStart: [number, number] | undefined;
-    selectionEnd: [number, number] | undefined;
-    selectionStartLength: number;
-  };
-  shouldColumnSelect(event: MouseEvent | KeyboardEvent): boolean;
-  refresh(isLinuxMouseSelection?: boolean): void;
+/** The name of the second session beside `name`. */
+function mateNameOf(name: string): string {
+  return name + MATE_SUFFIX;
+}
+
+/** Whether `name` is the second session of some pair. */
+function isMateName(name: string): boolean {
+  return name.endsWith(MATE_SUFFIX);
+}
+
+/** The first session of the pair `name` is the second of. */
+function primaryNameOf(name: string): string {
+  return name.slice(0, -MATE_SUFFIX.length);
 }
 
 // Touch "select" mode (toggled from the key bar). tmux runs with `mouse on`, so
@@ -384,6 +399,10 @@ class Session {
   // sessions nobody was looking at.
   started = false;
 
+  // Sharing the screen with the other half of a split, rather than having it to
+  // itself. Set by layOutTab; read where a full-width measurement is meant.
+  half = false;
+
   private readonly fitAddon = new FitAddon();
   private ws: WebSocket | null = null;
   private reconnectDelay = MIN_DELAY;
@@ -416,22 +435,21 @@ class Session {
   // is never buffered — only these one-shot sends routed through sendSeq().
   private pendingSeq: string[] = [];
 
-  // Which of this tab's two panes is on screen and how many panes the window
-  // actually has (1 until the second one is made), both as tmux last reported
-  // them — never as what this device last asked for, so a switch made on
-  // another device, or in tmux itself, shows up here too.
-  layout: LayoutMode = 'one';
-  layoutPanes = 1;
-  // 0-based column of the divider while both windows are side by side, else
-  // null. Selections are clipped to the window they start in using this.
-  dividerCol: number | null = null;
-  // The split direction we last asked for, so a resize that crosses WIDE_COLS
-  // can re-lay the split without overriding one arranged by hand.
-  private layoutOrient: 'h' | 'v' | null = null;
+  // Which of this tab's two terminals is on screen. A per-device choice now
+  // that the pair is two sessions rather than one tmux window: a phone and a
+  // desktop looking at the same work want different answers to it.
+  view: LayoutMode = 'one';
+  // The session beside this one, built the first time it is asked for. Null on
+  // a tab that has never been split, and always null on a mate itself.
+  mate: Session | null = null;
+  // True on the second session of a pair. It is an ordinary session in every
+  // other way; this only keeps it out of the tab strip and its own recursion.
+  readonly isMate: boolean;
 
-  constructor(name: string, displayName?: string) {
+  constructor(name: string, displayName?: string, isMate = false) {
     this.name = name;
     this.displayName = displayName?.trim() || name;
+    this.isMate = isMate;
     this.term = new Terminal({
       cursorBlink: true,
       fontFamily:
@@ -548,9 +566,14 @@ class Session {
     });
     this.el.addEventListener('mouseup', copySelection);
 
+    // With two terminals on screen, something has to say which one the key bar,
+    // a paste and an uploaded file are meant for. Touching one is that
+    // something — the same gesture that focuses it for typing.
+    this.el.addEventListener('pointerdown', () => focusPane(this), { capture: true });
+    this.term.textarea?.addEventListener('focus', () => focusPane(this));
+
     this.wireInput();
     this.wireTouchScroll();
-    this.wireSplitSelection();
     this.wireHandles();
   }
 
@@ -618,7 +641,7 @@ class Session {
     if (SEL_DEBUG) {
       this.debugSend(
         'sel-range',
-        `a=${a[0]},${a[1]} b=${b[0]},${b[1]} divider=${this.dividerCol} ` +
+        `a=${a[0]},${a[1]} b=${b[0]},${b[1]} ` +
           `len=${this.term.getSelection().length} has=${this.term.hasSelection() ? 1 : 0}`,
       );
     }
@@ -632,20 +655,14 @@ class Session {
     if (eRow < sRow || (eRow === sRow && eCol < sCol)) {
       [sCol, sRow, eCol, eRow] = [eCol, eRow, sCol, sRow];
     }
-    if (this.dividerCol !== null) {
-      // Split tab: stay inside the window the selection started in.
-      const [first, last] = this.windowCols(this.selA[0]);
-      const lo = Math.max(first, Math.min(last, Math.min(sCol, eCol)));
-      const hi = Math.max(first, Math.min(last, Math.max(sCol, eCol)));
-      this.selectBlock(lo, sRow, hi, eRow);
-    } else {
-      this.useFlowingSelection();
-      const length = (eRow - sRow) * this.term.cols + (eCol - sCol) + 1;
-      try {
-        this.term.select(sCol, sRow, length);
-      } catch {
-        /* out of range after a redraw — leave the selection as it was */
-      }
+    // One terminal, one selection that flows through it. The second session of
+    // a split is a terminal of its own with a selection of its own, so nothing
+    // here has to be kept on one side of a line drawn in the text.
+    const length = (eRow - sRow) * this.term.cols + (eCol - sCol) + 1;
+    try {
+      this.term.select(sCol, sRow, length);
+    } catch {
+      /* out of range after a redraw — leave the selection as it was */
     }
     this.positionHandles(sCol, sRow, eCol, eRow);
     // Whatever made or changed this selection — a drag, a handle, a long press,
@@ -704,17 +721,21 @@ class Session {
   }
 
   /**
-   * Attach this tab: open its socket, which spawns its pty and its tmux client.
-   * Called the first time the tab is shown (see setActive), never before — a
-   * tab you have not looked at costs nothing. Idempotent; a reconnect in flight
-   * counts as started.
+   * Attach this terminal: open its socket, which spawns its pty and its tmux
+   * client. Called the first time it is shown (see setShown), never before — a
+   * tab you have not looked at, and a split you have not asked for, cost
+   * nothing. Idempotent; a reconnect in flight counts as started.
    */
   start(): void {
     if (this.started || this.disposed) return;
     this.started = true;
-    // Adopt the size the panes already have, so the socket opens — and so the
-    // pty spawns — at the size this tab is actually going to be.
-    if (paneCols && paneRows) this.applyDims(paneCols, paneRows);
+    // Open at the size this pane is really going to be, so the pty spawns at it
+    // and tmux never has to resize the window afterwards. One on screen has
+    // just measured itself — setShown fits before it starts — and one that is
+    // not takes the last full-pane measurement.
+    if (this.el.classList.contains('hidden') && paneCols && paneRows) {
+      this.applyDims(paneCols, paneRows);
+    }
     updateTabDot(this);
     this.connect();
   }
@@ -1055,12 +1076,10 @@ class Session {
           selecting = true;
           selMoved = false;
           [anchorCol, anchorRow] = cellAt(t.clientX, t.clientY);
-          this.noteTouchColumn(anchorCol);
           this.clearSelectionRange();
           hideSelectionBar();
           return;
         }
-        this.noteTouchColumn(cellAt(t.clientX, t.clientY)[0]);
         const pressAt = cellAt(t.clientX, t.clientY);
         if (SEL_DEBUG) {
           this.debugSend(
@@ -1085,7 +1104,6 @@ class Session {
           if (!range) return;
           tracking = false;
           pressFired = true;
-          this.noteTouchColumn(pressAt[0]);
           this.setSelectionRange(range[0], range[1]);
           showSelectionBar();
         }, 500);
@@ -1212,7 +1230,9 @@ class Session {
       return;
     }
     this.sendResize();
-    setPaneDims(this.term.cols, this.term.rows);
+    // Only a full-width pane speaks for the tabs that cannot measure themselves.
+    // Half of a split is not the size they will open at.
+    if (!this.half) setPaneDims(this.term.cols, this.term.rows);
   }
 
   /** Adopt the measured pane size and pass it on to the server. */
@@ -1226,38 +1246,6 @@ class Session {
     this.sendResize();
   }
 
-  /**
-   * xterm's selection service. Private API, so everything that uses it checks
-   * what it got and falls back to the ordinary selection: an xterm upgrade that
-   * moves this should cost the split-tab clipping, not the ability to select.
-   */
-  private selection(): SelectionInternals | null {
-    const core = (this.term as unknown as { _core?: { _selectionService?: unknown } })._core;
-    const svc = core?._selectionService as SelectionInternals | undefined;
-    if (!svc || typeof svc.refresh !== 'function' || !svc._model) return null;
-    return svc;
-  }
-
-  /**
-   * Make a drag-selection stay inside one window while the tab is split.
-   *
-   * xterm decides between its two selection modes at mousedown, and refuses the
-   * column one on macOS whenever macOptionClickForcesSelection is set — which is
-   * how Option-drag makes a selection here at all (tmux's mouse mode owns a
-   * plain drag). So the question gets answered here instead: column select
-   * whenever the two windows are side by side, xterm's own rule otherwise.
-   */
-  private wireSplitSelection(): void {
-    const svc = this.selection();
-    if (!svc || typeof svc.shouldColumnSelect !== 'function') return;
-    const xtermsRule = svc.shouldColumnSelect.bind(svc);
-    svc.shouldColumnSelect = (event) => this.dividerCol !== null || xtermsRule(event);
-  }
-
-  // Column of the last touch or click in this pane, so "select everything" and
-  // the split-tab clipping both know which of the two windows you mean.
-  private lastTouchCol = 0;
-
   // The selection as two cells in buffer coordinates, kept so either end can be
   // moved afterwards. A drag on a phone lands where it lands — the finger is
   // over the text it is choosing — so being able to nudge an edge afterwards is
@@ -1270,85 +1258,42 @@ class Session {
   private handleA: HTMLElement | null = null;
   private handleB: HTMLElement | null = null;
 
-  /** Note where a gesture landed; the column decides which window it is in. */
-  noteTouchColumn(col: number): void {
-    this.lastTouchCol = col;
-  }
-
   /**
-   * Select everything on screen — clipped to one window when the tab is split,
-   * the one last touched. This is the copy most often wanted on a phone, where
-   * dragging out an exact range is the hard part.
+   * Select everything on screen. This is the copy most often wanted on a phone,
+   * where dragging out an exact range is the hard part — and with the split
+   * being two terminals, "on screen" needs no qualification any more.
    */
   selectVisible(): boolean {
     const top = this.term.buffer.active.viewportY;
     const bottom = top + this.term.rows - 1;
-    const [first, last] = this.windowCols(this.lastTouchCol);
-    this.setSelectionRange([first, top], [last, bottom]);
+    this.setSelectionRange([0, top], [this.term.cols - 1, bottom]);
     return this.term.hasSelection();
   }
 
-  /** First and last column of the window that `col` falls in. */
-  private windowCols(col: number): [number, number] {
-    const divider = this.dividerCol;
-    if (divider === null) return [0, this.term.cols - 1];
-    return col < divider ? [0, divider - 1] : [divider + 1, this.term.cols - 1];
-  }
-
   /**
-   * Put xterm back in its ordinary flowing selection mode. term.select() sets
-   * the selection but not the mode, so without this a flowing drag made after a
-   * block one would be read back a column at a time — the right cells
-   * highlighted, the wrong text copied.
+   * The second session beside this one, built on first use.
+   *
+   * Nothing is asked of tmux to make it: the socket attaches with
+   * `new-session -A`, which creates the session if it is not there and picks up
+   * whatever was left in it if it is. So the pair survives a reload, a reboot
+   * and a restore, and a tab that is never split never costs a second anything.
    */
-  private useFlowingSelection(): void {
-    const svc = this.selection();
-    if (svc) svc._activeSelectionMode = 0; // SelectionMode.NORMAL
-  }
-
-  /**
-   * Select a block of cells: every row from sRow to eRow, clipped to the
-   * columns sCol..eCol. term.select() only makes the flowing kind, and the
-   * block kind is otherwise reachable only from an Alt-drag, so the selection
-   * model is set here directly. Returns false if xterm's internals have moved,
-   * leaving the caller to fall back.
-   */
-  private selectBlock(sCol: number, sRow: number, eCol: number, eRow: number): boolean {
-    const svc = this.selection();
-    if (!svc) return false;
-    this.term.clearSelection();
-    svc._model.selectionStart = [sCol, sRow];
-    svc._model.selectionStartLength = 0;
-    // The end column is exclusive, and must stay inside the grid.
-    svc._model.selectionEnd = [Math.min(this.term.cols, eCol + 1), eRow];
-    svc._activeSelectionMode = COLUMN_SELECTION_MODE;
-    svc.refresh(true);
-    return true;
-  }
-
-  /** The split direction this pane's width calls for. */
-  private wantOrient(): 'h' | 'v' {
-    return this.term.cols >= WIDE_COLS ? 'h' : 'v';
-  }
-
-  /**
-   * Ask tmux to show one of this tab's windows or both. The second pane is
-   * created on demand; showing a single one only zooms it, so neither window
-   * is ever closed — the server refuses to do that (see src/tmux.ts).
-   */
-  setLayout(mode: LayoutMode): void {
-    const orient = this.wantOrient();
-    this.layoutOrient = orient;
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: 'layout', mode, orient }));
+  ensureMate(): Session | null {
+    if (this.isMate) return null;
+    if (!this.mate) {
+      this.mate = new Session(mateNameOf(this.name), undefined, true);
     }
+    return this.mate;
   }
 
-  /** Restack a side-by-side split (or unstack it) once the width changes. */
-  relayoutForWidth(): void {
-    if (this.layout !== 'both') return;
-    if (this.wantOrient() === this.layoutOrient) return;
-    this.setLayout('both');
+  /** Show one of this tab's terminals, or both. */
+  setView(mode: LayoutMode): void {
+    if (this.isMate) return;
+    this.view = mode;
+    if (mode !== 'one') this.ensureMate();
+    layOutTab(this);
+    saveTabs();
+    refreshLayoutUI();
   }
 
   /** Re-state our size on a freshly opened socket, and re-measure if shown. */
@@ -1361,25 +1306,23 @@ class Session {
     this.term.options.fontSize = px;
   }
 
-  setActive(active: boolean): void {
-    this.el.classList.toggle('hidden', !active);
-    if (!active) this.clearSelectionRange(); // a selection belongs to its tab
-    if (active) {
-      requestAnimationFrame(() => {
-        this.fit();
-        // Attach now, not at page load: this is the first frame where the pane
-        // is laid out, so fit() has the real size to hand the server.
-        this.start();
-        // On touch (phones / iOS PWA), don't auto-focus the terminal when a
-        // session becomes active: focusing xterm's hidden textarea pops up the
-        // soft keyboard, so every tab switch forced the keyboard open and the
-        // user had to dismiss it each time. Skip the programmatic focus on a
-        // coarse pointer — tapping the terminal still focuses it (and raises the
-        // keyboard) when the user actually wants to type. Desktop keeps the
-        // immediate focus so you can type right after switching.
-        if (!TOUCH_DEVICE) this.term.focus();
-      });
+  /**
+   * Show or hide this one terminal. Where it goes on screen is the tab's
+   * business — see layOutTab — because with a split that depends on what the
+   * other one is doing.
+   */
+  setShown(shown: boolean): void {
+    this.el.classList.toggle('hidden', !shown);
+    if (!shown) {
+      this.clearSelectionRange(); // a selection belongs to what is on screen
+      return;
     }
+    requestAnimationFrame(() => {
+      this.fit();
+      // Attach now, not at page load: this is the first frame where this pane
+      // is laid out, so fit() has the real size to hand the server.
+      this.start();
+    });
   }
 
   focus(): void {
@@ -1499,29 +1442,20 @@ class Session {
       }
       if (typeof ev.data === 'string') {
         try {
-          const msg = JSON.parse(ev.data) as {
-            type?: string;
-            mode?: LayoutMode;
-            panes?: number;
-            divider?: number | null;
-          };
+          const msg = JSON.parse(ev.data) as { type?: string };
           // The session was closed (killed) here or on another device: drop the
           // tab and do NOT reconnect — reconnecting would recreate the session
           // via `new-session -A`, resurrecting what was just closed.
           if (msg && msg.type === 'closed') {
+            // A mate closing takes the split down, not the tab: the tab is the
+            // first session and is still perfectly alive.
+            if (this.isMate) {
+              const tab = sessions.find((s) => s.mate === this);
+              if (tab) tab.setView('one');
+              return;
+            }
             recentlyClosed.set(this.name, performance.now());
             removeLocalSession(this);
-          } else if (msg && msg.type === 'layout' && msg.mode) {
-            this.layout = msg.mode;
-            if (typeof msg.panes === 'number') this.layoutPanes = msg.panes;
-            this.dividerCol = typeof msg.divider === 'number' ? msg.divider : null;
-            // First word from tmux about this session: take its current split
-            // as the one we asked for, so a later resize doesn't re-lay a
-            // layout somebody arranged by hand.
-            if (this.layoutOrient === null && msg.mode === 'both') {
-              this.layoutOrient = this.wantOrient();
-            }
-            if (isActive(this)) refreshLayoutUI();
           }
         } catch {
           /* ignore */
@@ -1547,6 +1481,8 @@ class Session {
 
   dispose(): void {
     this.disposed = true;
+    this.mate?.dispose(); // the pair goes together, or the second one is orphaned
+    this.mate = null;
     this.stopPing();
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
@@ -1572,27 +1508,99 @@ class Session {
 // ---------------------------------------------------------------------------
 // Tab / session manager
 // ---------------------------------------------------------------------------
+// The tabs — first sessions only. A mate is reached through its tab's `mate`,
+// never listed here, so everything that walks this list (the strip, the drawer,
+// the cross-device sync, the size broadcast) goes on seeing one thing per tab.
 const sessions: Session[] = [];
+// The tab that is open, and the one of its (up to two) terminals that typing,
+// pasting, copying and an uploaded file are meant for. On an unsplit tab they
+// are the same session; a tab is never open without a focused terminal.
+let activeTab: Session | null = null;
 let activeSession: Session | null = null;
 
+/** Whether this terminal is one of the ones currently on screen. */
 function isActive(s: Session): boolean {
-  return activeSession === s;
+  return s === activeTab || (activeTab?.mate === s && activeTab.view !== 'one');
+}
+
+/** Point typing and the key bar at one of the open tab's terminals. */
+function focusPane(s: Session): void {
+  if (!isActive(s) || activeSession === s) return;
+  activeSession = s;
+  markFocusedPane();
+  reflectActiveStatus();
+}
+
+/** Say which half has the keys, but only while there are two to tell apart. */
+function markFocusedPane(): void {
+  const split = activeTab?.view === 'both';
+  for (const s of [activeTab, activeTab?.mate]) {
+    s?.el.classList.toggle('focused', split && s === activeSession);
+  }
 }
 
 function reflectActiveStatus(): void {
   if (!activeSession || activeSession.connected) hideStatus();
-  // A tab being opened for the first time is attaching, not reconnecting; its
-  // socket opens on the next frame (see setActive).
+  // A terminal being opened for the first time is attaching, not reconnecting;
+  // its socket opens on the next frame (see setShown).
   else if (!activeSession.started) hideStatus();
   else showStatus('reconnecting…');
 }
 
 function updateTabDot(s: Session): void {
+  if (s.isMate) return; // no tab of its own to report on
   s.tabDot?.classList.toggle('connected', s.connected);
   // A tab nobody has opened yet is not "disconnected" — there is nothing wrong
   // with it, it just hasn't attached. Hollow dot rather than a grey one.
   s.tabDot?.classList.toggle('idle', !s.started);
   refreshMobileUI();
+}
+
+/**
+ * Put a tab's terminals on screen: one of them, the other, or both — side by
+ * side when there is room for two usable ones, stacked when there is not.
+ *
+ * The two are placed by hand rather than by a flex container because they are
+ * absolutely positioned siblings of every other tab's pane, all of them filling
+ * #terminal. The gap between them is the whole of the divider: there is no
+ * character anywhere in either grid that has to be kept straight.
+ */
+function layOutTab(tab: Session): void {
+  const mate = tab.view === 'one' ? tab.mate : tab.ensureMate();
+  const both = tab.view === 'both' && !!mate;
+  const vertical = both && termArea.clientWidth < WIDE_PX;
+
+  tab.half = both;
+  if (mate) mate.half = both;
+
+  if (both && mate) {
+    // A 2px gap, showing the background between them.
+    tab.el.style.inset = vertical ? '0 0 calc(50% + 1px) 0' : '0 calc(50% + 1px) 0 0';
+    mate.el.style.inset = vertical ? 'calc(50% + 1px) 0 0 0' : '0 0 0 calc(50% + 1px)';
+  } else {
+    tab.el.style.inset = '';
+    if (mate) mate.el.style.inset = '';
+  }
+  tab.el.classList.toggle('split', both);
+  mate?.el.classList.toggle('split', both);
+
+  const showFirst = tab.view !== 'two';
+  const showSecond = tab.view !== 'one' && !!mate;
+  tab.setShown(showFirst);
+  mate?.setShown(showSecond);
+
+  // Keys follow what is on screen: the terminal that had them if it is still
+  // up, else whichever one is. Being on the open tab is not enough — going from
+  // both halves to the second one alone leaves the first one's grid hidden, and
+  // typing into a hidden terminal is typing into nothing you can see.
+  const onScreen = [showFirst ? tab : null, showSecond ? mate : null].filter(
+    (s): s is Session => !!s,
+  );
+  if (!activeSession || !onScreen.includes(activeSession)) {
+    activeSession = onScreen[0] ?? tab;
+  }
+  markFocusedPane();
+  reflectActiveStatus();
 }
 
 function buildTab(s: Session): void {
@@ -1666,15 +1674,27 @@ function addSession(name: string, makeActive: boolean, displayName?: string): Se
 }
 
 function activateSession(s: Session): void {
-  if (activeSession && activeSession !== s) activeSession.setActive(false);
+  if (activeTab && activeTab !== s) {
+    activeTab.setShown(false);
+    activeTab.mate?.setShown(false);
+  }
+  activeTab = s;
+  // Whatever had the keys belonged to the tab we just left.
   activeSession = s;
-  s.setActive(true);
+  layOutTab(s);
   for (const x of sessions) x.tabEl?.classList.toggle('active', x === s);
   // With many tabs the active one can sit off-screen in the horizontal strip
   // (e.g. after picking it from the drawer); scroll it back into view. inline/
   // block: 'nearest' only scrolls #tabs horizontally, never the page/terminal.
   s.tabEl?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   hideSelectionBar(); // a selection belongs to the tab it was made in
+  // On touch (phones / iOS PWA), don't auto-focus the terminal when a tab
+  // becomes active: focusing xterm's hidden textarea pops up the soft keyboard,
+  // so every tab switch forced it open and the user had to dismiss it each
+  // time. Tapping the terminal still focuses it (and raises the keyboard) when
+  // the user actually wants to type. Desktop keeps the immediate focus so you
+  // can type right after switching.
+  if (!TOUCH_DEVICE) requestAnimationFrame(() => activeSession?.focus());
   reflectActiveStatus();
   refreshMobileUI();
   refreshLayoutUI();
@@ -1742,7 +1762,8 @@ function closeSession(s: Session): void {
   sessions.splice(idx, 1);
   s.tabEl?.remove();
   s.dispose();
-  if (activeSession === s) {
+  if (activeTab === s) {
+    activeTab = null;
     activeSession = null;
     const next = sessions[idx] ?? sessions[idx - 1] ?? null;
     if (next) activateSession(next);
@@ -1874,15 +1895,19 @@ async function promptRenameSession(s: Session): Promise<void> {
 interface SavedTab {
   name: string;
   displayName: string;
+  /** Local only: which of the tab's terminals this device had on screen. */
+  view?: LayoutMode;
 }
 
 function saveTabs(): void {
   try {
     localStorage.setItem(
       'tw.tabs',
-      JSON.stringify(sessions.map((s) => ({ name: s.name, displayName: s.displayName }))),
+      JSON.stringify(
+        sessions.map((s) => ({ name: s.name, displayName: s.displayName, view: s.view })),
+      ),
     );
-    if (activeSession) localStorage.setItem('tw.activeTab', activeSession.name);
+    if (activeTab) localStorage.setItem('tw.activeTab', activeTab.name);
   } catch {
     /* ignore */
   }
@@ -1904,7 +1929,11 @@ function loadTabs(): { tabs: SavedTab[]; active: string | null } {
             typeof item.displayName === 'string' && item.displayName.trim().length
               ? item.displayName
               : item.name;
-          tabs.push({ name: item.name, displayName: dn });
+          const view: LayoutMode | undefined =
+            item.view === 'one' || item.view === 'two' || item.view === 'both'
+              ? item.view
+              : undefined;
+          tabs.push({ name: item.name, displayName: dn, view });
         }
       }
       return { tabs, active };
@@ -2116,7 +2145,8 @@ function removeLocalSession(s: Session): void {
   sessions.splice(idx, 1);
   s.tabEl?.remove();
   s.dispose();
-  if (activeSession === s) {
+  if (activeTab === s) {
+    activeTab = null;
     activeSession = null;
     const next = sessions[idx] ?? sessions[idx - 1] ?? null;
     if (next) activateSession(next);
@@ -2149,6 +2179,11 @@ async function syncFromServer(): Promise<void> {
     // Add tabs opened elsewhere; adopt display-name changes from elsewhere.
     for (const t of serverTabs) {
       if (recentlyClosed.has(t.name)) continue; // don't resurrect a just-closed tab
+      // The second session of a split belongs to its tab, not in the strip. The
+      // server leaves it out of the list; this is the same rule again, for a
+      // server that has not been updated yet. One whose first session is gone
+      // is nobody's second half any more, and shows up as an ordinary tab.
+      if (isMateName(t.name) && byName.has(primaryNameOf(t.name))) continue;
       const existing = sessions.find((s) => s.name === t.name);
       if (!existing) {
         addSession(t.name, false, t.displayName);
@@ -2193,7 +2228,10 @@ async function syncFromServer(): Promise<void> {
 // Layout: key bar height + iOS keyboard offset; fit the active session.
 // ---------------------------------------------------------------------------
 function fitActive(): void {
-  activeSession?.fit();
+  // Both halves of a split, not just the one with the keys: the keyboard coming
+  // up takes rows from each of them.
+  activeTab?.fit();
+  if (activeTab?.view !== 'one') activeTab?.mate?.fit();
 }
 
 // Resizing a tmux window makes it reflow its whole history, so the panes nobody
@@ -2216,9 +2254,9 @@ function setPaneDims(cols: number, rows: number): void {
     for (const s of sessions) {
       if (!isActive(s)) s.applyDims(paneCols, paneRows);
     }
-    // A window that got narrow enough (or wide enough) wants its two panes
+    // A window that got narrow enough (or wide enough) wants its two terminals
     // stacked rather than side by side, or the other way round.
-    activeSession?.relayoutForWidth();
+    if (activeTab?.view === 'both') layOutTab(activeTab);
   }, BG_RESIZE_DELAY);
 }
 
@@ -2380,7 +2418,10 @@ function changeFont(delta: number): void {
     /* ignore */
   }
   savePrefs({ fontSize: currentFont });
-  for (const s of sessions) s.setFont(currentFont);
+  for (const s of sessions) {
+    s.setFont(currentFont);
+    s.mate?.setFont(currentFont); // a second half is not in `sessions`
+  }
   fitActive(); // the cell size changed: re-measure and push the new size to all panes
   activeSession?.focus();
 }
@@ -2419,20 +2460,20 @@ makeButton(controlsEl, 'tb-btn tb-icon', '⟳', 'Restart this session', () => {
   activeSession?.focus();
 });
 
-// Split view. Each tab's tmux window holds two windows (panes): this picks
-// whether you see the first, the second, or both at once. Showing one zooms it
-// and leaves the other running out of sight — neither can be closed, only the
-// whole tab can. The second pane is made the first time it's needed.
+// Split view. A tab can show a second terminal beside its own: this picks
+// whether you see the first, the second, or both at once. Both keep running
+// whichever you are looking at — only closing the tab closes them. The second
+// session is made the first time it is asked for.
 const LAYOUT_BUTTONS: { mode: LayoutMode; label: string; title: string }[] = [
-  { mode: 'one', label: '1', title: 'Window 1 only (window 2 keeps running)' },
-  { mode: 'two', label: '2', title: 'Window 2 only (window 1 keeps running)' },
-  { mode: 'both', label: '⊞', title: 'Show both windows' },
+  { mode: 'one', label: '1', title: 'First terminal only (the second keeps running)' },
+  { mode: 'two', label: '2', title: 'Second terminal only (the first keeps running)' },
+  { mode: 'both', label: '⊞', title: 'Show both terminals' },
 ];
 const layoutButtons = new Map<LayoutMode, HTMLElement>();
 const sheetLayoutButtons = new Map<LayoutMode, HTMLElement>();
 
 function refreshLayoutUI(): void {
-  const mode = activeSession?.layout ?? 'one';
+  const mode = activeTab?.view ?? 'one';
   for (const [m, b] of layoutButtons) b.classList.toggle('active', m === mode);
   for (const [m, b] of sheetLayoutButtons) b.classList.toggle('active', m === mode);
 }
@@ -2443,7 +2484,7 @@ for (const def of LAYOUT_BUTTONS) {
   layoutButtons.set(
     def.mode,
     makeButton(layoutSeg, 'tb-btn', def.label, def.title, () => {
-      activeSession?.setLayout(def.mode);
+      activeTab?.setView(def.mode);
       activeSession?.focus();
     }),
   );
@@ -2769,7 +2810,7 @@ function renderDrawer(): void {
   drawerList.textContent = '';
   for (const s of sessions) {
     const row = document.createElement('div');
-    row.className = 'drawer-row' + (s === activeSession ? ' active' : '');
+    row.className = 'drawer-row' + (s === activeTab ? ' active' : '');
 
     const body = document.createElement('div');
     body.className = 'drawer-body';
@@ -2885,7 +2926,7 @@ for (const def of LAYOUT_BUTTONS) {
   b.title = def.title;
   b.addEventListener('pointerdown', (e) => {
     e.preventDefault();
-    activeSession?.setLayout(def.mode);
+    activeTab?.setView(def.mode);
   });
   splitRow.append(b);
   sheetLayoutButtons.set(def.mode, b);
@@ -2983,7 +3024,7 @@ function closeSheet(): void {
 // Keep the mobile bar's title + connection dot current, and re-render the open
 // drawer when the session list / active tab / connection state changes.
 function refreshMobileUI(): void {
-  const s = activeSession;
+  const s = activeTab;
   mTitleLabel.textContent = s ? s.displayName : '—';
   mTitleDot.classList.toggle('connected', !!s?.connected);
   mKeysBtn.classList.toggle('active', !keybarEl.classList.contains('hidden'));
@@ -3357,7 +3398,16 @@ async function init(): Promise<void> {
   // activating one is what opens its socket, on the frame after its pane has
   // been laid out and measured — so a tab attaches at the size it will really
   // have, and a tab nobody opens costs nothing at all.
-  for (const t of initialTabs) addSession(t.name, false, t.displayName);
+  //
+  // Whether a tab was split is this device's own memory of it — the server has
+  // nothing to say about it, and the phone you also read this on wants its own
+  // answer. Only the tab you open acts on it, so a split tab you never look at
+  // still opens no second session.
+  const cachedViews = new Map(cached.tabs.map((t) => [t.name, t.view]));
+  for (const t of initialTabs) {
+    const s = addSession(t.name, false, t.displayName);
+    s.view = cachedViews.get(t.name) ?? 'one';
+  }
 
   // This device's own last focus first, then what the server remembers for its
   // kind of device — which is what is left after a storage wipe.

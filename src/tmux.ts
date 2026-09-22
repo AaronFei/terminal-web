@@ -1,5 +1,4 @@
 import { execFile, execFileSync } from "node:child_process";
-import type { LayoutMode, LayoutOrient } from "./types.js";
 
 /**
  * Sanitize a requested tmux session name.
@@ -171,156 +170,11 @@ export function listWebTabs(): Promise<WebTab[] | null> {
   });
 }
 
-// ---------------------------------------------------------------------------
-// Split view: a tab's tmux window holds two panes, and the UI shows the first
-// alone, the second alone, or both. "Showing one" is tmux's zoom — the other
-// pane stays alive and keeps running, it just isn't on screen — so nothing in
-// here can ever close a pane. Only closing the tab (kill-session) does that.
-// ---------------------------------------------------------------------------
-
-/** The panes of a session's current window, oldest first, plus its zoom state. */
-interface PaneList {
-  ids: string[];
-  /** Index into `ids` of the pane that has the focus. */
-  activeIndex: number;
-  zoomed: boolean;
-  /** Each pane's top row and rightmost column, both 0-based. */
-  tops: number[];
-  rights: number[];
-}
-
-/** What the UI needs to know about a window's layout. */
-export interface WindowLayout {
-  mode: LayoutMode;
-  /** Panes the window has right now: 1 until the second one is created. */
-  panes: number;
-  /**
-   * 0-based column of the vertical divider when the two windows are side by
-   * side, else null (stacked, zoomed, or a single pane). The browser needs it
-   * because a split tab is still one terminal grid: without knowing where the
-   * divider is, a drag-selection runs straight through it into the other
-   * window's text — see web/terminal.ts.
-   */
-  divider: number | null;
-}
-
-const PANE_FMT = "#{pane_id} #{pane_active} #{window_zoomed_flag} #{pane_top} #{pane_right}";
-
 /** Run tmux; resolve its stdout, or null if it failed. Never throws. */
 function runTmux(args: string[]): Promise<string | null> {
   return new Promise((resolve) => {
     execFile("tmux", args, (err, stdout) => resolve(err ? null : stdout));
   });
-}
-
-async function listPanes(session: string): Promise<PaneList | null> {
-  const out = await runTmux(["list-panes", "-t", session, "-F", PANE_FMT]);
-  if (out === null) return null;
-  const ids: string[] = [];
-  const tops: number[] = [];
-  const rights: number[] = [];
-  let activeIndex = 0;
-  let zoomed = false;
-  for (const line of out.split("\n")) {
-    if (!line.trim()) continue;
-    const [id, active, zoom, top, right] = line.trim().split(" ");
-    if (!id) continue;
-    if (active === "1") activeIndex = ids.length;
-    if (zoom === "1") zoomed = true;
-    ids.push(id);
-    tops.push(Number.parseInt(top ?? "", 10) || 0);
-    rights.push(Number.parseInt(right ?? "", 10) || 0);
-  }
-  return ids.length ? { ids, activeIndex, zoomed, tops, rights } : null;
-}
-
-/** Read the mode a pane list amounts to. */
-function modeOf(list: PaneList): WindowLayout {
-  const panes = list.ids.length;
-  if (panes < 2) return { mode: "one", panes, divider: null };
-  if (list.zoomed) {
-    // Zoomed: one pane fills the window, so there is no divider on screen.
-    return { mode: list.activeIndex === 0 ? "one" : "two", panes, divider: null };
-  }
-  // Side by side when the two panes start on the same row; the divider is the
-  // column just past the first one. Stacked panes have no vertical divider, and
-  // every row belongs to exactly one of them, so nothing needs clipping there.
-  const sideBySide = list.tops[0] === list.tops[1];
-  return { mode: "both", panes, divider: sideBySide ? list.rights[0] + 1 : null };
-}
-
-/** The layout a session's window is in, or null if tmux couldn't be asked. */
-export async function readLayout(session: string): Promise<WindowLayout | null> {
-  const list = await listPanes(session);
-  return list ? modeOf(list) : null;
-}
-
-/**
- * Put a session's window into `mode`, returning the layout it ended up in.
- *
- * The second pane is created on demand, and only when the caller asks for it
- * (`create`) or the mode needs it on screen: splitting takes rows or columns
- * away from a pane that is already running something, and on the alternate
- * screen — which is where Claude Code lives, with no scrollback — whatever no
- * longer fits is destroyed rather than scrolled off. So a plain "show window 1"
- * on a session that never had a second pane leaves it as it is.
- */
-export async function applyLayout(
-  session: string,
-  mode: LayoutMode,
-  orient: LayoutOrient = "h",
-  create = false
-): Promise<WindowLayout | null> {
-  let list = await listPanes(session);
-  if (!list) return null;
-
-  if (list.ids.length < 2 && (create || mode !== "one")) {
-    // -d leaves the focus where it is; -c starts the new pane in the same
-    // directory as the one it was split from, which is nearly always the
-    // project you are working in.
-    await runTmux([
-      "split-window",
-      "-d",
-      orient === "v" ? "-v" : "-h",
-      "-c",
-      "#{pane_current_path}",
-      "-t",
-      session,
-    ]);
-    list = await listPanes(session);
-    if (!list) return null;
-  }
-  if (list.ids.length < 2) return modeOf(list); // single pane: nothing to switch
-
-  const current = modeOf(list);
-  // Already there. Worth checking rather than re-applying: every zoom and
-  // unzoom resizes both panes, and a pane on the alternate screen loses
-  // whatever no longer fits each time.
-  if (current.mode === mode && mode !== "both") return current;
-
-  const args: string[] = [];
-  if (list.zoomed) args.push("resize-pane", "-Z", "-t", list.ids[list.activeIndex], ";");
-  if (mode === "both") {
-    args.push("select-layout", "-t", session, orient === "v" ? "even-vertical" : "even-horizontal");
-  } else {
-    const target = mode === "two" ? list.ids[1] : list.ids[0];
-    args.push("select-pane", "-t", target, ";", "resize-pane", "-Z", "-t", target);
-  }
-  await runTmux(args);
-  return readLayout(session);
-}
-
-/**
- * Seconds since a session was created, or null if it can't be read. Used to
- * tell a session this connection just created (which can be given its second
- * pane for free, nothing is running in it yet) from one that already existed.
- */
-export async function sessionAgeSeconds(session: string): Promise<number | null> {
-  const out = await runTmux(["display", "-p", "-t", session, "#{session_created}"]);
-  if (out === null) return null;
-  const created = Number.parseInt(out.trim(), 10);
-  if (!Number.isInteger(created) || created <= 0) return null;
-  return Math.max(0, Math.floor(Date.now() / 1000) - created);
 }
 
 // ---------------------------------------------------------------------------

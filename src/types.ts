@@ -26,45 +26,11 @@ export interface RestartMessage {
   type: "restart";
 }
 
-/**
- * Which of a tab's two tmux panes is on screen. A tab's window holds two panes
- * ("windows", in the UI's words) and the mode picks what you see: the first
- * alone, the second alone, or both side by side. Showing one is tmux's zoom, so
- * the other pane keeps running untouched — nothing here ever closes a pane.
- */
-export type LayoutMode = "one" | "two" | "both";
-
-/** Which way a split is laid out: "h" = side by side, "v" = stacked. */
-export type LayoutOrient = "h" | "v";
-
-/**
- * Client -> Server: put this session's tmux window into the given mode,
- * creating the second pane if it doesn't exist yet.
- */
-export interface LayoutMessage {
-  type: "layout";
-  mode: LayoutMode;
-  orient?: LayoutOrient;
-}
-
-/**
- * Server -> Client: the layout the session's tmux window is actually in. Sent
- * on attach and after every change, to every client of that session — so the
- * control reflects tmux rather than what this device last asked for, and a
- * switch made on one device shows up on the others.
- */
-export interface LayoutStateMessage {
-  type: "layout";
-  mode: LayoutMode;
-  /** Panes the window has right now: 1 until the second one is created. */
-  panes: number;
-  /**
-   * 0-based column of the vertical divider when both windows are side by side,
-   * else null. A split tab is one terminal grid, so the browser needs this to
-   * keep a drag-selection inside the window it started in.
-   */
-  divider: number | null;
-}
+// A split used to be a tmux one — a window of two panes drawn into a single
+// grid — which took a message each way: one to ask tmux to zoom or unzoom, one
+// to report back which pane was showing and what column its border sat in. The
+// second terminal is its own session now, so a split is something the browser
+// arranges by itself and tmux is only ever asked to attach.
 
 /** Server -> Client: reply to a PingMessage. */
 export interface PongMessage {
@@ -99,19 +65,10 @@ export interface DebugMessage {
 }
 
 /** Any JSON control message a client may send to the server. */
-export type ClientMessage =
-  | ResizeMessage
-  | PingMessage
-  | RestartMessage
-  | LayoutMessage
-  | DebugMessage;
+export type ClientMessage = ResizeMessage | PingMessage | RestartMessage | DebugMessage;
 
 /** Any JSON control message the server may send to a client. */
-export type ServerMessage =
-  | PongMessage
-  | InfoMessage
-  | ClosedMessage
-  | LayoutStateMessage;
+export type ServerMessage = PongMessage | InfoMessage | ClosedMessage;
 
 /** Union of every JSON control message in the protocol. */
 export type ControlMessage = ClientMessage | ServerMessage;
@@ -123,9 +80,6 @@ export function isClientMessage(value: unknown): value is ClientMessage {
   if (v.type === "ping") return true;
   if (v.type === "restart") return true;
   if (v.type === "debug") return typeof v.event === "string";
-  if (v.type === "layout") {
-    return v.mode === "one" || v.mode === "two" || v.mode === "both";
-  }
   if (v.type === "resize") {
     return typeof v.cols === "number" && typeof v.rows === "number";
   }
