@@ -19,13 +19,9 @@ import {
   setWebTabLabel,
   listWebTabs,
   listTmuxSessions,
-  applyLayout,
-  readLayout,
-  sessionAgeSeconds,
   findClientTty,
   refreshClient,
 } from "./tmux.js";
-import type { WindowLayout } from "./tmux.js";
 import type { ServerMessage } from "./types.js";
 import { isClientMessage } from "./types.js";
 import { gateHttp, isAuthed } from "./auth.js";
@@ -88,32 +84,15 @@ function broadcastClosed(name: string, except?: WebSocket): void {
   }
 }
 
-/**
- * Tell every client of `name` — this device included — which of the tab's two
- * panes is on screen, so the control always shows what tmux is actually doing
- * and a switch made on one device lands on the others too.
- */
-function broadcastLayout(name: string, state: WindowLayout): void {
-  const set = sessionClients.get(name);
-  if (!set) return;
-  for (const peer of set) {
-    sendJson(peer, {
-      type: "layout",
-      mode: state.mode,
-      panes: state.panes,
-      divider: state.divider,
-    });
-  }
+// The suffix that makes a session the second half of a split (see web/
+// terminal.ts, where the pairing is explained). Reserved: a session named this
+// way belongs to the tab it is named after and is not one of its own.
+const MATE_SUFFIX = "__b";
+
+/** The second session of the pair, for killing both halves together. */
+function mateNameOf(name: string): string {
+  return name + MATE_SUFFIX;
 }
-
-// Sessions whose second pane is being created right now, so two devices
-// attaching to the same brand-new session can't both split it.
-const splitting = new Set<string>();
-
-// A session younger than this was created by the connection that is asking, so
-// nothing is running in it yet and its second pane is free to make. Anything
-// older keeps whatever layout it has until the user asks for a change.
-const FRESH_SESSION_SECONDS = 10;
 
 // Short hostname of the machine running this server, used to label the page
 // title so several hosts open in different tabs are easy to tell apart. Strip
@@ -430,6 +409,15 @@ async function handleListSessions(res: http.ServerResponse): Promise<void> {
   for (const name of liveSessions) {
     if (!byName.has(name)) byName.set(name, { name, displayName: name });
   }
+  // The second half of a split is not a tab — it belongs to the one it is named
+  // after. Only while that one is here, though: a second half whose first is
+  // gone answers to nobody, and hiding it would strand whatever is running in
+  // it with no way to reach it.
+  for (const name of [...byName.keys()]) {
+    if (name.endsWith(MATE_SUFFIX) && byName.has(name.slice(0, -MATE_SUFFIX.length))) {
+      byName.delete(name);
+    }
+  }
   sendJsonHttp(res, 200, { tabs: [...byName.values()] });
 }
 
@@ -495,6 +483,8 @@ async function handleAdoptSessions(
   for (const raw of names.slice(0, 64)) {
     if (typeof raw !== "string") continue;
     const name = sanitizeSession(raw);
+    // A second half is never adopted as a tab of its own; its tab carries it.
+    if (name.endsWith(MATE_SUFFIX)) continue;
     if (!alive.has(name) || adopted.includes(name)) continue;
     tagWebSession(name);
     adopted.push(name);
@@ -531,16 +521,25 @@ async function handleKillSession(
     return;
   }
   const name = sanitizeSession(obj.name);
-  // Killing a session is the only irreversible thing this server does, so it
-  // says so either way. Logging just the failures left no record of what had
-  // been killed, which is not what you want when sessions have gone missing.
-  console.log(`[api] kill-session "${name}" requested`);
-  broadcastClosed(name);
-  liveSessions.delete(name);
-  execFile("tmux", ["kill-session", "-t", name], (err) => {
-    if (err) console.error(`[api] kill-session "${name}" failed:`, err.message);
-    else console.log(`[api] kill-session "${name}" done`);
-  });
+  // A tab is up to two sessions — its own and, if it was ever split, the one
+  // named after it. Closing the tab closes both; nothing else is touched, and
+  // the second name is derived here rather than taken from the request, so a
+  // caller cannot name a session of its own to take down with it.
+  const names = name.endsWith(MATE_SUFFIX) ? [name] : [name, mateNameOf(name)];
+  for (const target of names) {
+    // Killing a session is the only irreversible thing this server does, so it
+    // says so either way. Logging just the failures left no record of what had
+    // been killed, which is not what you want when sessions have gone missing.
+    console.log(`[api] kill-session "${target}" requested`);
+    broadcastClosed(target);
+    liveSessions.delete(target);
+    execFile("tmux", ["kill-session", "-t", target], (err) => {
+      // A tab that was never split has no second session, and "can't find
+      // session" is the expected answer for it rather than a failure.
+      if (err) console.error(`[api] kill-session "${target}" failed:`, err.message);
+      else console.log(`[api] kill-session "${target}" done`);
+    });
+  }
   sendJsonHttp(res, 200, { ok: true });
 }
 
@@ -854,11 +853,13 @@ const DEFAULT_ROWS = 24;
 const MIN_DIM = 10;
 const MAX_COLS = 1000;
 const MAX_ROWS = 500;
-// At or above this width a split view goes side by side; below it, stacked —
-// half of 80 columns is not a terminal anyone can use.
-const WIDE_COLS = 100;
-// How long after the last resize (or split-view switch) to make tmux repaint.
-// Long enough that dragging a window costs one repaint rather than sixty.
+// How long after the last resize to make tmux repaint. Long enough that
+// dragging a window costs one repaint rather than sixty.
+//
+// The browser's split needs nothing from tmux now — two sessions side by side
+// have no border to draw. This is for a split made INSIDE tmux, which is still
+// one window drawn into one grid: tmux sends only differences, so a grid that
+// drifts from its model keeps a crooked border until something redraws it all.
 const REPAINT_DELAY_MS = 400;
 const HEARTBEAT_MS = 20_000;
 
@@ -1018,8 +1019,13 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
   // Tag the tmux session as a web tab so every device sees it (cross-device
   // sync), and note it as live so /api/sessions lists it without waiting for
   // the tag write. Tagging on every connect also adopts pre-existing sessions.
-  liveSessions.add(session);
-  tagWebSession(session);
+  //
+  // Except the second half of a split: it is reached through the tab it is
+  // named after, and a tab of its own is the one thing it must not become.
+  if (!session.endsWith(MATE_SUFFIX)) {
+    liveSessions.add(session);
+    tagWebSession(session);
+  }
   addSessionClient(session, ws);
 
   let closed = false;
@@ -1041,52 +1047,9 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
         // The tty is stable for the life of this pty, so it is looked up once.
         if (!clientTty) clientTty = await findClientTty(proc.pid);
         if (clientTty && !closed) await refreshClient(clientTty);
-        // A resize moves the divider, and the browser clips its selections to
-        // it, so hand out the column it ended up at.
-        const state = await readLayout(session);
-        if (state && !closed) broadcastLayout(session, state);
       })();
     }, REPAINT_DELAY_MS);
   };
-
-  // Tell this client which of the tab's panes is on screen, and give a session
-  // we just created its second pane straight away — splitting costs nothing
-  // while nothing is running in it, so every tab made from here on has both
-  // views available with only the main one shown. A session that already
-  // existed is left exactly as it is: splitting a pane that is running
-  // something takes rows or columns away from it, and on the alternate screen
-  // those are destroyed rather than scrolled off. Those get their second pane
-  // the first time the user asks for it. Retried while tmux registers the
-  // session, same as tagWebSession.
-  const orient: "h" | "v" = cols >= WIDE_COLS ? "h" : "v";
-  const reportLayout = async (attempt = 0): Promise<void> => {
-    if (closed) return;
-    let state = await readLayout(session);
-    if (!state) {
-      if (attempt < 10) setTimeout(() => void reportLayout(attempt + 1), 150);
-      return;
-    }
-    if (state.panes < 2 && !splitting.has(session)) {
-      const age = await sessionAgeSeconds(session);
-      if (age !== null && age <= FRESH_SESSION_SECONDS) {
-        splitting.add(session);
-        try {
-          state = (await applyLayout(session, "one", orient, true)) ?? state;
-        } finally {
-          splitting.delete(session);
-        }
-        broadcastLayout(session, state);
-        return;
-      }
-    }
-    sendJson(ws, {
-      type: "layout",
-      mode: state.mode,
-      panes: state.panes,
-      divider: state.divider,
-    });
-  };
-  void reportLayout();
 
   // xterm.js auto-answers the terminal-identity queries (DA1 ESC[?..c /
   // DA2 ESC[>..c) tmux sends when a client attaches. tmux 3.6 only *consumes*
@@ -1217,14 +1180,6 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
             console.error("[ws] resize error:", err);
           }
         }
-      } else if (parsed.type === "layout") {
-        // Switch which pane is on screen. Never closes one: showing a single
-        // pane is tmux's zoom, so the other keeps running out of sight.
-        const want = parsed.orient === "v" ? "v" : "h";
-        void applyLayout(session, parsed.mode, want).then((state) => {
-          if (state) broadcastLayout(session, state);
-          scheduleRepaint();
-        });
       } else if (parsed.type === "ping") {
         sendJson(ws, { type: "pong" });
       } else if (parsed.type === "restart") {

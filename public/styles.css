@@ -332,6 +332,21 @@ body {
   display: none;
 }
 
+/* Sharing the screen with the other half of a split. The gap between the two
+   IS the divider — they are separate sessions in separate grids, so there is no
+   character anywhere that has to line up, and nothing to draw crookedly. Where
+   each half sits is set from the script; this is only how they read.
+
+   The ring says which one has the keys, which two terminals need and one does
+   not: without it a keypress goes somewhere you did not choose. */
+.term-pane.split {
+  box-shadow: inset 0 0 0 1px #313134;
+  border-radius: 6px;
+}
+.term-pane.split.focused {
+  box-shadow: inset 0 0 0 1px #3b8eea;
+}
+
 /* drag-an-image-here affordance */
 #terminal.dragging::after {
   content: "Drop image to upload";

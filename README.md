@@ -296,7 +296,8 @@ adds two bars:
 - **Selection bar (touch)** — dragging with **選取** armed no longer copies the
   moment you lift your finger. The selection stays up and a small bar appears
   above the key bar: **複製** copies it, **全選** extends it to the whole screen
-  (to one window of a split tab — the one you last touched), **取消** drops it.
+  (of the terminal you are in — each half of a split has its own), **取消**
+  drops it.
   Drag again to redo the selection before committing to it. **Copy the screen**
   in the `⋯` sheet does the select-all and the copy in one tap.
 - **Bottom key bar** — `Copy Paste Esc Tab Ctrl Alt ← ↑ ↓ → Home End PgUp PgDn
@@ -325,30 +326,45 @@ session (with a live connection dot).
 - Open tabs and the active tab are remembered (localStorage) and restored on
   reload.
 
-### Split view: two windows per tab
+### Split view: two terminals per tab
 
-Every tab's tmux window holds **two panes** — two windows, as the UI calls
-them — and the `1` `2` `⊞` control in the top bar (or **Split view** in the
-phone's ⋯ sheet) picks which you are looking at:
+A tab can show a **second terminal** beside its own, and the `1` `2` `⊞`
+control in the top bar (or **Split view** in the phone's ⋯ sheet) picks which
+you are looking at:
 
 | | |
 |---|---|
-| `1` | window 1 fills the tab; window 2 keeps running out of sight |
-| `2` | window 2 fills the tab; window 1 keeps running out of sight |
-| `⊞` | both at once — side by side on a wide screen, stacked below ~100 columns |
+| `1` | the first terminal fills the tab; the second keeps running out of sight |
+| `2` | the second fills the tab; the first keeps running out of sight |
+| `⊞` | both at once — side by side on a wide screen, stacked below ~760px |
 
-Showing one window is tmux's **zoom**, not a close: the other pane and
-everything running in it are untouched. Neither window can be closed from the
-web UI at all — only closing the tab (`×`) ends them, along with the session.
+The second terminal is **a tmux session of its own**, named after the first:
+`work` has `work__b`. It is created the first time you press `2` or `⊞` — by
+attaching to it, the same `new-session -A` every tab uses, so nothing is asked
+of tmux beyond that — and a tab you never split never makes one. The `__b`
+suffix is reserved: a session named that way is shown as part of the tab it is
+named after rather than as a tab of its own, and closing that tab (`×`) kills
+both halves. Switching between `1`, `2` and `⊞` never closes anything.
 
-New tabs are given their second pane the moment they are created, so both views
-are there from the start with only window 1 shown. A session that already
-existed when this landed keeps its single pane until you press `2` or `⊞`:
-splitting takes rows or columns away from the pane being split, and a program on
-the alternate screen (Claude Code, for one) has no scrollback, so whatever no
-longer fits is destroyed rather than scrolled off. The same is true each time
-you switch — a zoom or unzoom resizes both panes — so the control does nothing
-when you ask for the mode you are already in.
+**Why two sessions and not one tmux split.** It was tmux's own split until
+2026-09-22: one window, two panes, drawn into a single terminal grid with the
+divider as a column of characters inside it. tmux sends only differences, so
+once that grid and tmux's model of it drifted apart the border stayed drawn a
+column or two off on a few rows for as long as the page was open, and
+everything downstream had to know where that column was — selections were
+clipped to one side of it through xterm's private selection service, and every
+resize forced a full repaint. Two sessions have no shared border to get wrong:
+each gets its own pty at its own size, its own selection and its own clipboard,
+and the gap between them is a CSS gap. The ring round one half shows which of
+the two the keyboard, the key bar and an uploaded file are going to.
+
+What this does not cover is a split made **inside** tmux (`Ctrl-b %`, or a
+program that splits itself). That is still one window in one grid, drawn by
+tmux, border and all.
+
+Which halves a tab is showing is remembered **per device** — a phone and a
+desktop looking at the same work want different answers — rather than read back
+from tmux as it was before.
 
 You can also pick the session for a fresh page with the `session` query
 parameter (handy for bookmarks/links):
