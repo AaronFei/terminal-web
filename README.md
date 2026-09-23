@@ -306,9 +306,10 @@ adds two bars:
   modified sequence.
 
 The key bar shows by default on touch devices and is hidden on desktop; your
-choice is remembered (localStorage). Tapping a key keeps focus on the terminal
-so the soft keyboard stays up, and the bar lifts above the iOS keyboard via the
-`visualViewport` API.
+choice is remembered (on the server — see [What the server
+remembers](#what-the-server-remembers)). Tapping a key keeps focus on the
+terminal so the soft keyboard stays up, and the bar lifts above the iOS
+keyboard via the `visualViewport` API.
 
 ---
 
@@ -322,8 +323,30 @@ session (with a live connection dot).
   are terminated). This is *not* the same as disconnecting — see
   [How resume works](#how-resume-works).
 - **`⟳`** restarts the active session: kills it and reconnects into a fresh one.
-- Open tabs and the active tab are remembered (localStorage) and restored on
-  reload.
+- Open tabs and the active tab are remembered **on the server** and restored on
+  reload — see below.
+
+### What the server remembers
+
+Nothing that has to survive lives in the browser alone:
+
+| What | Where it lives |
+|---|---|
+| Which sessions are tabs, and their labels | the tmux sessions themselves (a `@twtab` option) |
+| Font size, key bar shown, the tab you were on | `~/.terminal-web/prefs.json`, via `GET`/`POST /api/prefs` |
+
+`localStorage` still holds a copy of all of it, because it is instant and it is
+what the page can use offline — but it is only a cache. It has to be: embedded
+in the a-fei launcher, this page runs in a cross-origin iframe, and iOS drops
+that storage when the launcher app is closed. Every relaunch then looked like a
+first visit — default font, key bar back to its default, and the first tab
+showing instead of the one that was open. The server's copy is what actually
+restores them now.
+
+Prefs are kept per **device class** (`touch` / `desktop`), so a phone's font
+size is not imposed on a desktop, and each remembers its own last tab. Writes
+are coalesced (400ms) and flushed with `sendBeacon` on `pagehide`, so closing
+the app right after a change still saves it.
 
 ### Split view: two windows per tab
 

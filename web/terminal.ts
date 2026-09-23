@@ -1886,6 +1886,7 @@ function saveTabs(): void {
   } catch {
     /* ignore */
   }
+  if (activeSession) savePrefs({ activeTab: activeSession.name });
 }
 
 function loadTabs(): { tabs: SavedTab[]; active: string | null } {
@@ -1984,6 +1985,100 @@ function renameOnServer(name: string, displayName: string): void {
     /* ignore — local UI already reflects the change */
   });
 }
+
+// ---------------------------------------------------------------------------
+// UI prefs (font size, key bar, which tab was open) live on the server too.
+// localStorage is still written — it is instant and it is what the first paint
+// uses — but it cannot be trusted to still be there: in the iOS launcher this
+// page runs in a cross-origin iframe, and that storage goes away when the app
+// is closed, so every relaunch looked like a first visit. The server copy is
+// what actually restores things. Scoped by device class, so a phone's font
+// size is not imposed on a desktop.
+// ---------------------------------------------------------------------------
+
+const PREF_SCOPE = TOUCH_DEVICE ? 'touch' : 'desktop';
+
+interface UiPrefs {
+  activeTab?: string;
+  fontSize?: number;
+  keybar?: boolean;
+}
+
+async function fetchServerPrefs(timeoutMs = 2500): Promise<UiPrefs | null> {
+  const ctrl = new AbortController();
+  const timer = window.setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(`/api/prefs?scope=${PREF_SCOPE}`, {
+      cache: 'no-store',
+      signal: ctrl.signal,
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { prefs?: unknown };
+    const prefs = data.prefs;
+    if (!prefs || typeof prefs !== 'object') return null;
+    return prefs as UiPrefs;
+  } catch {
+    return null;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+// Nothing is sent until init has read the server's copy and applied it: the
+// values in play before that are boot defaults, and writing those back would
+// overwrite the very prefs we are about to restore.
+let prefsReady = false;
+let pendingPrefs: UiPrefs = {};
+let prefsTimer = 0;
+
+function prefsBody(): string {
+  const body = JSON.stringify({ scope: PREF_SCOPE, ...pendingPrefs });
+  pendingPrefs = {};
+  return body;
+}
+
+function flushPrefs(): void {
+  window.clearTimeout(prefsTimer);
+  if (!Object.keys(pendingPrefs).length) return;
+  void fetch('/api/prefs', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: prefsBody(),
+    keepalive: true,
+  }).catch(() => {
+    /* ignore — a lost pref is a cosmetic loss, and the next change retries */
+  });
+}
+
+// Coalesced: holding A− down, or walking through tabs, is one write.
+function savePrefs(patch: UiPrefs): void {
+  if (!prefsReady) return;
+  Object.assign(pendingPrefs, patch);
+  window.clearTimeout(prefsTimer);
+  prefsTimer = window.setTimeout(flushPrefs, 400);
+}
+
+// Closing the app is exactly when the debounce would still be pending, and on
+// iOS pagehide is the last event we get. sendBeacon survives the teardown that
+// a normal fetch would not.
+window.addEventListener('pagehide', () => {
+  if (!prefsReady || !Object.keys(pendingPrefs).length) return;
+  const body = prefsBody();
+  try {
+    const blob = new Blob([body], { type: 'application/json' });
+    if (navigator.sendBeacon('/api/prefs', blob)) return;
+  } catch {
+    /* fall through to fetch */
+  }
+  void fetch('/api/prefs', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body,
+    keepalive: true,
+  }).catch(() => {
+    /* ignore */
+  });
+});
 
 // Tear down a tab whose session was closed on another device. Unlike
 // closeSession this sends NO kill (the session is already gone server-side) —
@@ -2103,6 +2198,10 @@ function updateKeybarHeight(): void {
   updateKeyboardOffset();
 }
 
+function isKeybarVisible(): boolean {
+  return !keybarEl.classList.contains('hidden');
+}
+
 function setKeybarVisible(visible: boolean): void {
   keybarEl.classList.toggle('hidden', !visible);
   keysBtn.classList.toggle('active', visible);
@@ -2112,6 +2211,7 @@ function setKeybarVisible(visible: boolean): void {
   } catch {
     /* ignore */
   }
+  savePrefs({ keybar: visible });
   requestAnimationFrame(() => {
     updateKeybarHeight();
     fitActive();
@@ -2236,6 +2336,7 @@ function changeFont(delta: number): void {
   } catch {
     /* ignore */
   }
+  savePrefs({ fontSize: currentFont });
   for (const s of sessions) s.setFont(currentFont);
   fitActive(); // the cell size changed: re-measure and push the new size to all panes
   activeSession?.focus();
@@ -3159,6 +3260,9 @@ const cached = loadTabs(); // per-device cache: offline fallback + last focus
 let defaultSessionName = urlSession ?? cached.tabs[0]?.name ?? 'web';
 
 async function init(): Promise<void> {
+  // Both server round-trips start together; the prefs one is awaited further
+  // down, just before the tabs are built.
+  const prefsPromise = fetchServerPrefs();
   // The server's list is authoritative; fall back to the local cache, then to
   // a single default session when both are empty.
   let server = await fetchServerTabs();
@@ -3186,14 +3290,42 @@ async function init(): Promise<void> {
   }
   defaultSessionName = urlSession ?? initialTabs[0]?.name ?? 'web';
 
+  // The stored prefs land before any tab is built, so a pane is created at the
+  // font it will keep and nothing has to be re-fitted afterwards. A device that
+  // still has its localStorage has already applied the same values; this only
+  // differs on one that lost them (see fetchServerPrefs).
+  const prefs = (await prefsPromise) ?? {};
+  if (typeof prefs.fontSize === 'number' && Number.isFinite(prefs.fontSize)) {
+    currentFont = Math.min(MAX_FONT, Math.max(MIN_FONT, Math.round(prefs.fontSize)));
+    updateFontVal();
+    try {
+      // Refill the cache, so a device that does keep its storage paints at the
+      // right size before the server has answered.
+      localStorage.setItem('tw.fontSize', String(currentFont));
+    } catch {
+      /* ignore */
+    }
+  }
+  if (typeof prefs.keybar === 'boolean' && prefs.keybar !== isKeybarVisible()) {
+    setKeybarVisible(prefs.keybar);
+  }
+
   // Build every tab (creation order is tab order). None of them attaches here:
   // activating one is what opens its socket, on the frame after its pane has
   // been laid out and measured — so a tab attaches at the size it will really
   // have, and a tab nobody opens costs nothing at all.
   for (const t of initialTabs) addSession(t.name, false, t.displayName);
 
-  const activeName = urlSession ?? cached.active ?? initialTabs[0].name;
-  activateSession(sessions.find((s) => s.name === activeName) ?? sessions[0]);
+  // This device's own last focus first, then what the server remembers for its
+  // kind of device — which is what is left after a storage wipe.
+  const wanted = [urlSession, cached.active, prefs.activeTab].filter(
+    (n): n is string => typeof n === 'string' && n.length > 0,
+  );
+  const active = wanted.map((n) => sessions.find((s) => s.name === n)).find(Boolean);
+  activateSession(active ?? sessions[0]);
+
+  // Everything restored: from here on, changes are the user's and get saved.
+  prefsReady = true;
 }
 
 void init();

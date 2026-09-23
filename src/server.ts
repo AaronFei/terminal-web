@@ -527,6 +527,114 @@ async function handleKillSession(
   sendJsonHttp(res, 200, { ok: true });
 }
 
+// ---------------------------------------------------------------------------
+// UI prefs (GET/POST /api/prefs). The browser used to be the only place these
+// lived, and localStorage is not somewhere they survive: in the iOS launcher
+// the terminal runs in a cross-origin iframe whose storage goes away with the
+// app, so every relaunch came back at the default font, with the key bar reset
+// and the first tab showing instead of the one that was open. They live here
+// now, next to the tab list, keyed by device class so a phone's font size is
+// not imposed on a desktop. The browser still caches them — this is what fills
+// the cache back in.
+// ---------------------------------------------------------------------------
+
+const PREFS_FILE = path.join(os.homedir(), ".terminal-web", "prefs.json");
+
+interface UiPrefs {
+  /** Tab (tmux session) this device class last had focused. */
+  activeTab?: string;
+  /** Terminal font size in px. */
+  fontSize?: number;
+  /** Whether the on-screen key bar is shown. */
+  keybar?: boolean;
+}
+
+/** device class ("touch" | "desktop") -> that class's prefs. */
+type PrefsByScope = Record<string, UiPrefs>;
+
+let prefsCache: PrefsByScope | null = null;
+// Writes are chained rather than fired in parallel, so two quick POSTs can't
+// race each other into the file with one of them holding stale state.
+let prefsWrite: Promise<void> = Promise.resolve();
+
+function prefScope(raw: unknown): string | null {
+  return raw === "touch" || raw === "desktop" ? raw : null;
+}
+
+async function loadPrefs(): Promise<PrefsByScope> {
+  if (prefsCache) return prefsCache;
+  try {
+    const parsed: unknown = JSON.parse(await fsp.readFile(PREFS_FILE, "utf8"));
+    prefsCache =
+      parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as PrefsByScope)
+        : {};
+  } catch {
+    prefsCache = {}; // missing or unreadable: prefs are a convenience, not state
+  }
+  return prefsCache;
+}
+
+/** Write via a temp file + rename, so a crash can never truncate the real one. */
+async function writePrefs(data: PrefsByScope): Promise<void> {
+  await fsp.mkdir(path.dirname(PREFS_FILE), { recursive: true });
+  const tmp = `${PREFS_FILE}.${process.pid}.tmp`;
+  await fsp.writeFile(tmp, JSON.stringify(data, null, 2), "utf8");
+  await fsp.rename(tmp, PREFS_FILE);
+}
+
+async function handleGetPrefs(
+  res: http.ServerResponse,
+  scopeRaw: string | null
+): Promise<void> {
+  const scope = prefScope(scopeRaw);
+  if (!scope) {
+    sendJsonHttp(res, 400, { error: "bad scope" });
+    return;
+  }
+  const all = await loadPrefs();
+  sendJsonHttp(res, 200, { prefs: all[scope] ?? {} });
+}
+
+/** Merge a partial update into one scope's prefs ({ scope, ...fields }). */
+async function handleSetPrefs(
+  req: http.IncomingMessage,
+  res: http.ServerResponse
+): Promise<void> {
+  let body: unknown;
+  try {
+    body = JSON.parse((await readBody(req, 2048)).toString("utf8"));
+  } catch {
+    sendJsonHttp(res, 400, { error: "invalid body" });
+    return;
+  }
+  const obj = body as { scope?: unknown } & UiPrefs;
+  const scope = prefScope(obj?.scope);
+  if (!scope) {
+    sendJsonHttp(res, 400, { error: "bad scope" });
+    return;
+  }
+  const all = await loadPrefs();
+  const next: UiPrefs = { ...(all[scope] ?? {}) };
+  // Only the fields actually present change; everything else is left alone, so
+  // a client that knows about one pref can't blank the ones it doesn't.
+  if (typeof obj.activeTab === "string" && obj.activeTab.trim()) {
+    next.activeTab = sanitizeSession(obj.activeTab);
+  }
+  if (typeof obj.fontSize === "number" && Number.isFinite(obj.fontSize)) {
+    next.fontSize = Math.min(28, Math.max(8, Math.round(obj.fontSize)));
+  }
+  if (typeof obj.keybar === "boolean") next.keybar = obj.keybar;
+  all[scope] = next;
+  prefsCache = all;
+  prefsWrite = prefsWrite
+    .then(() => writePrefs(all))
+    .catch((err: Error) => {
+      console.error("[prefs] write failed:", err.message);
+    });
+  sendJsonHttp(res, 200, { ok: true });
+}
+
 // Matches the files we generate (clip-<ISO-stamp>-<rand>...), regardless of the
 // original name/extension appended after, so pruning only ever touches ours.
 const UPLOAD_NAME_RE = /^clip-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}-[a-z0-9]/i;
@@ -769,6 +877,16 @@ const server = http.createServer((req, res) => {
 
       if (method === "POST" && requestUrl.pathname === "/api/sessions/adopt") {
         await handleAdoptSessions(req, res);
+        return;
+      }
+
+      if (method === "GET" && requestUrl.pathname === "/api/prefs") {
+        await handleGetPrefs(res, requestUrl.searchParams.get("scope"));
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/prefs") {
+        await handleSetPrefs(req, res);
         return;
       }
 
