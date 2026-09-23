@@ -94,6 +94,84 @@ function mateNameOf(name: string): string {
   return name + MATE_SUFFIX;
 }
 
+// ---------------------------------------------------------------------------
+// Closed tabs. Telling the clients attached to a session that it was closed
+// (broadcastClosed) only reaches the ones connected at that moment. A page on a
+// device that was asleep — an iPad in a drawer, a phone in a pocket — still has
+// the tab, and when it wakes it reconnects every socket it had open. Attaching
+// is `new-session -A`, so each of those reconnects quietly created the session
+// again, empty, and tagged it as a tab on every device: close a tab here, and
+// an hour later it is back.
+//
+// So the server remembers what was closed, and a connect to one of those names
+// that does not say it means to create the session is answered with "closed"
+// instead — the same message a connected client gets, so the stale page drops
+// the tab the same way. Kept on disk, because a deploy restarts this server and
+// a device can sleep for days.
+// ---------------------------------------------------------------------------
+
+const CLOSED_FILE = path.join(os.homedir(), ".terminal-web", "closed.json");
+/** How long a closed name is refused to a stale page. */
+const CLOSED_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** name -> when it was closed (epoch ms). */
+let closedTabs: Map<string, number> = loadClosedTabs();
+let closedWrite: Promise<void> = Promise.resolve();
+
+function loadClosedTabs(): Map<string, number> {
+  try {
+    const parsed: unknown = JSON.parse(fs.readFileSync(CLOSED_FILE, "utf8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const now = Date.now();
+      return new Map(
+        Object.entries(parsed as Record<string, unknown>).filter(
+          (e): e is [string, number] => typeof e[1] === "number" && now - e[1] < CLOSED_TTL_MS
+        )
+      );
+    }
+  } catch {
+    /* missing or unreadable: nothing remembered */
+  }
+  return new Map();
+}
+
+function saveClosedTabs(): void {
+  const data = JSON.stringify(Object.fromEntries(closedTabs), null, 2);
+  // Chained, so two quick closes cannot land out of order.
+  closedWrite = closedWrite
+    .then(async () => {
+      await fsp.mkdir(path.dirname(CLOSED_FILE), { recursive: true });
+      const tmp = `${CLOSED_FILE}.${process.pid}.tmp`;
+      await fsp.writeFile(tmp, data, "utf8");
+      await fsp.rename(tmp, CLOSED_FILE);
+    })
+    .catch((err: Error) => {
+      console.error("[closed] write failed:", err.message);
+    });
+}
+
+function markClosed(names: string[]): void {
+  const now = Date.now();
+  for (const n of names) closedTabs.set(n, now);
+  saveClosedTabs();
+}
+
+/** A tab made on purpose under a closed name: it, and its second half, are open again. */
+function clearClosed(name: string): void {
+  const base = name.endsWith(MATE_SUFFIX) ? name.slice(0, -MATE_SUFFIX.length) : name;
+  let changed = false;
+  for (const n of [base, mateNameOf(base)]) changed = closedTabs.delete(n) || changed;
+  if (changed) saveClosedTabs();
+}
+
+function isClosed(name: string): boolean {
+  const at = closedTabs.get(name);
+  if (at === undefined) return false;
+  if (Date.now() - at < CLOSED_TTL_MS) return true;
+  closedTabs.delete(name);
+  return false;
+}
+
 // Short hostname of the machine running this server, used to label the page
 // title so several hosts open in different tabs are easy to tell apart. Strip
 // any DNS domain suffix (e.g. "nuc.local" -> "nuc").
@@ -534,6 +612,8 @@ async function handleKillSession(
     broadcastClosed(target);
     liveSessions.delete(target);
   }
+  // Before anything that waits: a sleeping page could wake in the meantime.
+  markClosed(names);
   // Save first, and wait for it: this command has taken whole tmux servers down
   // with it (see snapshotBeforeKill). The tab is already gone in the browser —
   // it does not wait on this reply — so the second or two costs nothing. One
@@ -1083,11 +1163,13 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
   // window steady: it used to shrink to 80x24 on every connect and reconnect,
   // for a beat, for every client attached to that session.
   let requested: string | null = null;
+  let create = false;
   let cols = DEFAULT_COLS;
   let rows = DEFAULT_ROWS;
   try {
     const u = new URL(req.url ?? "/ws", "http://localhost");
     requested = u.searchParams.get("session");
+    create = u.searchParams.get("create") === "1";
     cols = parseDim(u.searchParams.get("cols"), DEFAULT_COLS, MAX_COLS);
     rows = parseDim(u.searchParams.get("rows"), DEFAULT_ROWS, MAX_ROWS);
   } catch {
@@ -1115,6 +1197,34 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
     return;
   }
 
+  if (create) {
+    clearClosed(session);
+  } else if (isClosed(session)) {
+    // Closed on purpose, and this connect is not asking for it back — a page
+    // that slept through the close, reconnecting what it had. Unless the
+    // session is somehow there anyway (made from a shell, say), it gets told
+    // the tab is closed rather than a fresh empty session under the old name.
+    void listTmuxSessions().then((names) => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      if (names?.includes(session)) {
+        attachSession(ws, session, cols, rows);
+        return;
+      }
+      console.log(`[ws] refused "${session}": closed, and not asked to create it`);
+      sendJson(ws, { type: "closed" });
+      try {
+        ws.close(1000, "closed");
+      } catch {
+        /* ignore */
+      }
+    });
+    return;
+  }
+  attachSession(ws, session, cols, rows);
+});
+
+/** Spawn the tmux client for `session` and wire it to this socket. */
+function attachSession(ws: LiveSocket, session: string, cols: number, rows: number): void {
   let proc: pty.IPty;
   try {
     proc = pty.spawn("tmux", tmuxArgs(session, config.tmuxConfPath), {
@@ -1353,7 +1463,7 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
     cleanup();
     console.log(`[ws] disconnected from "${session}" (tmux session persists)`);
   });
-});
+}
 
 wss.on("error", (err) => {
   console.error("[wss] server error:", err);

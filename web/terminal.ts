@@ -409,6 +409,12 @@ class Session {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private disposed = false;
+  // Until when a connect may create this session if it is not there. The
+  // server refuses to bring back a closed tab for a connect that does not ask
+  // (see closedTabs in server.ts) — only a tab made on purpose asks, and only
+  // for its first attach, so a page that sleeps for a day and wakes up cannot
+  // pass for one.
+  private createUntil = 0;
 
   // IME double-input guard (order-independent, content-scoped).
   private lastData = '';
@@ -1282,8 +1288,14 @@ class Session {
     if (this.isMate) return null;
     if (!this.mate) {
       this.mate = new Session(mateNameOf(this.name), undefined, true);
+      this.mate.intendCreate(); // made by pressing 2 or ⊞, or a split this device kept
     }
     return this.mate;
+  }
+
+  /** This session is being made on purpose: its first attach may create it. */
+  intendCreate(): void {
+    this.createUntil = performance.now() + 60_000;
   }
 
   /** Show one of this tab's terminals, or both. */
@@ -1393,13 +1405,15 @@ class Session {
     // on the alternate screen loses everything that no longer fits.
     const url =
       `${wsProto}://${window.location.host}/ws?session=${encodeURIComponent(this.name)}` +
-      `&cols=${this.term.cols}&rows=${this.term.rows}`;
+      `&cols=${this.term.cols}&rows=${this.term.rows}` +
+      (performance.now() < this.createUntil ? '&create=1' : '');
     const socket = new WebSocket(url);
     socket.binaryType = 'arraybuffer';
     this.ws = socket;
 
     socket.onopen = () => {
       this.reconnectDelay = MIN_DELAY;
+      this.createUntil = 0; // it exists now; a later reconnect is only a reconnect
       if (IME_DEBUG) {
         this.debugSend(
           'env',
@@ -1451,7 +1465,12 @@ class Session {
             // first session and is still perfectly alive.
             if (this.isMate) {
               const tab = sessions.find((s) => s.mate === this);
-              if (tab) tab.setView('one');
+              if (tab) {
+                tab.setView('one');
+                tab.mate = null; // pressing 2 or ⊞ again makes a new one
+                if (activeSession === this) activeSession = tab;
+              }
+              this.dispose(); // or its socket's close would reconnect it
               return;
             }
             recentlyClosed.set(this.name, performance.now());
@@ -1752,6 +1771,16 @@ function confirmCloseSession(s: Session): void {
   });
 }
 
+/**
+ * The tab that appears when the last one goes — made on purpose, so it may
+ * create its session. Never under a name that was just closed, though: that is
+ * how a page waking up with only a closed tab would bring it straight back.
+ */
+function addFallbackTab(): void {
+  const name = recentlyClosed.has(defaultSessionName) ? nextSessionName() : defaultSessionName;
+  addSession(name, true).intendCreate();
+}
+
 function closeSession(s: Session): void {
   const idx = sessions.indexOf(s);
   if (idx < 0) return;
@@ -1768,7 +1797,7 @@ function closeSession(s: Session): void {
     const next = sessions[idx] ?? sessions[idx - 1] ?? null;
     if (next) activateSession(next);
   }
-  if (sessions.length === 0) addSession(defaultSessionName, true);
+  if (sessions.length === 0) addFallbackTab();
   refreshMobileUI();
   saveTabs();
 }
@@ -1862,7 +1891,7 @@ async function promptAddSession(): Promise<void> {
     okText: 'Create',
   });
   if (raw === null) return; // cancelled
-  addSession(sanitizeName(raw) ?? suggestion, true);
+  addSession(sanitizeName(raw) ?? suggestion, true).intendCreate();
 }
 
 // Update only the tab's display label; the tmux session name (s.name) is left
@@ -2215,9 +2244,12 @@ async function syncFromServer(): Promise<void> {
       const listed = new Set(after.map((t) => t.name));
       missing = missing.filter((s) => !listed.has(s.name));
     }
-    for (const s of missing) removeLocalSession(s);
+    for (const s of missing) {
+      recentlyClosed.set(s.name, performance.now());
+      removeLocalSession(s);
+    }
 
-    if (sessions.length === 0) addSession(defaultSessionName, true);
+    if (sessions.length === 0) addFallbackTab();
     saveTabs();
   } finally {
     syncing = false;
@@ -3407,6 +3439,9 @@ async function init(): Promise<void> {
   for (const t of initialTabs) {
     const s = addSession(t.name, false, t.displayName);
     s.view = cachedViews.get(t.name) ?? 'one';
+    // Asked for by name in the URL, or the default on a first visit: both are
+    // tabs being made, not remembered, so they may create their session.
+    if (t.name === urlSession || (!server?.length && !cached.tabs.length)) s.intendCreate();
   }
 
   // This device's own last focus first, then what the server remembers for its
