@@ -1622,6 +1622,59 @@ function layOutTab(tab: Session): void {
   reflectActiveStatus();
 }
 
+// How far a finger may move between landing and lifting and still count as a
+// tap. Past it, it was a swipe — scrolling a list — and picks nothing.
+const TAP_SLOP_PX = 10;
+
+/**
+ * Run `fn` on a tap, and never on a swipe that starts on `el`.
+ *
+ * Acting on pointerdown (what the session drawer used to do) picks whatever the
+ * finger lands on, and its preventDefault stops the list from scrolling at all:
+ * trying to scroll to a session selected the first one you touched. Waiting for
+ * pointerup is not enough by itself either — a browser does not always turn a
+ * short drag into a scroll (and fire pointercancel) before the finger lifts. So
+ * a tap is a lift close to where it landed, with `scroller`, if given, not
+ * having moved in between.
+ */
+function onTap(el: HTMLElement, fn: (e: PointerEvent) => void, scroller?: HTMLElement): void {
+  let start: { id: number; x: number; y: number; left: number; top: number } | null = null;
+  el.addEventListener('pointerdown', (e) => {
+    start = {
+      id: e.pointerId,
+      x: e.clientX,
+      y: e.clientY,
+      left: scroller?.scrollLeft ?? 0,
+      top: scroller?.scrollTop ?? 0,
+    };
+  });
+  el.addEventListener('pointercancel', () => {
+    start = null;
+  });
+  el.addEventListener('pointerup', (e) => {
+    const s0 = start;
+    start = null;
+    if (!s0 || s0.id !== e.pointerId) return;
+    if (Math.hypot(e.clientX - s0.x, e.clientY - s0.y) > TAP_SLOP_PX) return;
+    if (scroller && (scroller.scrollLeft !== s0.left || scroller.scrollTop !== s0.top)) return;
+    tapped = true;
+    fn(e);
+  });
+  // A tap that closes the drawer uncovers the terminal, and the mouse events a
+  // browser synthesizes after a touch would land on it — focusing it, which on
+  // a phone raises the keyboard. touchend comes after pointerup and cancelling
+  // it cancels those; it is too late to affect a scroll, which is over.
+  let tapped = false;
+  el.addEventListener(
+    'touchend',
+    (e) => {
+      if (tapped && e.cancelable) e.preventDefault();
+      tapped = false;
+    },
+    { passive: false },
+  );
+}
+
 function buildTab(s: Session): void {
   const tab = document.createElement('div');
   tab.className = 'tab';
@@ -1637,15 +1690,14 @@ function buildTab(s: Session): void {
   close.title = 'Close tab & kill session';
   tab.append(dot, label, close);
 
-  // Single tap activates; a second tap within 350ms renames. Activate on
-  // pointerUP (not down) and WITHOUT preventDefault so a sideways drag can scroll
-  // the tab strip: a drag that the browser turns into a scroll fires
-  // pointercancel, never pointerup, so reaching pointerup means a genuine tap.
-  // (The old pointerdown+preventDefault cancelled the pan, making the strip
-  // unscrollable once your finger landed on a tab.) touch-action:manipulation on
-  // .tab keeps the strip pannable and drops the double-tap-to-zoom.
+  // Single tap activates; a second tap within 350ms renames. On a tap only (see
+  // onTap), and WITHOUT preventDefault, so a sideways drag scrolls the strip
+  // instead of picking the tab it started on. (The old pointerdown+preventDefault
+  // cancelled the pan, making the strip unscrollable once your finger landed on
+  // a tab.) touch-action:manipulation on .tab keeps the strip pannable and drops
+  // the double-tap-to-zoom.
   let lastTap = 0;
-  tab.addEventListener('pointerup', (e) => {
+  onTap(tab, (e) => {
     if (e.target === close) return; // the × has its own handler
     const now = performance.now();
     if (now - lastTap < 350) {
@@ -1655,12 +1707,11 @@ function buildTab(s: Session): void {
     }
     lastTap = now;
     activateSession(s);
-  });
-  close.addEventListener('pointerdown', (e) => {
-    e.preventDefault();
+  }, tabsEl);
+  onTap(close, (e) => {
     e.stopPropagation();
     confirmCloseSession(s);
-  });
+  }, tabsEl);
 
   s.tabEl = tab;
   s.tabLabel = label;
@@ -2852,35 +2903,32 @@ function renderDrawer(): void {
     name.className = 'drawer-name';
     name.textContent = s.displayName;
     body.append(dot, name);
-    body.addEventListener('pointerdown', (e) => {
-      e.preventDefault();
+    // Taps only: this list scrolls, and a swipe through it must not pick the
+    // session it started on (it used to, on pointerdown).
+    onTap(body, () => {
       activateSession(s);
       closeDrawer();
-    });
+    }, drawer);
 
     const rename = document.createElement('button');
     rename.className = 'drawer-act';
     rename.type = 'button';
     rename.textContent = '✎';
     rename.title = 'Rename tab';
-    rename.addEventListener('pointerdown', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
+    onTap(rename, () => {
       promptRenameSession(s);
       renderDrawer();
-    });
+    }, drawer);
 
     const close = document.createElement('button');
     close.className = 'drawer-act danger';
     close.type = 'button';
     close.textContent = '×';
     close.title = 'Close tab & kill session';
-    close.addEventListener('pointerdown', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
+    onTap(close, () => {
       closeDrawer();
       confirmCloseSession(s);
-    });
+    }, drawer);
 
     row.append(body, rename, close);
     drawerList.append(row);
