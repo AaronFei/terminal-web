@@ -520,6 +520,10 @@ async function handleKillSession(
   console.log(`[api] kill-session "${name}" requested`);
   broadcastClosed(name);
   liveSessions.delete(name);
+  // Save first, and wait for it: this command has taken whole tmux servers down
+  // with it (see snapshotBeforeKill). The tab is already gone in the browser —
+  // it does not wait on this reply — so the second or two costs nothing.
+  await snapshotBeforeKill(name);
   execFile("tmux", ["kill-session", "-t", name], (err) => {
     if (err) console.error(`[api] kill-session "${name}" failed:`, err.message);
     else console.log(`[api] kill-session "${name}" done`);
@@ -1332,14 +1336,20 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
         // Kill this session's tmux session. The attached pty (tmux client)
         // then exits, the ws closes, and the client reconnects into a fresh
         // session via `new-session -A`.
-        execFile("tmux", ["kill-session", "-t", session], (err) => {
-          if (err) {
-            console.error(
-              `[ws] restart: kill-session "${session}" failed:`,
-              err.message
-            );
-            sendJson(ws, { type: "info", message: "Restart failed." });
-          }
+        //
+        // Same kill, same insurance as closing a tab: restarting one session is
+        // not meant to cost the other twelve, which is what it does on the day
+        // this command takes the server with it.
+        void snapshotBeforeKill(session).then(() => {
+          execFile("tmux", ["kill-session", "-t", session], (err) => {
+            if (err) {
+              console.error(
+                `[ws] restart: kill-session "${session}" failed:`,
+                err.message
+              );
+              sendJson(ws, { type: "info", message: "Restart failed." });
+            }
+          });
         });
       } else if (parsed.type === "debug") {
         console.error(
@@ -1538,7 +1548,13 @@ async function readSnapshot(): Promise<{ panes: number; sessions: number; ageMs:
 // truth for this long, it IS the truth and snapshots resume.
 const COLLAPSE_GRACE_MS = 2 * 60 * 60_000;
 
-async function snapshotSessions(): Promise<void> {
+/**
+ * How long to wait for a save before going ahead without it. The snapshot is
+ * insurance, not a gate: whatever the user asked for still has to happen.
+ */
+const SNAPSHOT_TIMEOUT_MS = 10_000;
+
+async function snapshotSessions(reason = "interval"): Promise<void> {
   try {
     await fsp.access(RESURRECT_SAVE, fs.constants.X_OK);
   } catch {
@@ -1565,25 +1581,63 @@ async function snapshotSessions(): Promise<void> {
   }
   // buildChildEnv for the locale: resurrect's format is tab-separated and tmux
   // only emits real tabs under a UTF-8 locale (see readSnapshot).
-  execFile(RESURRECT_SAVE, ["quiet"], { env: buildChildEnv() }, (err) => {
-    if (err) {
-      console.error("[snapshot] resurrect save failed:", err.message);
-      return;
-    }
-    void readSnapshot().then((snap) => {
-      const panes = snap?.panes ?? null;
-      if (panes === null) {
-        console.error("[snapshot] saved, but the snapshot could not be read back");
-      } else if (panes === 0) {
-        console.error(
-          `[snapshot] SAVED NOTHING: ${names.length} session(s) live but the ` +
-            "snapshot holds no panes — it cannot be restored from"
-        );
-      } else {
-        console.log(`[snapshot] saved ${panes} pane(s) across ${names.length} session(s)`);
+  //
+  // Awaited, rather than left to finish on its own, because a caller about to
+  // kill a session needs the save to have happened BEFORE it does — see
+  // snapshotBeforeKill.
+  const saved = await new Promise<boolean>((resolve) => {
+    execFile(
+      RESURRECT_SAVE,
+      ["quiet"],
+      { env: buildChildEnv(), timeout: SNAPSHOT_TIMEOUT_MS },
+      (err) => {
+        if (err) {
+          console.error(`[snapshot] resurrect save failed (${reason}):`, err.message);
+          resolve(false);
+          return;
+        }
+        resolve(true);
       }
-    });
+    );
   });
+  if (!saved) return;
+  const snap = await readSnapshot();
+  const panes = snap?.panes ?? null;
+  if (panes === null) {
+    console.error("[snapshot] saved, but the snapshot could not be read back");
+  } else if (panes === 0) {
+    console.error(
+      `[snapshot] SAVED NOTHING: ${names.length} session(s) live but the ` +
+        "snapshot holds no panes — it cannot be restored from"
+    );
+  } else {
+    console.log(
+      `[snapshot] saved ${panes} pane(s) across ${names.length} session(s) (${reason})`
+    );
+  }
+}
+
+/**
+ * Save before killing anything, and wait for it.
+ *
+ * `tmux kill-session` is the one command here that has been observed to take a
+ * whole tmux server with it: on the NUC (tmux 3.4) every server death in a
+ * fortnight — four of them — landed within a second of one, each time with the
+ * kill itself reporting "server exited unexpectedly", and each time every other
+ * session went with it. Reproducing it on a scratch server never worked, so
+ * what is treated here is the damage rather than the cause: a snapshot taken
+ * in the moment before means a death costs seconds instead of the up-to-five
+ * minutes back to the last interval save, whatever it turns out to be.
+ *
+ * Never fatal, and bounded by SNAPSHOT_TIMEOUT_MS: the kill the user asked for
+ * happens either way.
+ */
+async function snapshotBeforeKill(name: string): Promise<void> {
+  try {
+    await snapshotSessions(`before killing "${name}"`);
+  } catch (err) {
+    console.error("[snapshot] pre-kill save threw:", err);
+  }
 }
 
 setTimeout(() => void snapshotSessions(), FIRST_SNAPSHOT_MS).unref();
