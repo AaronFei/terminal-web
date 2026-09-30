@@ -470,6 +470,9 @@ class Session {
     });
     this.term.loadAddon(this.fitAddon);
     this.term.loadAddon(new WebLinksAddon());
+    this.term.onRender(() => {
+      if (keyboardUp && this === activeSession) scheduleKeyboardOffset();
+    });
 
     this.el = document.createElement('div');
     this.el.className = 'term-pane hidden';
@@ -1239,6 +1242,21 @@ class Session {
     // Only a full-width pane speaks for the tabs that cannot measure themselves.
     // Half of a split is not the size they will open at.
     if (!this.half) setPaneDims(this.term.cols, this.term.rows);
+  }
+
+  contentBottomPx(): number {
+    const buf = this.term.buffer.active;
+    let last = buf.cursorY;
+    for (let y = this.term.rows - 1; y > last; y -= 1) {
+      const line = buf.getLine(buf.viewportY + y);
+      if (line && line.translateToString(true).trim() !== '') {
+        last = y;
+        break;
+      }
+    }
+    const screen = this.el.querySelector<HTMLElement>('.xterm-screen');
+    const cellH = (screen?.clientHeight || this.el.clientHeight) / this.term.rows;
+    return (last + 1) * cellH;
   }
 
   /** Adopt the measured pane size and pass it on to the server. */
@@ -2417,6 +2435,16 @@ const KEYBOARD_MIN_VISIBLE_PX = 72;
 // only the framing page can see it, and it says so by postMessage.
 let framedCovered = 0;
 
+let keyboardUp = false;
+let kbOffsetFrame = 0;
+function scheduleKeyboardOffset(): void {
+  if (kbOffsetFrame) return;
+  kbOffsetFrame = requestAnimationFrame(() => {
+    kbOffsetFrame = 0;
+    updateKeyboardOffset();
+  });
+}
+
 function updateKeyboardOffset(): void {
   const top = cssPx(termArea, 'top');
   const keybarH = cssPx(root, '--keybar-h');
@@ -2448,7 +2476,10 @@ function updateKeyboardOffset(): void {
 
   const covered = restingTermH - available;
   const room = Math.max(0, restingTermH - KEYBOARD_MIN_VISIBLE_PX);
-  const offset = covered > KEYBOARD_MIN_PX ? Math.min(Math.round(covered), room) : 0;
+  const maxOffset = covered > KEYBOARD_MIN_PX ? Math.min(Math.round(covered), room) : 0;
+  keyboardUp = maxOffset > 0;
+  const needed = activeSession ? Math.ceil(activeSession.contentBottomPx() - available) : maxOffset;
+  const offset = Math.max(0, Math.min(maxOffset, needed));
   root.style.setProperty('--kb-offset', `${offset}px`);
 
   if (VV_DEBUG) {
