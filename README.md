@@ -206,6 +206,25 @@ stop the script (Ctrl-C).
 
 ---
 
+## Input regression checks
+
+```bash
+npm ci
+npx playwright install chromium --only-shell
+npm run test:input
+```
+
+These checks load the real frontend and xterm.js in headless Chromium with
+fixture HTTP responses and a recording WebSocket. They do not start the server,
+a shell, or tmux. They cover Android's keyCode 229 + input events, predictive
+composition, repeated Unicode input, paste, Backspace, reconnection during
+composition, and the custom iOS and desktop input paths.
+
+The events and device identities are simulated; this does not replace a check
+on a physical Android device with Gboard or on Safari. On a minimal Linux
+workstation, Chromium also needs its system libraries (see Playwright's browser
+installation instructions).
+
 ## Running as a background service (launchd / systemd)
 
 To keep terminal-web running across logins and restarts (instead of a terminal
@@ -293,10 +312,11 @@ adds two bars:
   everything that isn't reached often: font size (persisted), the split view
   again, restart, paste, **📎 attach a file**, download, and fullscreen. It is
   the same sheet the phone's ⋯ opens.
-- **Selection bar (touch)** — dragging with **選取** armed no longer copies the
+- **Selection bar (touch)** — dragging with **Select** armed no longer copies the
   moment you lift your finger. The selection stays up and a small bar appears
-  above the key bar: **複製** copies it, **全選** extends it to the whole screen
-  (of the terminal you are in — each half of a split has its own), **取消**
+  above the key bar: **Copy** copies it, **Select all** extends it to the whole
+  screen
+  (of the terminal you are in — each half of a split has its own), **Cancel**
   drops it.
   Drag again to redo the selection before committing to it. **Copy the screen**
   in the `⋯` sheet does the select-all and the copy in one tap.

@@ -89,6 +89,7 @@ const MAX_PENDING_SEQ = 64 * 1024;
 // it through to the browser. Everything else uses Ctrl, which collides with the
 // terminal's ^C/^V — hence the OS-specific copy/paste key handling below.
 const isMac = /Mac|iP(hone|ad|od)/.test(navigator.platform || navigator.userAgent);
+const isAndroid = /Android/i.test(navigator.userAgent);
 
 const params = new URLSearchParams(window.location.search);
 const IME_DEBUG = (params.get('debug') ?? '').includes('ime');
@@ -508,8 +509,8 @@ class Session {
     // Auto-repeat is dropped on both paste chords: holding the key would paste
     // the same block again and again, which at a shell prompt is a duplicated
     // command rather than a typo.
-    // This handler ALSO keeps xterm out of IME composition entirely, on every
-    // platform — see the compositionend handler in wireInput, which commits the
+    // On desktop and iOS, this handler also keeps xterm out of IME composition
+    // — see the compositionend handler in wireInput, which commits the
     // text itself. xterm sends composed text from three places, and starving
     // one is not enough:
     //   1. compositionend        -> _finalizeComposition(true), deferred; reads
@@ -523,7 +524,9 @@ class Session {
     // belonging to a composition shuts both off. e.isComposing is per-event, so
     // it cannot latch on if a compositionend is ever missed.
     this.term.attachCustomKeyEventHandler((e) => {
-      if (e.type === 'keydown' && (e.isComposing || e.keyCode === 229)) {
+      // Gboard delivers printable input through keyCode 229 plus textarea
+      // mutations. Let xterm observe those keys and the resulting input events.
+      if (!isAndroid && e.type === 'keydown' && (e.isComposing || e.keyCode === 229)) {
         return false; // composition keystroke — ours, not xterm's
       }
       if (isMac) return true; // ⌘ needs no remapping; the chords below are Ctrl
@@ -672,7 +675,7 @@ class Session {
     }
     this.positionHandles(sCol, sRow, eCol, eRow);
     // Whatever made or changed this selection — a drag, a handle, a long press,
-    // 全選 — if it was a finger then its actions belong on screen. Leaving that
+    // Select all — if it was a finger then its actions belong on screen. Leaving that
     // to each caller is how a path ends up with a selection and no way to copy
     // it, which is exactly what happened.
     if (this.lastInputWasTouch && this.term.hasSelection()) showSelectionBar();
@@ -781,14 +784,6 @@ class Session {
       });
     }
 
-    // iOS CJK keyboards send punctuation, numbers and space as a keydown with
-    // keyCode 229 and the character in .key, but with NO composition and NO
-    // input event — so xterm.js drops them (in Chinese mode those keys did
-    // nothing). A real composition key (Bopomofo / pinyin letter) is also
-    // keyCode 229 but is followed by compositionstart within a few ms. So on
-    // such a keydown we schedule the character, cancel it if a composition
-    // starts, and otherwise forward it. English keys (real keyCode) and
-    // committed CJK (compositionend → onData) are untouched, so nothing doubles.
     if (ta) {
       // Keep xterm's hidden textarea empty after a paste. xterm reads the text
       // off the event's clipboardData and sends it, but never preventDefaults,
@@ -805,7 +800,38 @@ class Session {
       ta.addEventListener('paste', (e) => {
         if (e.clipboardData) e.preventDefault();
       });
+    }
 
+    if (ta && isAndroid) {
+      // xterm owns Android IME input. In particular, Gboard can emit 229 +
+      // insertText without compositionend, so our commit-only path would drop
+      // every character. Do not clear its textarea or filter its onData here.
+      // Still track composition to postpone reconnect-induced focus changes.
+      ta.addEventListener('compositionstart', () => {
+        this.composing = true;
+      });
+      ta.addEventListener('compositionend', () => {
+        this.composing = false;
+        // xterm finalizes asynchronously. Its listener was registered first;
+        // allow that pending commit to run before resizing/refocusing.
+        window.setTimeout(() => {
+          if (this.composing || !this.reattachAfterCompose) return;
+          this.reattachAfterCompose = false;
+          this.resync();
+          if (isActive(this)) this.term.focus();
+        }, 0);
+      });
+    }
+
+    // iOS CJK keyboards send punctuation, numbers and space as a keydown with
+    // keyCode 229 and the character in .key, but with NO composition and NO
+    // input event — so xterm.js drops them (in Chinese mode those keys did
+    // nothing). A real composition key (Bopomofo / pinyin letter) is also
+    // keyCode 229 but is followed by compositionstart within a few ms. So on
+    // such a keydown we schedule the character, cancel it if a composition
+    // starts, and otherwise forward it. English keys (real keyCode) and
+    // committed CJK (compositionend → onData) are untouched, so nothing doubles.
+    if (ta && !isAndroid) {
       // Keep it empty after a composition commits, too — this is what actually
       // stops Bopomofo snowballing.
       //
@@ -925,6 +951,10 @@ class Session {
 
     this.term.onData((data: string) => {
       this.debug('onData', data);
+      if (isAndroid) {
+        this.send(data);
+        return;
+      }
       const now = performance.now();
       // Never let the pre-edit string through. Windows Bopomofo keeps ONE
       // composition open while you type — the log shows compositionupdate
@@ -1419,7 +1449,7 @@ class Session {
           'env',
           `mac=${isMac} coarse=${window.matchMedia('(pointer: coarse)').matches} ` +
             `touch=${TOUCH_DEVICE} maxTouch=${navigator.maxTouchPoints} ` +
-            `imeOwned=1 ua=${navigator.userAgent.slice(0, 80)}`,
+            `imeOwned=${isAndroid ? 0 : 1} ua=${navigator.userAgent.slice(0, 80)}`,
         );
       }
       this.setConnected(true);
@@ -2654,10 +2684,12 @@ function setTouchSelectMode(on: boolean): void {
 function copySelectionNow(): void {
   const sel = activeSession?.term.getSelection() ?? '';
   if (!sel) {
-    flashStatus('沒有選到東西', 1400);
+    flashStatus('Nothing selected', 1400);
     return;
   }
-  void copyText(sel).then((ok) => flashStatus(ok ? `已複製 ${sel.length} 字` : '複製失敗', 1600));
+  void copyText(sel).then((ok) =>
+    flashStatus(ok ? `Copied ${sel.length} characters` : 'Copy failed', 1600),
+  );
   setTouchSelectMode(false);
 }
 
@@ -2672,11 +2704,11 @@ function selBarButton(label: string, cls: string, onTap: () => void): void {
   selBar.append(b);
 }
 
-selBarButton('複製', 'primary', () => copySelectionNow());
-selBarButton('全選', '', () => {
-  if (!activeSession?.selectVisible()) flashStatus('無法全選', 1400);
+selBarButton('Copy', 'primary', () => copySelectionNow());
+selBarButton('Select all', '', () => {
+  if (!activeSession?.selectVisible()) flashStatus('Could not select all', 1400);
 });
-selBarButton('取消', '', () => {
+selBarButton('Cancel', '', () => {
   activeSession?.clearSelectionRange();
   setTouchSelectMode(false);
 });
@@ -2700,7 +2732,7 @@ const KEYS: KeyDef[] = [
   { label: 'Enter', seq: '\r' },
   // Touch text-selection toggle: while armed, drag on the terminal to select and
   // lift to copy (a tablet's stand-in for desktop Option-drag selection).
-  { label: '選取', action: 'select' },
+  { label: 'Select', action: 'select' },
   // On a phone the arrows get their own second row; everything else stays on the first.
   { rowBreak: true },
   // Ctrl+End: jump to the bottom in Claude Code's fullscreen view (CSI 1;5F).
@@ -2765,7 +2797,10 @@ for (const def of KEYS) {
       // (and lifting copies it) instead of scrolling; tap again to go back to
       // scrolling. Never refocus — that would pop the soft keyboard.
       setTouchSelectMode(!touchSelectMode);
-      flashStatus(touchSelectMode ? '選取模式:拖曳選字,放開後再按複製' : '選取關閉', 1800);
+      flashStatus(
+        touchSelectMode ? 'Selection mode: drag to select text, then tap Copy' : 'Selection mode off',
+        1800,
+      );
       return;
     }
     if (def.action === 'copy') {
@@ -3061,7 +3096,7 @@ sheet.append(
     () => {
       closeSheet();
       if (activeSession?.selectVisible()) copySelectionNow();
-      else flashStatus('無法全選', 1400);
+      else flashStatus('Could not select all', 1400);
     },
     true,
   ),
