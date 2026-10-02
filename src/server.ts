@@ -19,6 +19,7 @@ import {
   setWebTabLabel,
   listWebTabs,
   listTmuxSessions,
+  mateStartDir,
   findClientTty,
   refreshClient,
 } from "./tmux.js";
@@ -1207,7 +1208,7 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
     void listTmuxSessions().then((names) => {
       if (ws.readyState !== WebSocket.OPEN) return;
       if (names?.includes(session)) {
-        attachSession(ws, session, cols, rows);
+        startAttach(ws, session, cols, rows);
         return;
       }
       console.log(`[ws] refused "${session}": closed, and not asked to create it`);
@@ -1220,14 +1221,36 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
     });
     return;
   }
-  attachSession(ws, session, cols, rows);
+  startAttach(ws, session, cols, rows);
 });
 
+/**
+ * Attach, starting a brand-new second half of a split where the first half is
+ * working: opening the split is for doing something next to what is on screen,
+ * and a shell in the home directory meant a `cd` back there every time.
+ */
+function startAttach(ws: LiveSocket, session: string, cols: number, rows: number): void {
+  if (!session.endsWith(MATE_SUFFIX)) {
+    attachSession(ws, session, cols, rows);
+    return;
+  }
+  void mateStartDir(session, session.slice(0, -MATE_SUFFIX.length)).then((dir) => {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    attachSession(ws, session, cols, rows, dir ?? undefined);
+  });
+}
+
 /** Spawn the tmux client for `session` and wire it to this socket. */
-function attachSession(ws: LiveSocket, session: string, cols: number, rows: number): void {
+function attachSession(
+  ws: LiveSocket,
+  session: string,
+  cols: number,
+  rows: number,
+  startDir?: string
+): void {
   let proc: pty.IPty;
   try {
-    proc = pty.spawn("tmux", tmuxArgs(session, config.tmuxConfPath), {
+    proc = pty.spawn("tmux", tmuxArgs(session, config.tmuxConfPath, startDir), {
       name: "xterm-256color",
       cols,
       rows,

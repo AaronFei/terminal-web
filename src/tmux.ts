@@ -24,8 +24,36 @@ export function sanitizeSession(name: string | null | undefined): string {
  * locale it detects, so CJK/wide characters render correctly instead of being
  * replaced with "_" placeholders.
  */
-export function tmuxArgs(session: string, confPath: string): string[] {
-  return ["-u", "-f", confPath, "new-session", "-A", "-s", session];
+export function tmuxArgs(session: string, confPath: string, startDir?: string): string[] {
+  // -c only when the caller knows the session is being made: on an existing one
+  // `-A` hands it to attach-session, which would reset the session's default
+  // directory instead.
+  const dir = startDir ? ["-c", startDir] : [];
+  return ["-u", "-f", confPath, "new-session", "-A", "-s", session, ...dir];
+}
+
+/**
+ * Where a new second half of a split should start: the directory the first
+ * half's active pane is in right now. Null when that cannot be told — the first
+ * half is gone, or the second half already exists (it keeps its own).
+ */
+export function mateStartDir(mate: string, base: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile("tmux", ["has-session", "-t", `=${mate}`], (err) => {
+      if (!err) {
+        resolve(null); // already there: attaching must not move it
+        return;
+      }
+      execFile(
+        "tmux",
+        ["display-message", "-p", "-t", `=${base}:`, "#{pane_current_path}"],
+        (err2, stdout) => {
+          const dir = err2 ? "" : stdout.trim();
+          resolve(dir.startsWith("/") ? dir : null);
+        }
+      );
+    });
+  });
 }
 
 /**
