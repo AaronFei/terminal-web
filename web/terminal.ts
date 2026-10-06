@@ -2705,6 +2705,9 @@ const KEYS: KeyDef[] = [
   { rowBreak: true },
   // Ctrl+End: jump to the bottom in Claude Code's fullscreen view (CSI 1;5F).
   { label: '^End', seq: '\x1b[1;5F' },
+  // Ctrl+X then Ctrl+S — emacs's save — as one tap: two chords in a row is a lot
+  // of Ctrl-arming on a phone.
+  { label: '^X^S', seq: '\x18\x13' },
   { label: '←', seq: '\x1b[D' },
   { label: '↑', seq: '\x1b[A' },
   { label: '↓', seq: '\x1b[B' },
