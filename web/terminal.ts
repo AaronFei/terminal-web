@@ -74,12 +74,6 @@ function primaryNameOf(name: string): string {
 // reporting; a tablet has no such key). While this is on, a one-finger drag
 // selects text instead of scrolling, and lifting the finger copies it.
 let touchSelectMode = false;
-// Window to drop a duplicated IME emission. The CapsLock-switch double-send
-// arrives ~100-120ms apart (keydown-finalize then compositionend-finalize), so
-// 100ms was just too tight; 300ms covers it with margin while staying far below
-// the interval of any legitimate re-typing of the same characters.
-const IME_DEDUP_MS = 300;
-
 // Cap on the bytes of discrete injections (uploaded file path, paste, key-bar
 // press) buffered while the WebSocket is down, so a long outage can't grow the
 // queue without bound. 64 KB is far more than any real path/paste.
@@ -117,6 +111,39 @@ const SEL_DEBUG = (params.get('debug') ?? '').includes('sel');
 // for were really a stale stylesheet; the query is just the shakier question to
 // be asking.)
 const TOUCH_DEVICE = navigator.maxTouchPoints > 0;
+
+/** No guessed mode: controls/attachment wait for explicit server capabilities. */
+let windowMode: boolean | null = null;
+
+/** Server control frames the window-tab UI cares about (absent / windows / info). */
+let onWindowControl: ((msg: { type?: string; message?: string }) => void) | null = null;
+
+interface WindowTab {
+  id: string;
+  index: number;
+  name: string;
+  active: boolean;
+}
+
+interface WindowsPayload {
+  mode?: string;
+  capabilities?: { windowTabs: boolean; sessionTabs: boolean };
+  stage?: number;
+  limitation?: string | null;
+  session?: string;
+  sessionPresent?: boolean | null;
+  windows?: WindowTab[] | null;
+  activeId?: string | null;
+  error?: string;
+  ok?: boolean;
+  created?: WindowTab;
+}
+
+let mainSessionName = 'main';
+let sessionPresent: boolean | null = null;
+let windowTabs: WindowTab[] = [];
+let viewSession: Session | null = null;
+let userClosedView = false;
 
 const encoder = new TextEncoder();
 
@@ -265,6 +292,10 @@ function openPasteBox(): void {
 // Quick help overlay: how to copy / paste / attach files. Shown from the "?"
 // button and once automatically on first visit.
 function openHelp(): void {
+  if (windowMode === null) {
+    flashStatus('Waiting for server mode/capabilities', 1800);
+    return;
+  }
   if (document.querySelector('.help-overlay')) return;
   const selKey = isMac ? '⌥ Option' : 'Shift';
   const pasteKey = isMac ? '⌘V' : 'Ctrl+V';
@@ -286,7 +317,9 @@ function openHelp(): void {
     '<li><b>Attach a file</b> (for Claude Code etc.) — tap the 📎 button, or paste / drag any file (image, PDF, text…): it uploads and inserts the file path. Then press Enter.</li>' +
     '<li><b>Download a file</b> — tap the ⬇ button (or <b>⋯ → Download</b> on a phone) and enter a name/relative path from the terminal\'s current folder (e.g. <code>report.zip</code>), or a full path (<code>~/output/report.zip</code>). It downloads to this device.</li>' +
     '<li><b>Scroll</b> — mouse wheel or two-finger swipe scrolls the history.</li>' +
-    '<li><b>Tabs</b> — <b>+</b> new session, <b>×</b> closes the tab and kills its session, <b>⟳</b> restarts the session fresh. Double-click (or double-tap) a tab to rename it — the label changes but its tmux session stays the same.</li>' +
+    (windowMode
+      ? '<li><b>Windows</b> — tabs are the windows of the existing configured tmux session, by stable @window id. <b>+</b> runs <code>new-window</code> (it does not create the session). Double-click renames the real window. <b>Close view</b> only disconnects this browser — the window keeps running. <b>Terminate</b> kills that window after a confirmation; terminating the final window ends the session. Stage 1: every browser shares the current window and its size; this page does not give you an independent view.</li>'
+      : '<li><b>Tabs</b> — <b>+</b> new session, <b>×</b> closes the tab and kills its session, <b>⟳</b> restarts the session fresh. Double-click (or double-tap) a tab to rename it — the label changes but its tmux session stays the same.</li>') +
     '</ul>' +
     '<div class="paste-row"><button class="tb-btn" type="button" data-help-close>Got it</button></div>';
   overlay.append(box);
@@ -343,7 +376,8 @@ const addBtn = document.createElement('button');
 addBtn.className = 'tab-add';
 addBtn.type = 'button';
 addBtn.textContent = '+';
-addBtn.title = 'New session';
+addBtn.title = 'Waiting for server mode';
+addBtn.disabled = true;
 tabsEl.append(addBtn);
 
 const controlsEl = document.createElement('div');
@@ -415,18 +449,14 @@ class Session {
   // for its first attach, so a page that sleeps for a day and wakes up cannot
   // pass for one.
   private createUntil = 0;
+  // Close-view / absent: do not reconnect. Reconnect would be harmless on the
+  // server (it will not create the session) but it would fight an explicit
+  // detach and spin if the session is missing.
+  private viewPaused = false;
 
-  // IME double-input guard (order-independent, content-scoped).
-  private lastData = '';
-  private lastDataAt = 0;
-
-  // The IME's current pre-edit (composing) string, straight from its own
-  // compositionupdate events, with the time it was last seen. Nothing in here
-  // has been committed, so none of it may reach the pty — only the text the IME
-  // hands us at compositionend does, and we send that ourselves. Kept for a
-  // moment after the composition ends because xterm's finalize is deferred.
-  private composingText = '';
-  private composingAt = 0;
+  // wireInput owns IME DOM events before xterm can turn them into onData.
+  // The constructor's custom handler consults it for both keydown and keypress.
+  private imeKeyHandler: ((event: KeyboardEvent) => boolean) | null = null;
 
   // True between compositionstart and compositionend — i.e. while the soft
   // keyboard is mid-composition (e.g. picking a 注音 candidate). A reconnect
@@ -508,24 +538,12 @@ class Session {
     // Auto-repeat is dropped on both paste chords: holding the key would paste
     // the same block again and again, which at a shell prompt is a duplicated
     // command rather than a typo.
-    // This handler ALSO keeps xterm out of IME composition entirely, on every
-    // platform — see the compositionend handler in wireInput, which commits the
-    // text itself. xterm sends composed text from three places, and starving
-    // one is not enough:
-    //   1. compositionend        -> _finalizeComposition(true), deferred; reads
-    //                               the textarea a tick later (starved there).
-    //   2. a non-229 keydown mid-composition -> _finalizeComposition(false),
-    //                               SYNCHRONOUS, so blanking the textarea
-    //                               afterwards cannot stop it.
-    //   3. a 229 keydown while not composing -> _handleAnyTextareaChanges().
-    // 2 and 3 both run from _compositionHelper.keydown(), which _keyDown calls
-    // only AFTER consulting this handler — so returning false for any keystroke
-    // belonging to a composition shuts both off. e.isComposing is per-event, so
-    // it cannot latch on if a compositionend is ever missed.
+    // IME ownership must cover keypress as well as keydown. Rejecting only
+    // the 229 keydown still lets xterm send its keypress/input, followed by our
+    // no-input fallback. wireInput coordinates those events as ONE key, and
+    // keeps xterm's synchronous finalize out of an active composition.
     this.term.attachCustomKeyEventHandler((e) => {
-      if (e.type === 'keydown' && (e.isComposing || e.keyCode === 229)) {
-        return false; // composition keystroke — ours, not xterm's
-      }
+      if (this.imeKeyHandler && !this.imeKeyHandler(e)) return false;
       if (isMac) return true; // ⌘ needs no remapping; the chords below are Ctrl
       if (e.type !== 'keydown' || !e.ctrlKey || e.altKey || e.metaKey) {
         return true; // not a copy/paste chord — let xterm handle it normally
@@ -781,190 +799,176 @@ class Session {
       });
     }
 
-    // iOS CJK keyboards send punctuation, numbers and space as a keydown with
-    // keyCode 229 and the character in .key, but with NO composition and NO
-    // input event — so xterm.js drops them (in Chinese mode those keys did
-    // nothing). A real composition key (Bopomofo / pinyin letter) is also
-    // keyCode 229 but is followed by compositionstart within a few ms. So on
-    // such a keydown we schedule the character, cancel it if a composition
-    // starts, and otherwise forward it. English keys (real keyCode) and
-    // committed CJK (compositionend → onData) are untouched, so nothing doubles.
+    let pasteInProgress = false;
+    let preeditInputPending = false;
+    let preeditInput = 0;
     if (ta) {
-      // Keep xterm's hidden textarea empty after a paste. xterm reads the text
-      // off the event's clipboardData and sends it, but never preventDefaults,
-      // so the browser then inserts the same text into that textarea — where it
-      // stays until the next Enter / ^C / blur. That matters because xterm
-      // tracks IME input as offsets into this textarea: compositionstart takes
-      // start = value.length, and the commit sends value.substring(start) — to
-      // the END of the value. Compose on top of a stale paste and those offsets
-      // are wrong, so part of the old block is committed again: type after
-      // pasting and the pasted text reappears. xterm doesn't need the
-      // insertion, so cancel it (only when clipboardData actually carried the
-      // paste, i.e. xterm has already handled it). Scoped to the terminal's own
-      // textarea — the mobile paste box needs its default insertion.
+      // A paste remains xterm-owned, including bracketed-paste formatting.
+      // Do not mistake its onData for an IME pre-edit if composition is active.
+      this.el.addEventListener('paste', () => {
+        pasteInProgress = true;
+        queueMicrotask(() => { pasteInProgress = false; });
+      }, { capture: true });
+      // Prevent the browser inserting a second copy of xterm's native paste
+      // into its textarea. Stale pasted text corrupts composition offsets and
+      // Windows Bopomofo reconverts it into the next composition (snowballing).
+      // This is scoped to xterm, never the mobile paste-overlay textarea.
       ta.addEventListener('paste', (e) => {
         if (e.clipboardData) e.preventDefault();
       });
-
-      // Keep it empty after a composition commits, too — this is what actually
-      // stops Bopomofo snowballing.
-      //
-      // The browser inserts the committed text into the textarea AFTER the
-      // compositionend dispatch, so clearing from inside that handler is undone
-      // a moment later. Windows Bopomofo then pulls the text sitting there
-      // straight back into its next composition (the log shows compositionstart
-      // immediately followed by a compositionupdate already carrying everything
-      // typed before), commits the lot again, and round it goes — each commit
-      // longer than the last. compositionend is not cancelable, so the
-      // insertion cannot be prevented; the input event that follows it is the
-      // first moment the text is really there with no composition active, which
-      // makes it the place to clear. Guarded on isComposing so the in-progress
-      // composition is never touched.
       ta.addEventListener('input', (e) => {
-        if (!(e as InputEvent).isComposing && ta.value !== '') ta.value = '';
+        if (!(e as InputEvent).isComposing && !this.composing) ta.value = '';
       });
 
-      const pendingKeys = new Map<number, string>();
-      let lastSeq = -1;
-      let seq = 0;
-      // Any composition activity means the most-recent IME keydown was actually
-      // composition input (Bopomofo / pinyin), so cancel its pending forward.
-      // The truly-dropped keys (punctuation / number / space) produce no
-      // composition event at all, so their forward survives and fires.
-      const cancelLast = (): void => {
-        if (lastSeq >= 0) {
-          pendingKeys.delete(lastSeq);
-          lastSeq = -1;
-        }
+      type DirectKey = { key: string; sent: boolean; timer: number | null };
+      let directKey: DirectKey | null = null;
+      let compositionInputPending = false;
+      let compositionCommit = 0;
+      const sendKey = (key: DirectKey, text: string): void => {
+        if (key.timer !== null) window.clearTimeout(key.timer);
+        key.timer = null;
+        if (key.sent || this.disposed) return;
+        key.sent = true;
+        this.debug('forward-key', text);
+        this.send(text);
       };
+      const cancelLast = (): void => {
+        if (directKey && directKey.timer !== null) window.clearTimeout(directKey.timer);
+        directKey = null;
+      };
+
+      // iOS CJK keyboards sometimes emit only a printable 229 keydown: keep
+      // the 90ms rescue for those keys. Other browsers ALSO emit keypress or
+      // input. All three belong to this record and may deliver it only once.
+      // A new keydown creates a NEW record even for an identical character;
+      // this is event ownership, not content/time deduplication of real keys.
+      this.imeKeyHandler = (e) => {
+        if (e.type === 'keydown') {
+          compositionInputPending = false;
+          if (!e.isComposing && e.keyCode !== 229) preeditInputPending = false;
+          directKey = null; // earlier no-input keys keep their own rescue timer
+          if (e.isComposing || this.composing) return false;
+          if (e.keyCode !== 229) return true;
+          if (e.key && [...e.key].length === 1) {
+            const key: DirectKey = { key: e.key, sent: false, timer: null };
+            directKey = key;
+            key.timer = window.setTimeout(() => sendKey(key, key.key), 90);
+          }
+          return false;
+        }
+        if (e.type === 'keypress') {
+          if (e.isComposing || this.composing || e.keyCode === 229) return false;
+          if (directKey) {
+            const text = e.charCode ? String.fromCharCode(e.charCode) : e.key;
+            // Prefer the subsequent input's converted/full-width text. A
+            // keypress-only browser still gets the existing 90ms rescue.
+            if (text && [...text].length === 1 && !directKey.sent) directKey.key = text;
+            return false;
+          }
+        }
+        return true;
+      };
+
+      // xterm registers input in CAPTURE on the textarea before wireInput.
+      // Capture on its ancestor therefore owns IME input before xterm's
+      // emoji/insertText fallback can send a second copy. Normal hardware
+      // typing and input-only emoji still reach xterm unchanged.
+      this.el.addEventListener('input', (event) => {
+        if (event.target !== ta) return;
+        const e = event as InputEvent;
+        if (e.isComposing || this.composing) {
+          // Bopomofo can leave continued pre-edit after a partial commit
+          // without another compositionstart. Guard xterm's already-scheduled
+          // finalize for this input transaction, without latching composition
+          // state after an IME's final input happens to retain isComposing.
+          if (e.isComposing) {
+            preeditInputPending = true;
+            cancelLast();
+            const input = ++preeditInput;
+            window.setTimeout(() => {
+              if (preeditInput === input) preeditInputPending = false;
+            }, 0);
+          }
+          e.stopImmediatePropagation(); // uncommitted pre-edit must never send
+          return;
+        }
+        if (compositionInputPending) {
+          compositionInputPending = false;
+          e.stopImmediatePropagation(); // compositionend already sent the commit
+          ta.value = '';
+          return;
+        }
+        if (directKey && e.data && e.inputType.startsWith('insert')) {
+          // A no-input rescue can be followed by an unrelated input-only
+          // emoji/paste. Only its matching late insertion belongs to the key.
+          if (directKey.sent && e.data !== directKey.key) {
+            directKey = null;
+            return;
+          }
+          sendKey(directKey, e.data); // use the actual full-width/converted text
+          directKey = null;
+          e.stopImmediatePropagation();
+          ta.value = '';
+        }
+      }, { capture: true });
+
       ta.addEventListener('compositionstart', () => {
         this.composing = true;
+        compositionInputPending = false;
         cancelLast();
-        // Never let a composition begin on top of leftover text: that is what
-        // the IME reconverts into its own buffer.
         if (ta.value !== '') ta.value = '';
       });
-      ta.addEventListener('compositionupdate', (e) => {
-        cancelLast();
-        if (e.data) {
-          this.composingText = e.data;
-          this.composingAt = performance.now();
-        }
-      });
+      ta.addEventListener('compositionupdate', cancelLast);
       ta.addEventListener('compositionend', (e) => {
         this.composing = false;
         cancelLast();
-        // Commit the composed text ourselves, then empty the textarea.
-        //
-        // xterm clears this textarea only on Enter / ^C / blur, so while you
-        // keep typing it accumulates everything composed so far — and xterm
-        // sends a composition by slicing that buffer:
-        //   value.substring(_compositionPosition.start + _dataAlreadySent.length)
-        // which runs to the END of the value. _compositionPosition.start is
-        // refreshed only on compositionstart, and a Windows IME fires that once
-        // for a whole run of characters, so start freezes while the buffer
-        // grows: every keystroke re-sends a sliding window of everything typed
-        // since — type without pressing Enter and the same block floods in over
-        // and over. compositionend.data is exactly the committed text, so send
-        // that and blank the buffer; xterm's own deferred slice then reads an
-        // empty value and sends nothing. Nothing here depends on the IME
-        // firing compositionstart per character.
-        const text = e.data;
-        if (text) {
-          // Synchronously, BEFORE the IME opens its next composition: the log
-          // shows compositionend and the next compositionstart landing in the
-          // same millisecond, so a deferred clear is far too late.
-          ta.value = '';
-          // If xterm's slice still manages to emit the same text, the onData
-          // dedup below drops it.
-          this.lastData = text;
-          this.lastDataAt = performance.now();
-          this.debug('composition-commit', text);
-          this.send(text);
-        } else {
-          // Cancelled composition (Escape): nothing to send, but still reset
-          // the buffer — after xterm's deferred slice has run, not racing it.
-          window.setTimeout(() => {
-            if (!this.composing) ta.value = '';
-          }, 0);
+        // compositionend.data is our sole commit source. Clear synchronously
+        // before an immediately following compositionstart, then clear again
+        // on the native input that inserts this commit AFTER compositionend.
+        // That trailing input is part of this DOM transaction, not a second
+        // character. Expire ownership at the next task if no input follows, so
+        // later input-only emoji or deliberate repeated CJK are not swallowed.
+        compositionInputPending = true;
+        const commit = ++compositionCommit;
+        window.setTimeout(() => {
+          if (compositionCommit === commit) compositionInputPending = false;
+        }, 0);
+        ta.value = '';
+        if (e.data) {
+          this.debug('composition-commit', e.data);
+          this.send(e.data);
         }
-        // A reconnect arrived mid-composition and deferred its re-fit/re-focus
-        // (see connect's onopen) so it wouldn't cancel the composition; now that
-        // we've committed, it's safe to catch up.
         if (this.reattachAfterCompose) {
           this.reattachAfterCompose = false;
           this.resync();
           if (isActive(this)) this.term.focus();
         }
       });
-      // The direct-insert half of the IME path. The custom key handler stops
-      // xterm seeing 229 keydowns at all, so xterm's own
-      // _handleAnyTextareaChanges — which used to deliver these keys — no
-      // longer runs, and its _inputEvent fallback bails out whenever a keydown
-      // was seen. So this rescue is what carries a key the IME commits with no
-      // composition (full-width punctuation, digits, space), and the
-      // compositionend handler above carries everything that does compose.
-      // Nothing sends twice: a composition cancels the pending forward through
-      // cancelLast().
-      ta.addEventListener('keydown', (e) => {
-        const ke = e as KeyboardEvent;
-        if (ke.keyCode !== 229) return; // only IME-routed keys
-        const k = ke.key;
-        if (!k || k.length !== 1) return; // a single printable char (not Enter/Backspace/…)
-        const s = ++seq;
-        pendingKeys.set(s, k);
-        lastSeq = s;
-        window.setTimeout(() => {
-          if (!pendingKeys.has(s)) return; // a composition consumed it
-          pendingKeys.delete(s);
-          this.debug('forward-key', k);
-          this.send(k);
-        }, 90);
+      ta.addEventListener('blur', () => {
+        // A missing compositionend on blur must not latch keyboard ownership.
+        this.composing = false;
+        compositionInputPending = false;
+        cancelLast();
+        ta.value = '';
       });
     }
 
     this.term.onData((data: string) => {
       this.debug('onData', data);
-      const now = performance.now();
-      // Never let the pre-edit string through. Windows Bopomofo keeps ONE
-      // composition open while you type — the log shows compositionupdate
-      // growing by a character at a time and only flushing a chunk now and
-      // then — so at compositionend the textarea still holds uncommitted text.
-      // xterm's finalize assumes the opposite (that what is left is exactly
-      // what was committed) and fires a few ms later on a setTimeout, sending
-      // the remaining pre-edit text: right after our own commit the log shows
-      //   composition-commit "喔喔喔喔喔喔ㄟ"
-      //   onData             "ㄟㄟㄟㄟㄟㄟ一一一一一一喔喔…"
-      // Whatever it sends is a tail of the textarea, hence a tail of the string
-      // the IME is composing, which makes this exact rather than a guess. The
-      // committed text reaches the pty from the compositionend handler, which
-      // calls send() directly and so never passes through here.
-      if (
-        data &&
-        !/[\x00-\x1f]/.test(data) && // never touch control bytes or escapes
-        this.composingText.endsWith(data) &&
-        now - this.composingAt < 500
-      ) {
+      // xterm's deferred finalize can read the NEXT composition's pre-edit if
+      // it starts in the same task. Its text is not a commit. Explicit paste
+      // and control/protocol bytes still pass through; compositionend sends
+      // directly. No 300/500ms string matching that drops intentional repeats.
+      if ((this.composing || preeditInputPending) && !pasteInProgress && data && !/[\x00-\x1f\x7f]/.test(data)) {
         this.debug('onData-DROP-preedit', data);
         return;
       }
-      // Only dedupe multibyte (IME) content; ASCII/control input is never touched.
-      if (
-        /[^\x00-\x7F]/.test(data) &&
-        data === this.lastData &&
-        now - this.lastDataAt < IME_DEDUP_MS
-      ) {
-        this.lastData = ''; // suppress exactly one duplicate
-        this.debug('onData-DROP', data);
-        return;
-      }
-      this.lastData = data;
-      this.lastDataAt = now;
       this.send(data);
     });
   }
 
   private send(data: string): void {
+    if (!data) return; // xterm may finalize a cancelled composition as empty onData
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(encoder.encode(data));
     }
@@ -1295,11 +1299,13 @@ class Session {
 
   /** This session is being made on purpose: its first attach may create it. */
   intendCreate(): void {
+    if (windowMode !== false) return; // only initialized session mode may create
     this.createUntil = performance.now() + 60_000;
   }
 
   /** Show one of this tab's terminals, or both. */
   setView(mode: LayoutMode): void {
+    if (windowMode !== false) return; // split belongs to initialized session mode
     if (this.isMate) return;
     this.view = mode;
     if (mode !== 'one') this.ensureMate();
@@ -1342,15 +1348,53 @@ class Session {
   }
 
   restart(): void {
+    if (windowMode !== false) return; // no session-restart control in window UI
     this.term.reset();
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ type: 'restart' }));
     }
   }
 
+  /**
+   * Disconnect this browser's pty without killing the tmux window or session.
+   * The socket close only detaches the tmux client.
+   */
+  closeView(): void {
+    this.viewPaused = true;
+    this.stopPing();
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.ws) {
+      try {
+        this.ws.close();
+      } catch {
+        /* ignore */
+      }
+      this.ws = null;
+    }
+    this.setConnected(false);
+  }
+
+  /** Open the browser view again. Does not create a session or a window. */
+  resumeView(): void {
+    if (this.disposed) return;
+    this.viewPaused = false;
+    this.reconnectDelay = MIN_DELAY;
+    // Boot payloads can arrive before setShown's first layout frame. Unpause
+    // now, but let start() attach only after that frame's fit measurement.
+    if (!this.started) return;
+    const state = this.ws?.readyState;
+    if (state === WebSocket.OPEN || state === WebSocket.CONNECTING) return;
+    this.connect();
+  }
+
   // Ask the server to kill this tmux session for good (used on tab close).
   // Over HTTP, not this tab's socket: a tab that was never opened has none.
+  // Window mode must not call this — terminate goes through /api/windows/kill.
   kill(): void {
+    if (windowMode !== false) return;
     void fetch('/api/sessions/kill', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1382,7 +1426,7 @@ class Session {
   }
 
   private scheduleReconnect(): void {
-    if (this.disposed) return;
+    if (this.disposed || this.viewPaused) return;
     if (this.reconnectTimer !== null) return;
     if (isActive(this)) showStatus('reconnecting…');
     const base = this.reconnectDelay;
@@ -1397,7 +1441,11 @@ class Session {
   }
 
   private connect(): void {
-    if (this.disposed) return;
+    if (this.disposed || this.viewPaused || !this.started) return;
+    // start() owns the initial measured attach. Repeated resumes/reconnects
+    // still converge on ONE socket/pty, not two streams rendering the same
+    // tmux output into one xterm (duplicated keyboard echo).
+    if (this.ws?.readyState === WebSocket.OPEN || this.ws?.readyState === WebSocket.CONNECTING) return;
     // Hand the server our size up front so it spawns the pty with it and the
     // tmux client attaches at the size it is going to keep. Attaching at tmux's
     // 80x24 default first — what every connect and reconnect used to do —
@@ -1406,12 +1454,16 @@ class Session {
     const url =
       `${wsProto}://${window.location.host}/ws?session=${encodeURIComponent(this.name)}` +
       `&cols=${this.term.cols}&rows=${this.term.rows}` +
-      (performance.now() < this.createUntil ? '&create=1' : '');
+      (windowMode || performance.now() >= this.createUntil ? '' : '&create=1');
     const socket = new WebSocket(url);
     socket.binaryType = 'arraybuffer';
     this.ws = socket;
 
     socket.onopen = () => {
+      if (this.ws !== socket || this.disposed || this.viewPaused) {
+        socket.close();
+        return;
+      }
       this.reconnectDelay = MIN_DELAY;
       this.createUntil = 0; // it exists now; a later reconnect is only a reconnect
       if (IME_DEBUG) {
@@ -1450,17 +1502,34 @@ class Session {
     };
 
     socket.onmessage = (ev: MessageEvent) => {
+      if (this.ws !== socket || this.disposed) return;
       if (ev.data instanceof ArrayBuffer) {
         this.term.write(new Uint8Array(ev.data));
         return;
       }
       if (typeof ev.data === 'string') {
         try {
-          const msg = JSON.parse(ev.data) as { type?: string };
+          const msg = JSON.parse(ev.data) as { type?: string; message?: string };
+          if (msg && msg.type === 'absent') {
+            // Main session is not there. Do not reconnect: a reconnect must
+            // not be what creates it, and a tight loop would only hammer tmux.
+            this.closeView();
+            onWindowControl?.(msg);
+            return;
+          }
+          if (msg && (msg.type === 'windows' || msg.type === 'info')) {
+            onWindowControl?.(msg);
+          }
           // The session was closed (killed) here or on another device: drop the
           // tab and do NOT reconnect — reconnecting would recreate the session
           // via `new-session -A`, resurrecting what was just closed.
+          // Window mode has no session tabs to drop, and must not treat this
+          // as a reason to kill or recreate anything.
           if (msg && msg.type === 'closed') {
+            if (windowMode) {
+              onWindowControl?.(msg);
+              return;
+            }
             // A mate closing takes the split down, not the tab: the tab is the
             // first session and is still perfectly alive.
             if (this.isMate) {
@@ -1483,8 +1552,11 @@ class Session {
     };
 
     socket.onclose = () => {
+      // A close from the previous view must not disconnect/reconnect the new
+      // socket when Close view is followed immediately by Reconnect view.
+      if (this.ws !== socket) return;
       this.stopPing();
-      if (this.ws === socket) this.ws = null;
+      this.ws = null;
       this.setConnected(false);
       this.scheduleReconnect();
     };
@@ -1935,6 +2007,7 @@ function domPrompt(opts: {
 }
 
 async function promptAddSession(): Promise<void> {
+  if (windowMode !== false) return;
   const suggestion = nextSessionName();
   const raw = await domPrompt({
     label: 'New session name:',
@@ -2240,6 +2313,11 @@ let syncing = false;
 // renamed) on other devices, drop sessions closed elsewhere. The active tab is
 // per-device and never changed here unless its session disappeared.
 async function syncFromServer(): Promise<void> {
+  if (windowMode === null) return;
+  if (windowMode) {
+    await syncWindows();
+    return;
+  }
   if (syncing) return;
   syncing = true;
   try {
@@ -2525,7 +2603,8 @@ function toggleFullscreen(): void {
 
 addBtn.addEventListener('pointerdown', (e) => {
   e.preventDefault();
-  promptAddSession();
+  if (windowMode) void promptNewWindow();
+  else void promptAddSession();
 });
 
 // Sessions list (opens the same bottom-sheet drawer the phone bar uses). On a
@@ -2538,10 +2617,11 @@ const keysBtn = makeButton(controlsEl, 'tb-btn tb-icon', '⌨', 'Toggle on-scree
   setKeybarVisible(keybarEl.classList.contains('hidden'));
   activeSession?.focus();
 });
-makeButton(controlsEl, 'tb-btn tb-icon', '⟳', 'Restart this session', () => {
+const restartBtn = makeButton(controlsEl, 'tb-btn tb-icon session-only', '⟳', 'Restart this session', () => {
   activeSession?.restart();
   activeSession?.focus();
 });
+void restartBtn;
 
 // Split view. A tab can show a second terminal beside its own: this picks
 // whether you see the first, the second, or both at once. Both keep running
@@ -2562,7 +2642,7 @@ function refreshLayoutUI(): void {
 }
 
 const layoutSeg = document.createElement('div');
-layoutSeg.className = 'tb-seg';
+layoutSeg.className = 'tb-seg session-only';
 for (const def of LAYOUT_BUTTONS) {
   layoutButtons.set(
     def.mode,
@@ -2606,6 +2686,28 @@ dlBtn.innerHTML =
   '<line x1="12" y1="15" x2="12" y2="3"></line></svg>';
 dlBtn.addEventListener('click', () => promptDownload());
 controlsEl.append(dlBtn);
+
+const closeViewBtn = makeButton(
+  controlsEl,
+  'tb-btn window-only',
+  'Close view',
+  'Disconnect this browser only. Does not kill the tmux window or the main session.',
+  () => {
+    closeBrowserView();
+  },
+);
+closeViewBtn.classList.add('window-only');
+const terminateBtn = makeButton(
+  controlsEl,
+  'tb-btn danger window-only',
+  'Terminate…',
+  'Terminate the selected tmux window after confirmation. This is not Close view.',
+  () => {
+    const w = activeWindow();
+    if (w) confirmTerminateWindow(w);
+  },
+);
+terminateBtn.classList.add('window-only');
 
 makeButton(controlsEl, 'tb-btn tb-icon', '?', 'Help: copy / paste / files', openHelp);
 // Everything that isn't reached often — font size, attach, fullscreen, help —
@@ -2881,7 +2983,8 @@ drawerNew.textContent = '+  New session';
 drawerNew.addEventListener('pointerdown', (e) => {
   e.preventDefault();
   closeDrawer();
-  promptAddSession();
+  if (windowMode) void promptNewWindow();
+  else void promptAddSession();
 });
 drawer.append(drawerGrip, drawerTitle, drawerList, drawerNew);
 drawerOverlay.append(drawer);
@@ -2893,6 +2996,10 @@ drawerOverlay.addEventListener('pointerdown', (e) => {
 let drawerOpen = false;
 
 function renderDrawer(): void {
+  if (windowMode) {
+    renderWindowDrawer();
+    return;
+  }
   drawerList.textContent = '';
   for (const s of sessions) {
     const row = document.createElement('div');
@@ -2996,7 +3103,7 @@ fontRow.append(fontMinus, fontVal, fontPlus);
 // The same split-view control, at touch size, for the phone's actions sheet
 // (the desktop top bar is hidden at that width).
 const splitRow = document.createElement('div');
-splitRow.className = 'sheet-seg';
+splitRow.className = 'sheet-seg session-only';
 const splitLabel = document.createElement('div');
 splitLabel.className = 'ss-lbl';
 splitLabel.textContent = 'Split view';
@@ -3044,16 +3151,32 @@ function sheetRow(
   return b;
 }
 
+const restartRow = sheetRow('⟳', 'Restart this session', () => {
+  closeSheet();
+  activeSession?.restart();
+  activeSession?.focus();
+});
+restartRow.classList.add('session-only');
+const closeViewRow = sheetRow('✕', 'Close view', () => {
+  closeSheet();
+  closeBrowserView();
+});
+closeViewRow.classList.add('window-only');
+const terminateRow = sheetRow('⌧', 'Terminate window…', () => {
+  closeSheet();
+  const w = activeWindow();
+  if (w) confirmTerminateWindow(w);
+});
+terminateRow.classList.add('window-only');
+
 sheet.append(
   sheetGrip,
   sheetTitle,
   fontRow,
   splitRow,
-  sheetRow('⟳', 'Restart this session', () => {
-    closeSheet();
-    activeSession?.restart();
-    activeSession?.focus();
-  }),
+  restartRow,
+  closeViewRow,
+  terminateRow,
   sheetRow('📋', 'Paste', () => {
     closeSheet();
     pasteFromClipboard();
@@ -3107,6 +3230,14 @@ function closeSheet(): void {
 // Keep the mobile bar's title + connection dot current, and re-render the open
 // drawer when the session list / active tab / connection state changes.
 function refreshMobileUI(): void {
+  if (windowMode) {
+    const w = activeWindow();
+    mTitleLabel.textContent = w ? w.name : sessionPresent === false ? 'session missing' : '—';
+    mTitleDot.classList.toggle('connected', !!viewSession?.connected);
+    mKeysBtn.classList.toggle('active', !keybarEl.classList.contains('hidden'));
+    if (drawerOpen) renderDrawer();
+    return;
+  }
   const s = activeTab;
   mTitleLabel.textContent = s ? s.displayName : '—';
   mTitleDot.classList.toggle('connected', !!s?.connected);
@@ -3426,7 +3557,10 @@ const cached = loadTabs(); // per-device cache: offline fallback + last focus
 // before init resolves); init refines it once the tab list is known.
 let defaultSessionName = urlSession ?? cached.tabs[0]?.name ?? 'web';
 
-async function init(): Promise<void> {
+async function initSessions(): Promise<void> {
+  windowMode = false;
+  addBtn.title = 'New session';
+  document.body.classList.remove('window-mode');
   // Both server round-trips start together; the prefs one is awaited further
   // down, just before the tabs are built.
   const prefsPromise = fetchServerPrefs();
@@ -3507,6 +3641,408 @@ async function init(): Promise<void> {
   prefsReady = true;
 }
 
+function activeWindow(): WindowTab | null {
+  return windowTabs.find((w) => w.active) ?? null;
+}
+
+function windowById(id: string): WindowTab | null {
+  return windowTabs.find((w) => w.id === id) ?? null;
+}
+
+async function fetchWindowsPayload(): Promise<WindowsPayload | null> {
+  try {
+    const res = await fetch('/api/windows', { cache: 'no-store' });
+    if (!res.ok) return null;
+    return (await res.json()) as WindowsPayload;
+  } catch {
+    return null;
+  }
+}
+
+async function postWindows(path: string, body: unknown): Promise<WindowsPayload | null> {
+  try {
+    const res = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = (await res.json()) as WindowsPayload;
+    if (!res.ok) {
+      flashStatus(data.error || `request failed (${res.status})`, 2600);
+      return null;
+    }
+    return data;
+  } catch {
+    flashStatus('window request failed', 2000);
+    return null;
+  }
+}
+
+const viewBanner = document.createElement('div');
+viewBanner.id = 'view-banner';
+viewBanner.className = 'hidden';
+const viewBannerText = document.createElement('div');
+viewBannerText.className = 'view-banner-text';
+const viewBannerBtn = document.createElement('button');
+viewBannerBtn.className = 'tb-btn';
+viewBannerBtn.type = 'button';
+viewBannerBtn.textContent = 'Reconnect view';
+viewBannerBtn.addEventListener('click', () => {
+  if (windowMode === null) {
+    void init();
+    return;
+  }
+  userClosedView = false;
+  viewBanner.classList.add('hidden');
+  viewSession?.resumeView();
+});
+viewBanner.append(viewBannerText, viewBannerBtn);
+termArea.append(viewBanner);
+
+function showViewBanner(text: string, allowReconnect: boolean): void {
+  viewBannerText.textContent = text;
+  viewBannerBtn.classList.toggle('hidden', !allowReconnect);
+  viewBanner.classList.remove('hidden');
+}
+
+function hideViewBanner(): void {
+  viewBanner.classList.add('hidden');
+}
+
+/**
+ * Close the browser's pty view only. Does not call kill-window or kill-session.
+ * Tabs stay, because they enumerate tmux windows, not local views.
+ */
+function closeBrowserView(): void {
+  if (!windowMode || !viewSession) return;
+  userClosedView = true;
+  viewSession.closeView();
+  showViewBanner(
+    'Browser view closed. The tmux windows are still running — this did not terminate anything.',
+    true,
+  );
+  refreshMobileUI();
+}
+
+function applyWindowsPayload(payload: WindowsPayload): void {
+  if (payload.mode !== 'windows') return;
+  if (typeof payload.session === 'string' && payload.session) mainSessionName = payload.session;
+  if (payload.sessionPresent !== undefined) sessionPresent = payload.sessionPresent;
+  if (payload.windows) {
+    windowTabs = payload.windows.slice().sort((a, b) => a.index - b.index || a.id.localeCompare(b.id));
+    renderWindowTabs();
+  } else if (payload.sessionPresent === false) {
+    windowTabs = [];
+    renderWindowTabs();
+  }
+  if (payload.sessionPresent === false) {
+    viewSession?.closeView();
+    showViewBanner(
+      `tmux session "${mainSessionName}" is not running. This page will not create it.`,
+      true,
+    );
+  } else if (payload.sessionPresent === null) {
+    showViewBanner(`tmux session "${mainSessionName}" could not be queried. Nothing was created.`, true);
+  } else if (!userClosedView) {
+    hideViewBanner();
+    // An absent session pauses the pty. Once tmux answers again, reattach.
+    // This does not create the session — the server still refuses that.
+    if (payload.sessionPresent === true) viewSession?.resumeView();
+  }
+  refreshMobileUI();
+}
+
+function renderWindowTabs(): void {
+  const activeId = activeWindow()?.id ?? null;
+  const seen = new Set<string>();
+  const existing = new Map<string, HTMLElement>();
+  for (const el of Array.from(tabsEl.querySelectorAll<HTMLElement>('[data-window-id]'))) {
+    if (el.dataset.windowId) existing.set(el.dataset.windowId, el);
+  }
+  for (const w of windowTabs) {
+    seen.add(w.id);
+    let tab = existing.get(w.id) ?? null;
+    if (!tab) {
+      tab = document.createElement('div');
+      tab.className = 'tab';
+      tab.dataset.windowId = w.id;
+      const dot = document.createElement('span');
+      dot.className = 'tab-dot';
+      const label = document.createElement('span');
+      label.className = 'tab-label';
+      const end = document.createElement('button');
+      end.className = 'tab-terminate';
+      end.type = 'button';
+      end.textContent = 'End';
+      end.title = 'Terminate this window (kills its programs). Not the same as Close view.';
+      tab.append(dot, label, end);
+      let lastTap = 0;
+      onTap(
+        tab,
+        (e) => {
+          if (e.target instanceof Node && end.contains(e.target)) return;
+          const now = performance.now();
+          if (now - lastTap < 350) {
+            lastTap = 0;
+            const cur = windowById(w.id);
+            if (cur) void promptRenameWindow(cur);
+            return;
+          }
+          lastTap = now;
+          void selectWindow(w.id);
+        },
+        tabsEl,
+      );
+      onTap(
+        end,
+        (e) => {
+          e.stopPropagation();
+          const cur = windowById(w.id);
+          if (cur) confirmTerminateWindow(cur);
+        },
+        tabsEl,
+      );
+      tabsEl.insertBefore(tab, addBtn);
+    }
+    const label = tab.querySelector('.tab-label');
+    if (label) {
+      label.textContent = w.name;
+      label.setAttribute('title', `${w.id} ${w.name} (double-click to rename the tmux window)`);
+    }
+    const dot = tab.querySelector('.tab-dot');
+    dot?.classList.toggle('connected', !!viewSession?.connected && w.active);
+    dot?.classList.toggle('idle', !w.active);
+    tab.classList.toggle('active', w.id === activeId);
+    if (w.id === activeId && tab.dataset.scrolled !== '1') {
+      tab.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      for (const el of existing.values()) delete el.dataset.scrolled;
+      tab.dataset.scrolled = '1';
+    }
+  }
+  for (const el of Array.from(tabsEl.querySelectorAll<HTMLElement>('[data-window-id]'))) {
+    if (!seen.has(el.dataset.windowId || '')) el.remove();
+  }
+}
+
+function renderWindowDrawer(): void {
+  drawerList.textContent = '';
+  drawerTitle.textContent = 'Windows';
+  for (const w of windowTabs) {
+    const row = document.createElement('div');
+    row.className = 'drawer-row' + (w.active ? ' active' : '');
+    const body = document.createElement('div');
+    body.className = 'drawer-body';
+    const dot = document.createElement('span');
+    dot.className = 'tab-dot' + (w.active && viewSession?.connected ? ' connected' : ' idle');
+    const name = document.createElement('span');
+    name.className = 'drawer-name';
+    name.textContent = w.name;
+    body.append(dot, name);
+    onTap(
+      body,
+      () => {
+        void selectWindow(w.id);
+        closeDrawer();
+      },
+      drawer,
+    );
+    const rename = document.createElement('button');
+    rename.className = 'drawer-act';
+    rename.type = 'button';
+    rename.textContent = '✎';
+    rename.title = 'Rename tmux window';
+    onTap(
+      rename,
+      () => {
+        void promptRenameWindow(w);
+      },
+      drawer,
+    );
+    const end = document.createElement('button');
+    end.className = 'drawer-act danger';
+    end.type = 'button';
+    end.textContent = 'End';
+    end.title = 'Terminate window (not Close view)';
+    onTap(
+      end,
+      () => {
+        closeDrawer();
+        confirmTerminateWindow(w);
+      },
+      drawer,
+    );
+    row.append(body, rename, end);
+    drawerList.append(row);
+  }
+}
+
+async function selectWindow(id: string): Promise<void> {
+  const data = await postWindows('/api/windows/select', { id });
+  if (data) applyWindowsPayload(data);
+}
+
+async function promptNewWindow(): Promise<void> {
+  if (windowMode !== true) return;
+  const raw = await domPrompt({
+    label: `New window in existing session "${mainSessionName}" (blank = tmux's own name). This runs new-window and switches the shared current window.`,
+    value: '',
+    okText: 'Create window',
+  });
+  if (raw === null) return;
+  const name = raw.trim();
+  const data = await postWindows('/api/windows', name ? { name } : {});
+  if (data) applyWindowsPayload(data);
+}
+
+async function promptRenameWindow(w: WindowTab): Promise<void> {
+  const raw = await domPrompt({
+    label: `Rename tmux window ${w.id} (this changes the real window, on every device):`,
+    value: w.name,
+    okText: 'Rename window',
+  });
+  if (raw === null) return;
+  const name = raw.trim();
+  if (!name) return;
+  const data = await postWindows('/api/windows/rename', { id: w.id, name });
+  if (data) applyWindowsPayload(data);
+}
+
+function confirmTerminateWindow(w: WindowTab): void {
+  if (document.querySelector('.confirm-overlay')) return;
+  const overlay = document.createElement('div');
+  overlay.className = 'paste-overlay confirm-overlay';
+  const box = document.createElement('div');
+  box.className = 'paste-box confirm-box';
+  const label = document.createElement('div');
+  label.className = 'paste-label';
+  const strong = document.createElement('b');
+  strong.textContent = `${w.name} (${w.id})`;
+  label.append(
+    'Terminate window ',
+    strong,
+    '? This kills that tmux window and the programs in it. It is not "Close view" — closing the browser does not do this. If this is the final window, the session ends. The page will not recreate it.',
+  );
+  const row = document.createElement('div');
+  row.className = 'paste-row';
+  const cancel = document.createElement('button');
+  cancel.className = 'tb-btn';
+  cancel.type = 'button';
+  cancel.textContent = 'Cancel';
+  const confirm = document.createElement('button');
+  confirm.className = 'tb-btn danger';
+  confirm.type = 'button';
+  confirm.textContent = 'Terminate window';
+  row.append(cancel, confirm);
+  box.append(label, row);
+  overlay.append(box);
+  document.body.append(overlay);
+  window.setTimeout(() => confirm.focus(), 0);
+  const close = (): void => {
+    overlay.remove();
+    viewSession?.focus();
+  };
+  cancel.addEventListener('click', close);
+  confirm.addEventListener('click', () => {
+    close();
+    void (async () => {
+      const data = await postWindows('/api/windows/kill', { id: w.id, confirm: true });
+      if (data) applyWindowsPayload(data);
+    })();
+  });
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) close();
+  });
+}
+
+async function syncWindows(): Promise<void> {
+  const data = await fetchWindowsPayload();
+  if (!data || data.mode === 'sessions') return;
+  applyWindowsPayload(data);
+}
+
+async function initWindows(boot: WindowsPayload): Promise<void> {
+  document.body.classList.add('window-mode');
+  addBtn.title = 'New window in the main session';
+  drawerTitle.textContent = 'Windows';
+  drawerNew.textContent = '+  New window';
+  mMenuBtn.title = 'Windows';
+  onWindowControl = (msg) => {
+    if (msg.type === 'absent') {
+      applyWindowsPayload({ mode: 'windows', sessionPresent: false, windows: [] });
+      showViewBanner(
+        msg.message || `tmux session "${mainSessionName}" is not running. This page will not create it.`,
+        true,
+      );
+      refreshMobileUI();
+      return;
+    }
+    if (msg.type === 'windows') applyWindowsPayload(msg as WindowsPayload);
+    if (msg.type === 'info' && msg.message) flashStatus(msg.message, 2400);
+  };
+  const prefs = (await fetchServerPrefs()) ?? {};
+  if (typeof prefs.fontSize === 'number' && Number.isFinite(prefs.fontSize)) {
+    currentFont = Math.min(MAX_FONT, Math.max(MIN_FONT, Math.round(prefs.fontSize)));
+    updateFontVal();
+    try {
+      localStorage.setItem('tw.fontSize', String(currentFont));
+    } catch {
+      /* ignore */
+    }
+  }
+  if (typeof prefs.keybar === 'boolean' && prefs.keybar !== isKeybarVisible()) {
+    setKeybarVisible(prefs.keybar);
+  }
+  if (boot?.session) mainSessionName = boot.session;
+  // One ordinary attach to the main session. Tabs do not each open a pty:
+  // stage 1 shares tmux's current window, so a second pty would only fight
+  // over the same window and its size.
+  viewSession = new Session(mainSessionName, mainSessionName);
+  sessions.push(viewSession);
+  activeTab = viewSession;
+  activeSession = viewSession;
+  viewSession.setShown(true);
+  applyWindowsPayload(boot);
+  prefsReady = true;
+  refreshMobileUI();
+}
+
+function enableModeControls(enabled: boolean): void {
+  for (const button of document.querySelectorAll<HTMLButtonElement>('.session-only button, .drawer-new, .tab-add')) {
+    button.disabled = !enabled;
+  }
+}
+
+let initializing = false;
+async function init(): Promise<void> {
+  if (initializing || windowMode !== null) return;
+  initializing = true;
+  try {
+    const boot = await fetchWindowsPayload();
+    const caps = boot?.capabilities;
+    const sessionsMode = boot?.mode === 'sessions' && caps?.sessionTabs === true && caps.windowTabs === false;
+    const windowsMode = boot?.mode === 'windows' && caps?.windowTabs === true && caps.sessionTabs === false &&
+      typeof boot.session === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(boot.session);
+    if (!boot || (!sessionsMode && !windowsMode)) {
+      showStatus('Cannot initialize: server mode/capabilities unavailable. No terminal was attached.');
+      viewBannerBtn.textContent = 'Retry initialization';
+      showViewBanner('Cannot obtain server mode/capabilities. No session or window was created. Retry when the server is reachable.', true);
+      return;
+    }
+    document.body.classList.remove('mode-pending');
+    viewBannerBtn.textContent = 'Reconnect view';
+    hideViewBanner();
+    if (sessionsMode) await initSessions();
+    else {
+      windowMode = true;
+      await initWindows(boot);
+    }
+    enableModeControls(true);
+  } finally {
+    initializing = false;
+  }
+}
+
+enableModeControls(false);
 void init();
 
 // Keep the tab list in sync with the server: when the page regains focus /
@@ -3517,7 +4053,7 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('focus', () => void syncFromServer());
 setInterval(() => {
   if (document.visibilityState === 'visible') void syncFromServer();
-}, 5000);
+}, 2000);
 
 // Default: show the key bar on touch devices, hidden on desktop (unless saved).
 const keybarDefault = (() => {

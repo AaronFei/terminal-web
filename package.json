@@ -12,6 +12,7 @@
   "scripts": {
     "dev": "bash scripts/dev.sh",
     "build": "node esbuild.mjs",
+    "test": "tsx --test test/*.test.ts",
     "start": "tsx src/server.ts",
     "postinstall": "node scripts/fix-pty-perms.mjs"
   },

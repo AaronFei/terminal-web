@@ -124,6 +124,64 @@ body {
   color: #fff;
 }
 
+/* Terminate is not Close. A word, not ×, so it cannot be mistaken for the old
+   "close tab & kill session" control. */
+.tab .tab-terminate {
+  flex: 0 0 auto;
+  appearance: none;
+  -webkit-appearance: none;
+  height: 18px;
+  padding: 0 4px;
+  border: 1px solid #6a3030;
+  border-radius: 4px;
+  background: transparent;
+  color: #e0a0a0;
+  font: inherit;
+  font-size: 10px;
+  line-height: 16px;
+  cursor: pointer;
+}
+.tab .tab-terminate:hover {
+  background: #5a1d1d;
+  color: #fff;
+}
+
+/* No inferred mode during initialization. Reveal the relevant controls only
+   after the server's explicit mode/capabilities response has been validated. */
+body.mode-pending .session-only,
+body.window-mode .session-only {
+  display: none !important;
+}
+body:not(.window-mode) .window-only {
+  display: none !important;
+}
+
+#view-banner {
+  position: absolute;
+  inset: 12px;
+  z-index: 8;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 24px;
+  text-align: center;
+  background: rgba(30, 30, 30, 0.94);
+  border: 1px solid #3a3a3a;
+  border-radius: 10px;
+  color: #e5e5e5;
+  font-family: var(--mono);
+  font-size: 14px;
+  line-height: 1.45;
+}
+#view-banner.hidden {
+  display: none;
+}
+.view-banner-text {
+  max-width: 42em;
+}
+
 .tab-add {
   flex: 0 0 auto;
   appearance: none;

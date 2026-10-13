@@ -13,7 +13,11 @@ import * as pty from "node-pty";
 import { loadConfig } from "./config.js";
 import {
   sanitizeSession,
+  sanitizeWindowId,
+  sanitizeWindowName,
   tmuxArgs,
+  tmuxAttachArgs,
+  configureTmuxSocket,
   ensureTmuxAvailable,
   tagWebSession,
   setWebTabLabel,
@@ -22,12 +26,22 @@ import {
   mateStartDir,
   findClientTty,
   refreshClient,
+  describeSessionWindows,
+  sessionExists,
+  createSessionWindow,
+  renameSessionWindow,
+  killSessionWindow,
+  selectSessionWindow,
+  sessionPaneCwd,
+  runTmuxResult,
 } from "./tmux.js";
+import type { SessionWindows, TmuxWindow } from "./tmux.js";
 import type { ServerMessage } from "./types.js";
 import { isClientMessage } from "./types.js";
 import { gateHttp, isAuthed } from "./auth.js";
 
 const config = loadConfig();
+configureTmuxSocket(config.tmuxSocketName);
 
 // The cross-device tab list lives on the tmux sessions themselves (a @twtab
 // user option), so it can't drift from reality — see tmux.ts. This set just
@@ -111,7 +125,7 @@ function mateNameOf(name: string): string {
 // a device can sleep for days.
 // ---------------------------------------------------------------------------
 
-const CLOSED_FILE = path.join(os.homedir(), ".terminal-web", "closed.json");
+const CLOSED_FILE = path.join(config.stateDir, "closed.json");
 /** How long a closed name is refused to a stale page. */
 const CLOSED_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -600,6 +614,9 @@ async function handleKillSession(
     return;
   }
   const name = sanitizeSession(obj.name);
+  // Explicit session management is available in either mode. MAIN_SESSION
+  // is a target, not an immune name. Window-tab termination uses
+  // /api/windows/kill instead; closing a view calls neither endpoint.
   // A tab is up to two sessions — its own and, if it was ever split, the one
   // named after it. Closing the tab closes both; nothing else is touched, and
   // the second name is derived here rather than taken from the request, so a
@@ -615,19 +632,20 @@ async function handleKillSession(
   }
   // Before anything that waits: a sleeping page could wake in the meantime.
   markClosed(names);
-  // Save first, and wait for it: this command has taken whole tmux servers down
-  // with it (see snapshotBeforeKill). The tab is already gone in the browser —
-  // it does not wait on this reply — so the second or two costs nothing. One
-  // save covers both halves.
-  await snapshotBeforeKill(name);
-  for (const target of names) {
-    execFile("tmux", ["kill-session", "-t", target], (err) => {
-      // A tab that was never split has no second session, and "can't find
-      // session" is the expected answer for it rather than a failure.
-      if (err) console.error(`[api] kill-session "${target}" failed:`, err.message);
+  // A later explicit kill must run AFTER an earlier restart's recreation,
+  // rather than killing its temporary absence and letting it resurrect later.
+  // Tombstones/broadcast above remain immediate to block stale reconnects.
+  await enqueueTmuxLifecycleMutation(async () => {
+    await snapshotBeforeKill(name); // one snapshot covers both split halves
+    for (const target of names) {
+      // Exact targeting also keeps an absent name from prefix-matching an
+      // unrelated session. An absent split mate is an expected no-op.
+      const killed = await runTmuxResult(["kill-session", "-t", `=${target}`]);
+      if (!killed.ok) console.error(`[api] kill-session "${target}" failed:`, killed.stderr);
       else console.log(`[api] kill-session "${target}" done`);
-    });
-  }
+    }
+    await publishWindows(true);
+  });
   sendJsonHttp(res, 200, { ok: true });
 }
 
@@ -642,7 +660,7 @@ async function handleKillSession(
 // the cache back in.
 // ---------------------------------------------------------------------------
 
-const PREFS_FILE = path.join(os.homedir(), ".terminal-web", "prefs.json");
+const PREFS_FILE = path.join(config.stateDir, "prefs.json");
 
 interface UiPrefs {
   /** Tab (tmux session) this device class last had focused. */
@@ -865,15 +883,15 @@ async function handleUpload(
 // ---------------------------------------------------------------------------
 /** The active pane's working directory for a tmux session, or null if unknown. */
 function sessionCwd(session: string | null): Promise<string | null> {
-  if (!session) return Promise.resolve(null);
-  const name = sanitizeSession(session);
-  return new Promise((resolve) => {
-    execFile(
-      "tmux",
-      ["display-message", "-p", "-t", name, "-F", "#{pane_current_path}"],
-      (err, stdout) => resolve(err ? null : stdout.toString().trim() || null)
-    );
-  });
+  // Window mode has one session. Do not let a download query name some other
+  // session on this socket.
+  const name = config.windowMode
+    ? config.mainSession
+    : session
+      ? sanitizeSession(session)
+      : "";
+  if (!name) return Promise.resolve(null);
+  return sessionPaneCwd(name);
 }
 
 async function handleDownload(
@@ -941,6 +959,315 @@ async function handleDownload(
 }
 
 // ---------------------------------------------------------------------------
+// Window tabs (phase one).
+//
+// Tabs are windows of the fixed main session, keyed by stable @window id.
+// Nothing here creates that session. Selection is tmux's current window,
+// shared by every ordinary attach — not a per-browser choice.
+// ---------------------------------------------------------------------------
+
+async function readJsonBody(req: http.IncomingMessage, max = 4096): Promise<unknown | undefined> {
+  try {
+    const body: unknown = JSON.parse((await readBody(req, max)).toString("utf8"));
+    return body && typeof body === "object" && !Array.isArray(body) ? body : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function windowsBody(described: SessionWindows) {
+  return {
+    mode: "windows" as const,
+    capabilities: { windowTabs: true, sessionTabs: false },
+    stage: 1 as const,
+    limitation: "shared-current-window" as const,
+    session: config.mainSession,
+    sessionPresent: described.present,
+    windows: described.windows,
+    activeId: described.activeId,
+  };
+}
+
+function broadcastWindows(described: SessionWindows): void {
+  const payload = { type: "windows" as const, ...windowsBody(described) };
+  const set = sessionClients.get(config.mainSession);
+  if (!set) return;
+  for (const peer of set) sendJson(peer, payload);
+}
+
+let lastWindowsJson = "";
+
+async function publishWindows(force = false): Promise<void> {
+  if (!config.windowMode) return;
+  try {
+    const described = await describeSessionWindows(config.mainSession);
+    const json = JSON.stringify(windowsBody(described));
+    if (!force && json === lastWindowsJson) return;
+    lastWindowsJson = json;
+    broadcastWindows(described);
+  } catch (err) {
+    console.error("[windows] publish failed:", err);
+  }
+}
+
+async function handleListWindows(res: http.ServerResponse): Promise<void> {
+  if (!config.windowMode) {
+    sendJsonHttp(res, 200, {
+      mode: "sessions",
+      capabilities: { windowTabs: false, sessionTabs: true },
+    });
+    return;
+  }
+  const described = await describeSessionWindows(config.mainSession);
+  sendJsonHttp(res, 200, windowsBody(described));
+}
+
+async function requireMainWindows(): Promise<
+  | { ok: true; windows: TmuxWindow[] }
+  | { ok: false; status: number; error: string }
+> {
+  const described = await describeSessionWindows(config.mainSession);
+  if (described.present === null || described.windows === null) {
+    return {
+      ok: false,
+      status: 503,
+      error: "tmux could not be queried; nothing was changed and nothing was created",
+    };
+  }
+  if (!described.present) {
+    return {
+      ok: false,
+      status: 409,
+      error: `session "${config.mainSession}" is not running; refusing to create it`,
+    };
+  }
+  return { ok: true, windows: described.windows };
+}
+
+async function handleCreateWindow(
+  req: http.IncomingMessage,
+  res: http.ServerResponse
+): Promise<void> {
+  if (!config.windowMode) {
+    sendJsonHttp(res, 404, { error: "window mode is off" });
+    return;
+  }
+  const body = await readJsonBody(req);
+  if (body === undefined) {
+    sendJsonHttp(res, 400, { error: "invalid body" });
+    return;
+  }
+  const obj = body as { name?: unknown };
+  let name: string | undefined;
+  if (typeof obj.name === "string" && obj.name.trim() !== "") {
+    const cleaned = sanitizeWindowName(obj.name);
+    if (!cleaned) {
+      sendJsonHttp(res, 400, { error: "invalid window name" });
+      return;
+    }
+    name = cleaned;
+  }
+  const owned = await requireMainWindows();
+  if (!owned.ok) {
+    console.error(`[api] refused new-window: ${owned.error}`);
+    sendJsonHttp(res, owned.status, { error: owned.error });
+    return;
+  }
+  console.log(
+    `[api] new-window -t ${config.mainSession}${name ? ` -n ${JSON.stringify(name)}` : ""}`
+  );
+  const created = await createSessionWindow(config.mainSession, name);
+  if (!created) {
+    sendJsonHttp(res, 500, { error: "new-window failed" });
+    return;
+  }
+  const described = await describeSessionWindows(config.mainSession);
+  await publishWindows(true);
+  sendJsonHttp(res, 200, { ok: true, created, ...windowsBody(described) });
+}
+
+async function handleRenameWindow(
+  req: http.IncomingMessage,
+  res: http.ServerResponse
+): Promise<void> {
+  if (!config.windowMode) {
+    sendJsonHttp(res, 404, { error: "window mode is off" });
+    return;
+  }
+  const body = await readJsonBody(req);
+  if (body === undefined) {
+    sendJsonHttp(res, 400, { error: "invalid body" });
+    return;
+  }
+  const obj = body as { id?: unknown; name?: unknown };
+  const id = sanitizeWindowId(obj.id);
+  const name = sanitizeWindowName(obj.name);
+  if (!id || !name) {
+    sendJsonHttp(res, 400, { error: "missing window id or name" });
+    return;
+  }
+  const owned = await requireMainWindows();
+  if (!owned.ok) {
+    sendJsonHttp(res, owned.status, { error: owned.error });
+    return;
+  }
+  if (!owned.windows.some((w) => w.id === id)) {
+    sendJsonHttp(res, 404, {
+      error: `window ${id} is not in session ${config.mainSession}`,
+    });
+    return;
+  }
+  console.log(`[api] rename-window ${id} -> ${JSON.stringify(name)}`);
+  const renamed = await renameSessionWindow(config.mainSession, id, name);
+  if (!renamed) {
+    sendJsonHttp(res, 500, { error: "rename-window failed" });
+    return;
+  }
+  const described = await describeSessionWindows(config.mainSession);
+  await publishWindows(true);
+  sendJsonHttp(res, 200, { ok: true, ...windowsBody(described) });
+}
+
+async function handleSelectWindow(
+  req: http.IncomingMessage,
+  res: http.ServerResponse
+): Promise<void> {
+  if (!config.windowMode) {
+    sendJsonHttp(res, 404, { error: "window mode is off" });
+    return;
+  }
+  const body = await readJsonBody(req);
+  if (body === undefined) {
+    sendJsonHttp(res, 400, { error: "invalid body" });
+    return;
+  }
+  const id = sanitizeWindowId((body as { id?: unknown }).id);
+  if (!id) {
+    sendJsonHttp(res, 400, { error: "missing window id" });
+    return;
+  }
+  const owned = await requireMainWindows();
+  if (!owned.ok) {
+    sendJsonHttp(res, owned.status, { error: owned.error });
+    return;
+  }
+  if (!owned.windows.some((w) => w.id === id)) {
+    sendJsonHttp(res, 404, {
+      error: `window ${id} is not in session ${config.mainSession}`,
+    });
+    return;
+  }
+  console.log(`[api] select-window ${id} (shared current window of ${config.mainSession})`);
+  const selected = await selectSessionWindow(config.mainSession, id);
+  if (!selected) {
+    sendJsonHttp(res, 500, { error: "select-window failed" });
+    return;
+  }
+  const described = await describeSessionWindows(config.mainSession);
+  await publishWindows(true);
+  sendJsonHttp(res, 200, { ok: true, ...windowsBody(described) });
+}
+
+/**
+ * Order explicit session kill/restart and window termination through one
+ * existing lifecycle queue. In particular, later kill must win over earlier
+ * restart recreation. There is no name or last-window protection.
+ */
+let tmuxLifecycleChain: Promise<void> = Promise.resolve();
+
+function enqueueTmuxLifecycleMutation(fn: () => Promise<void>): Promise<void> {
+  const run = tmuxLifecycleChain.then(fn, fn);
+  tmuxLifecycleChain = run.then(
+    () => undefined,
+    () => undefined
+  );
+  return run;
+}
+
+/** Explicit session restart; never invoked by a view reconnect. */
+async function restartWindowSession(session: string, ws: WebSocket): Promise<void> {
+  await enqueueTmuxLifecycleMutation(async () => {
+    await snapshotBeforeKill(session);
+    console.log(`[ws] explicit restart: kill-session "${session}"`);
+    const killed = await runTmuxResult(["kill-session", "-t", `=${session}`]);
+    if (!killed.ok) {
+      console.error(`[ws] restart failed: ${killed.stderr}`);
+      sendJson(ws, { type: "info", message: "Restart failed; session was not recreated." });
+      return;
+    }
+    // This creation belongs to the explicit restart, not an attach callback.
+    const created = await runTmuxResult([
+      "-f", config.tmuxConfPath, "new-session", "-d", "-s", session,
+    ]);
+    if (!created.ok) console.error(`[ws] restart recreation failed: ${created.stderr}`);
+    await publishWindows(true);
+  });
+}
+
+/**
+ * Terminate one window. Requires `confirm: true` so a stray POST cannot kill
+ * a window. Killing the final window ends the session (and the tmux server
+ * if it has no other sessions). This is an explicit user operation.
+ */
+async function handleKillWindow(
+  req: http.IncomingMessage,
+  res: http.ServerResponse
+): Promise<void> {
+  if (!config.windowMode) {
+    sendJsonHttp(res, 404, { error: "window mode is off" });
+    return;
+  }
+  const body = await readJsonBody(req);
+  if (body === undefined) {
+    sendJsonHttp(res, 400, { error: "invalid body" });
+    return;
+  }
+  const obj = body as { id?: unknown; confirm?: unknown };
+  const id = sanitizeWindowId(obj.id);
+  if (!id) {
+    sendJsonHttp(res, 400, { error: "missing window id" });
+    return;
+  }
+  if (obj.confirm !== true) {
+    sendJsonHttp(res, 400, {
+      error: "terminate requires confirm:true; closing a browser view must not call this",
+    });
+    return;
+  }
+  // Keep membership checks and result publication ordered across requests.
+  await enqueueTmuxLifecycleMutation(async () => {
+    const owned = await requireMainWindows();
+    if (!owned.ok) {
+      sendJsonHttp(res, owned.status, { error: owned.error });
+      return;
+    }
+    if (!owned.windows.some((w) => w.id === id)) {
+      sendJsonHttp(res, 404, {
+        error: `window ${id} is not in session ${config.mainSession}`,
+      });
+      return;
+    }
+    console.log(`[api] kill-window ${id} in "${config.mainSession}"`);
+    const outcome = await killSessionWindow(config.mainSession, id);
+    if (outcome === "refused") {
+      sendJsonHttp(res, 409, {
+        error: `window ${id} no longer belongs to session "${config.mainSession}"`,
+      });
+      return;
+    }
+    if (outcome !== "killed") {
+      sendJsonHttp(res, 500, {
+        error: "kill-window failed",
+      });
+      return;
+    }
+    const described = await describeSessionWindows(config.mainSession);
+    await publishWindows(true);
+    sendJsonHttp(res, 200, { ok: true, ...windowsBody(described) });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // HTTP server
 // ---------------------------------------------------------------------------
 
@@ -961,6 +1288,31 @@ const server = http.createServer((req, res) => {
 
       if (method === "POST" && requestUrl.pathname === "/upload") {
         await handleUpload(req, res, requestUrl.searchParams.get("name"));
+        return;
+      }
+
+      if (method === "GET" && requestUrl.pathname === "/api/windows") {
+        await handleListWindows(res);
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/windows") {
+        await handleCreateWindow(req, res);
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/windows/rename") {
+        await handleRenameWindow(req, res);
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/windows/select") {
+        await handleSelectWindow(req, res);
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/windows/kill") {
+        await handleKillWindow(req, res);
         return;
       }
 
@@ -1079,7 +1431,16 @@ function parseDim(raw: string | null, fallback: number, max: number): number {
 // This server's own configuration env vars. They must NOT leak into the user's
 // shell: e.g. zsh's `%m` prompt escape reads $HOST, so an exported HOST (the
 // bind address) would make the prompt show "100" instead of the real hostname.
-const SERVER_ENV_VARS = ["HOST", "PORT", "DEFAULT_SESSION"];
+const SERVER_ENV_VARS = [
+  "HOST",
+  "PORT",
+  "DEFAULT_SESSION",
+  "MAIN_SESSION",
+  "TMUX_SOCKET_NAME",
+  "WINDOW_MODE",
+  "TERMINAL_WEB_STATE_DIR",
+  "TERMINAL_WEB_SNAPSHOT",
+];
 
 function hasUtf8(value: string | undefined): boolean {
   return typeof value === "string" && /utf-?8/i.test(value);
@@ -1089,6 +1450,12 @@ function buildChildEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, TERM: "xterm-256color" };
   for (const key of SERVER_ENV_VARS) {
     delete env[key];
+  }
+  // A server started from inside tmux inherits TMUX. With a configured socket
+  // the pty must not follow that outer client; -L on the argv is the other lock.
+  if (config.tmuxSocketName) {
+    delete env.TMUX;
+    delete env.TMUX_PANE;
   }
   // Ensure a UTF-8 locale. Under launchd the environment has no LANG, which
   // leaves the shell and tmux in a non-UTF-8 (C) locale — CJK/wide characters
@@ -1176,7 +1543,9 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
   } catch {
     requested = null;
   }
-  const session = sanitizeSession(requested ?? config.defaultSession);
+  const session = config.windowMode
+    ? config.mainSession
+    : sanitizeSession(requested ?? config.defaultSession);
 
   // Guard the host's system-wide pty table: refuse the connection (before
   // spawning any pty) once we're at the cap, rather than letting a runaway or
@@ -1195,6 +1564,33 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
     } catch {
       /* ignore */
     }
+    return;
+  }
+
+  if (config.windowMode) {
+    // Ignore ?session= and ?create=1. Presence was resolved before the
+    // handshake completed, so the message handler is installed before the
+    // client can send ping/restart. A late check would drop those frames.
+    const present = (req as http.IncomingMessage & { mainPresent?: boolean | null }).mainPresent;
+    if (present === true) {
+      attachSession(ws, config.mainSession, cols, rows, undefined, true);
+      return;
+    }
+    if (present === false || present === null) {
+      const message =
+        present === false
+          ? `tmux session "${config.mainSession}" is not running. This server will not create it.`
+          : `tmux session "${config.mainSession}" could not be queried. This server will not create it.`;
+      console.log(`[ws] refused attach to "${config.mainSession}": present=${String(present)}`);
+      sendJson(ws, { type: "absent", message });
+      try {
+        ws.close(1000, "absent");
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+    void attachMainWindow(ws, cols, rows);
     return;
   }
 
@@ -1225,6 +1621,31 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
 });
 
 /**
+ * Attach to the existing main session. If it is missing or tmux cannot be
+ * asked, tell the client and do not spawn `new-session`. Used only if the
+ * upgrade path did not already resolve presence.
+ */
+async function attachMainWindow(ws: LiveSocket, cols: number, rows: number): Promise<void> {
+  const present = await sessionExists(config.mainSession);
+  if (ws.readyState !== WebSocket.OPEN) return;
+  if (present !== true) {
+    const message =
+      present === false
+        ? `tmux session "${config.mainSession}" is not running. This server will not create it.`
+        : `tmux session "${config.mainSession}" could not be queried. This server will not create it.`;
+    console.log(`[ws] refused attach to "${config.mainSession}": present=${String(present)}`);
+    sendJson(ws, { type: "absent", message });
+    try {
+      ws.close(1000, "absent");
+    } catch {
+      /* ignore */
+    }
+    return;
+  }
+  attachSession(ws, config.mainSession, cols, rows, undefined, true);
+}
+
+/**
  * Attach, starting a brand-new second half of a split where the first half is
  * working: opening the split is for doing something next to what is on screen,
  * and a shell in the home directory meant a `cd` back there every time.
@@ -1246,11 +1667,15 @@ function attachSession(
   session: string,
   cols: number,
   rows: number,
-  startDir?: string
+  startDir?: string,
+  attachOnly = false
 ): void {
   let proc: pty.IPty;
+  const args = attachOnly
+    ? tmuxAttachArgs(session)
+    : tmuxArgs(session, config.tmuxConfPath, startDir);
   try {
-    proc = pty.spawn("tmux", tmuxArgs(session, config.tmuxConfPath, startDir), {
+    proc = pty.spawn("tmux", args, {
       name: "xterm-256color",
       cols,
       rows,
@@ -1280,7 +1705,8 @@ function attachSession(
   //
   // Except the second half of a split: it is reached through the tab it is
   // named after, and a tab of its own is the one thing it must not become.
-  if (!session.endsWith(MATE_SUFFIX)) {
+  // Window mode must not tag `main` as a session-tab, and must not create it.
+  if (!attachOnly && !session.endsWith(MATE_SUFFIX)) {
     liveSessions.add(session);
     tagWebSession(session);
   }
@@ -1441,6 +1867,12 @@ function attachSession(
       } else if (parsed.type === "ping") {
         sendJson(ws, { type: "pong" });
       } else if (parsed.type === "restart") {
+        if (attachOnly) {
+          // Explicit restart deliberately recreates the target. Ordinary
+          // view reconnects remain attach-only, even after this operation.
+          void restartWindowSession(session, ws);
+          return;
+        }
         // Kill this session's tmux session. The attached pty (tmux client)
         // then exits, the ws closes, and the client reconnects into a fresh
         // session via `new-session -A`.
@@ -1448,16 +1880,13 @@ function attachSession(
         // Same kill, same insurance as closing a tab: restarting one session is
         // not meant to cost the other twelve, which is what it does on the day
         // this command takes the server with it.
-        void snapshotBeforeKill(session).then(() => {
-          execFile("tmux", ["kill-session", "-t", session], (err) => {
-            if (err) {
-              console.error(
-                `[ws] restart: kill-session "${session}" failed:`,
-                err.message
-              );
-              sendJson(ws, { type: "info", message: "Restart failed." });
-            }
-          });
+        void enqueueTmuxLifecycleMutation(async () => {
+          await snapshotBeforeKill(session);
+          const killed = await runTmuxResult(["kill-session", "-t", `=${session}`]);
+          if (!killed.ok) {
+            console.error(`[ws] restart: kill-session "${session}" failed:`, killed.stderr);
+            sendJson(ws, { type: "info", message: "Restart failed." });
+          }
         });
       } else if (parsed.type === "debug") {
         console.error(
@@ -1517,9 +1946,24 @@ server.on("upgrade", (req, socket, head) => {
     return;
   }
 
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit("connection", ws, req);
-  });
+  // Resolve the main session before completing the handshake. The connection
+  // handler can then attach synchronously, so a ping sent on open is not lost
+  // in the gap while `has-session` runs.
+  void (async () => {
+    try {
+      if (config.windowMode) {
+        (req as http.IncomingMessage & { mainPresent?: boolean | null }).mainPresent =
+          await sessionExists(config.mainSession);
+      }
+      if (socket.destroyed) return;
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        wss.emit("connection", ws, req);
+      });
+    } catch (err) {
+      console.error("[ws] upgrade failed:", err);
+      socket.destroy();
+    }
+  })();
 });
 
 // Heartbeat: terminate sockets that stopped responding to pings.
@@ -1662,7 +2106,22 @@ const COLLAPSE_GRACE_MS = 2 * 60 * 60_000;
  */
 const SNAPSHOT_TIMEOUT_MS = 10_000;
 
+let snapshotSkipLogged = false;
+
 async function snapshotSessions(reason = "interval"): Promise<void> {
+  // resurrect's save.sh talks to the default tmux server, not `-L`. Running it
+  // from a scratch-socket test (or any non-default socket) would overwrite the
+  // production snapshot. Skip unless we are on the default socket.
+  if (config.tmuxSocketName || process.env.TERMINAL_WEB_SNAPSHOT === "0") {
+    if (!snapshotSkipLogged) {
+      snapshotSkipLogged = true;
+      console.log(
+        "[snapshot] skipped (custom tmux socket or TERMINAL_WEB_SNAPSHOT=0); " +
+          "not touching the default resurrect snapshot"
+      );
+    }
+    return;
+  }
   try {
     await fsp.access(RESURRECT_SAVE, fs.constants.X_OK);
   } catch {
@@ -1752,6 +2211,14 @@ setTimeout(() => void snapshotSessions(), FIRST_SNAPSHOT_MS).unref();
 const snapshotTimer = setInterval(() => void snapshotSessions(), SNAPSHOT_MS);
 snapshotTimer.unref();
 
+// External `new-window` / `rename-window` / `kill-window` never hit this
+// process. Poll the configured socket and push when the list changes so every
+// browser follows the same authoritative selection.
+const windowsWatch = config.windowMode
+  ? setInterval(() => void publishWindows(false), 1000)
+  : null;
+windowsWatch?.unref();
+
 // ---------------------------------------------------------------------------
 // Startup & graceful shutdown
 // ---------------------------------------------------------------------------
@@ -1777,7 +2244,21 @@ function logStartup(): void {
       "  WARNING: tmux was not found on PATH. Sessions will fail to start. Install tmux (e.g. `brew install tmux`)."
     );
   }
-  console.log(`  Default session: "${config.defaultSession}"  (override with ?session=NAME)`);
+  if (config.windowMode) {
+    console.log(
+      `  Window mode: existing session "${config.mainSession}" only (tabs are its windows; missing session is not created)`
+    );
+    console.log(
+      "  Stage 1: shared current window and size via an ordinary attach. Independent selection is not enabled."
+    );
+  } else {
+    console.log(`  Default session: "${config.defaultSession}"  (override with ?session=NAME)`);
+  }
+  if (config.tmuxSocketName) {
+    console.log(`  tmux socket: -L ${config.tmuxSocketName}`);
+  } else {
+    console.log("  tmux socket: default");
+  }
   console.log(`  Max concurrent terminals: ${config.maxPtys}  (set MAX_PTYS to change)`);
   console.log("");
 }
@@ -1819,6 +2300,7 @@ function shutdown(signal: string): void {
   console.log(`\n[server] received ${signal}, shutting down...`);
 
   clearInterval(heartbeat);
+  if (windowsWatch) clearInterval(windowsWatch);
 
   // Close all websockets (detaches their tmux clients; sessions persist).
   for (const client of wss.clients) {

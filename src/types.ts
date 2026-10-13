@@ -19,8 +19,9 @@ export interface PingMessage {
 
 /**
  * Client -> Server: kill this connection's tmux session so it restarts fresh.
- * The pty (tmux client) then exits, the ws closes, and the client reconnects
- * into a brand-new session via `new-session -A`.
+ * In session mode the pty exits and legacy reconnect creates the fresh
+ * session via `new-session -A`. In window mode this explicit request makes
+ * the backend recreate its target; ordinary view reconnect stays attach-only.
  */
 export interface RestartMessage {
   type: "restart";
@@ -54,6 +55,33 @@ export interface ClosedMessage {
 }
 
 /**
+ * Server -> Client: the fixed main session is not running. The client must
+ * not reconnect in a way that creates it. Distinct from `closed`, which means
+ * a session tab was killed on purpose.
+ */
+export interface AbsentMessage {
+  type: "absent";
+  message: string;
+}
+
+/**
+ * Server -> Client: authoritative window list for the shared main session.
+ * `windows: null` means "unknown, keep what you had". `activeId` is tmux's
+ * current window — every client must highlight that, not a local choice.
+ */
+export interface WindowsMessage {
+  type: "windows";
+  mode: "windows";
+  capabilities: { windowTabs: boolean; sessionTabs: boolean };
+  stage: 1;
+  limitation: "shared-current-window";
+  session: string;
+  sessionPresent: boolean | null;
+  windows: { id: string; index: number; name: string; active: boolean }[] | null;
+  activeId: string | null;
+}
+
+/**
  * Client -> Server: diagnostic trace (only sent when ?debug=ime is set). The
  * server just logs these; they never affect terminal behavior.
  */
@@ -68,7 +96,12 @@ export interface DebugMessage {
 export type ClientMessage = ResizeMessage | PingMessage | RestartMessage | DebugMessage;
 
 /** Any JSON control message the server may send to a client. */
-export type ServerMessage = PongMessage | InfoMessage | ClosedMessage;
+export type ServerMessage =
+  | PongMessage
+  | InfoMessage
+  | ClosedMessage
+  | AbsentMessage
+  | WindowsMessage;
 
 /** Union of every JSON control message in the protocol. */
 export type ControlMessage = ClientMessage | ServerMessage;

@@ -27,8 +27,10 @@ an `AUTH_TOKEN` to gate access with a shared token. See [Security](#security).
 
 - **Resumable** sessions (tmux) — survive disconnect, refresh and sleep
 - Deep **scrollback** (mouse-wheel, or one-finger drag on touch)
-- **Multi-session tabs** — open (`+`), rename (double-tap), close-and-kill (`×`),
-  restart (`⟳`); the tab list **syncs across all your devices**
+- **Main-session window tabs** (stage 1) — tabs are windows of the existing
+  `main` session, by stable `@window` id. **Close view** only disconnects this
+  browser; **Terminate** kills a window after confirmation. See
+  [Window tabs](docs/window-tabs.md).
 - **Mobile layout + installable PWA** — compact top bar, a sessions drawer, and
   an on-screen key bar (arrows, Esc/Tab/sticky Ctrl·Alt, `^C`)
 - **Copy & paste** that works over plain HTTP (no HTTPS required)
@@ -253,9 +255,13 @@ create"). So:
   the same named session. tmux repaints the screen and you're back where you
   left off.
 
-> Closing a **tab inside the app** (the `×`) is different: it *kills* that tmux
-> session for good. So to keep a job running, just close the window or let the
-> connection drop — don't press `×`. See [Sessions & tabs](#sessions--tabs).
+> The default is original **session mode** (`WINDOW_MODE=0`, also when unset).
+> In optional `WINDOW_MODE=1`, closing the browser — or **Close view** — only
+> detaches. **Terminate** is a separate confirmed action that kills one window;
+> terminating the final window ends the session. Automatic view reconnect does
+> not create a missing session. `MAIN_SESSION` is a target, not a protected name.
+> Explicit session-management APIs remain available in either mode. See
+> [Window tabs](docs/window-tabs.md).
 
 The front end intentionally does **not** reset the terminal on reconnect, so
 your local xterm scrollback is preserved and tmux's repaint lands cleanly. A
@@ -314,14 +320,53 @@ keyboard via the `visualViewport` API.
 
 ---
 
+## Window tabs (stage 1)
+
+Window tabs are an **opt-in generic tmux feature**, not an iTerm2 integration.
+With `WINDOW_MODE=1`, the page attaches to the **existing** session named by
+`MAIN_SESSION` (default `main`) and shows one tab per **window**, identified by tmux's stable
+`#{window_id}` (`@12`). It does not create that session, and it does not
+recreate a missing window. Details: [docs/window-tabs.md](docs/window-tabs.md).
+
+**Stage 1 limitation:** every browser shares that session's current window and
+its size. Clicking a tab runs `select-window` for every attached client. This
+build does not set `window-size`: the attach does not load `-f`, so
+`tmux/web.tmux.conf` is not applied. It does not add grouped sessions or a
+control-mode backend. A grouped session would only isolate which window is
+current; clients in the group would still share window and pane size.
+Independent selection and size are not part of this stage. Real Chromium/xterm
+and scratch WS/PTY/tmux regressions cover both modes; actual Safari/iPad input
+is untested. Details: [docs/window-tabs.md](docs/window-tabs.md).
+
+```bash
+# Create the session yourself, then explicitly opt in:
+tmux new-session -d -s main
+WINDOW_MODE=1 MAIN_SESSION=main npm start
+```
+
+The client obtains explicit server mode/capabilities before attaching or enabling
+tab operations. Failed initialization displays an error and a retry button; it
+does not guess a mode.
+
+**Close view** disconnects this browser only. **Terminate** asks first, then
+`kill-window`; killing the final window ends the session. View reconnect never
+recreates a missing session. Restart and session split controls are hidden in
+the window UI because they are session operations, not window-tab operations.
+Explicit legacy session-management APIs remain permitted, including restart;
+`MAIN_SESSION` does not provide name-based immunity.
+
 ## Sessions & tabs
+
+This is the **default** when `WINDOW_MODE` is unset or `0`. Set `WINDOW_MODE=1`
+explicitly for the different window-tab UI described above.
 
 Each tmux session is independent, and the top bar shows one **tab** per open
 session (with a live connection dot). 
 
 - **`+`** opens a new session (you're prompted for a name).
 - **`×`** closes the tab **and kills that tmux session for good** (its programs
-  are terminated). This is *not* the same as disconnecting — see
+  are terminated), including its `__b` split mate. There are no immune session
+  names. This is *not* the same as disconnecting — see
   [How resume works](#how-resume-works).
 - **`⟳`** restarts the active session: kills it and reconnects into a fresh one.
 - Open tabs and the active tab are remembered **on the server** and restored on
@@ -433,7 +478,10 @@ your shell instead, e.g. `HOST=100.x.y.z PORT=8090 npm start`.
 | ----------------- | ---------------------------------------------------- | --------------------------------------------------------------------------- |
 | `PORT`            | `8090`                                               | Port the HTTP/WebSocket server listens on.                                  |
 | `HOST`            | Tailscale IPv4 (`tailscale ip -4`), else `0.0.0.0`   | Address to bind. Set explicitly to pin a specific interface/IP.             |
-| `DEFAULT_SESSION` | `web`                                                | tmux session name used when the client doesn't pass `?session=NAME`.        |
+| `DEFAULT_SESSION` | `web`                                                | Session name when the client omits `?session=` (`WINDOW_MODE=0` only).      |
+| `MAIN_SESSION`    | `main`                                               | Window-mode target, not a protected name. Never created by view reconnect. |
+| `WINDOW_MODE`     | `0`                                                  | Default original session tabs. Explicit `1` enables existing-session window tabs (shared current window and size). |
+| `TMUX_SOCKET_NAME`| _(empty = default socket)_                           | tmux `-L` name. Tests must set a scratch name; every tmux call uses it.     |
 | `AUTH_TOKEN`      | _(empty = no auth)_                                  | Shared token required for requests arriving via Cloudflare; see [Security](#security). |
 | `UPLOAD_DIR`      | `~/terminal-web-uploads`                             | Where pasted/dropped/attached files are saved (see below).                  |
 | `UPLOAD_RETENTION_HOURS` | `72`                                          | Auto-delete uploads older than this (0 = never by age).                     |

@@ -15,6 +15,24 @@ export interface Config {
   hostFromTailscale: boolean;
   /** Default tmux session name when none is given in the WS query. */
   defaultSession: string;
+  /**
+   * Fixed tmux session whose windows are the browser tabs in window mode.
+   * Default `main`. View attachment never creates this session; an explicit
+   * restart request may recreate it. The name confers no protection.
+   */
+  mainSession: string;
+  /**
+   * tmux `-L` socket name. Empty = the default socket (production). Tests set
+   * a scratch name; every tmux invocation must use it.
+   */
+  tmuxSocketName: string;
+  /**
+   * Optional window-tab mode. Tabs are windows of `mainSession`, attached
+   * with ordinary shared current-window semantics. Default off.
+   */
+  windowMode: boolean;
+  /** Prefs / closed-tab state. Tests point this at a temp directory. */
+  stateDir: string;
   /** Absolute path to the project root. */
   repoRoot: string;
   /** Absolute path to tmux/web.tmux.conf. */
@@ -65,6 +83,37 @@ function detectTailscaleIp(): string | null {
   }
 }
 
+function parseSocketName(raw: string | undefined): string {
+  if (raw === undefined || raw.trim() === "") return "";
+  const name = raw.trim();
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(name)) {
+    throw new Error(
+      `Invalid TMUX_SOCKET_NAME "${raw}": must match [A-Za-z0-9_-]{1,64}. ` +
+        "Refusing to fall back to the default socket."
+    );
+  }
+  return name;
+}
+
+function parseMainSession(raw: string | undefined): string {
+  const source = raw && raw.trim() !== "" ? raw.trim() : "main";
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(source)) {
+    throw new Error(
+      `Invalid MAIN_SESSION "${source}": must match [A-Za-z0-9_-]{1,64}. ` +
+        "Refusing to rewrite it into a different session name."
+    );
+  }
+  return source;
+}
+
+function parseWindowMode(raw: string | undefined): boolean {
+  if (raw === undefined || raw.trim() === "") return false;
+  const v = raw.trim().toLowerCase();
+  if (v === "1" || v === "true" || v === "on" || v === "yes") return true;
+  if (v === "0" || v === "false" || v === "off" || v === "no") return false;
+  throw new Error(`Invalid WINDOW_MODE "${raw}": use 1 or 0.`);
+}
+
 function parseNonNegInt(raw: string | undefined, fallback: number): number {
   if (raw === undefined || raw.trim() === "") return fallback;
   const n = Number.parseInt(raw, 10);
@@ -106,6 +155,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       ? env.DEFAULT_SESSION.trim()
       : "web";
 
+  const stateDir =
+    env.TERMINAL_WEB_STATE_DIR && env.TERMINAL_WEB_STATE_DIR.trim() !== ""
+      ? path.resolve(env.TERMINAL_WEB_STATE_DIR.trim())
+      : path.join(os.homedir(), ".terminal-web");
+
   const uploadDir =
     env.UPLOAD_DIR && env.UPLOAD_DIR.trim() !== ""
       ? path.resolve(env.UPLOAD_DIR.trim())
@@ -116,6 +170,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     host,
     hostFromTailscale,
     defaultSession,
+    mainSession: parseMainSession(env.MAIN_SESSION),
+    tmuxSocketName: parseSocketName(env.TMUX_SOCKET_NAME),
+    windowMode: parseWindowMode(env.WINDOW_MODE),
+    stateDir,
     repoRoot: REPO_ROOT,
     tmuxConfPath: path.join(REPO_ROOT, "tmux", "web.tmux.conf"),
     publicDir: path.join(REPO_ROOT, "public"),
