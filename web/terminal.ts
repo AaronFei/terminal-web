@@ -1244,19 +1244,30 @@ class Session {
     if (!this.half) setPaneDims(this.term.cols, this.term.rows);
   }
 
+  /**
+   * How far below the top of #terminal the last thing worth seeing ends: the
+   * lower of the cursor row and the last non-blank row on screen. Measured
+   * from #terminal rather than from this pane, because in a stacked split the
+   * bottom half starts halfway down and the keyboard slides both halves.
+   */
   contentBottomPx(): number {
     const buf = this.term.buffer.active;
-    let last = buf.cursorY;
-    for (let y = this.term.rows - 1; y > last; y -= 1) {
+    const rows = this.term.rows;
+    // cursorY counts from the bottom page of the buffer, not from what is on
+    // screen; scrolled back into history, the cursor may be below the view.
+    let last = Math.min(rows - 1, Math.max(0, buf.baseY + buf.cursorY - buf.viewportY));
+    for (let y = rows - 1; y > last; y -= 1) {
       const line = buf.getLine(buf.viewportY + y);
       if (line && line.translateToString(true).trim() !== '') {
         last = y;
         break;
       }
     }
-    const screen = this.el.querySelector<HTMLElement>('.xterm-screen');
-    const cellH = (screen?.clientHeight || this.el.clientHeight) / this.term.rows;
-    return (last + 1) * cellH;
+    const screen = this.el.querySelector<HTMLElement>('.xterm-screen') ?? this.el;
+    const box = screen.getBoundingClientRect();
+    // Both rects carry the same --kb-offset transform, so it cancels out.
+    const top = box.top - termArea.getBoundingClientRect().top;
+    return top + ((last + 1) * box.height) / rows;
   }
 
   /** Adopt the measured pane size and pass it on to the server. */
@@ -1574,6 +1585,8 @@ function markFocusedPane(): void {
   for (const s of [activeTab, activeTab?.mate]) {
     s?.el.classList.toggle('focused', split && s === activeSession);
   }
+  // The other half's prompt may sit somewhere else entirely; slide for it.
+  if (keyboardUp) scheduleKeyboardOffset();
 }
 
 function reflectActiveStatus(): void {
