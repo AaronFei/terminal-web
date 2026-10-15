@@ -70,16 +70,16 @@ export function openHelp(): void {
   box.innerHTML =
     '<div class="help-title">How to copy / paste / files</div>' +
     '<ul class="help-list">' +
-    `<li><b>Copy</b> — hold <b>${selKey}</b> and drag to select; it copies automatically. (Or select, then <b>${copyKey}</b> / tap <b>Copy</b>.)</li>` +
+    `<li><b>Copy</b> — hold <b>${selKey}</b> and drag to select; it copies automatically. (Or select, then <b>${copyKey}</b>.) On a phone/tablet, tap <b>選取</b> on the key bar and drag over the text, or long-press a word; adjust with the handles, then tap <b>複製</b>.</li>` +
     `<li><b>Paste</b> — click the terminal, then <b>${pasteKey}</b>${
       isMac ? '' : ' (or Ctrl+Shift+V)'
-    }. On a phone/tablet, tap <b>Paste</b> and paste into the box that appears.</li>` +
+    }. On a phone/tablet, open <b>⋯ → 📋 Paste</b>; if the browser can't read the clipboard, paste into the box that appears.</li>` +
     (isMac
       ? ''
       : '<li><b>Literal ^V</b> (vim visual-block, readline quoted-insert) — Ctrl+V now pastes, so press <b>Ctrl+Q</b>, which both accept as its alias.</li>') +
-    '<li><b>Attach a file</b> (for Claude Code etc.) — tap the 📎 button, or paste / drag any file (image, PDF, text…): it uploads and inserts the file path. Then press Enter.</li>' +
+    '<li><b>Attach a file</b> (for Claude Code etc.) — <b>⋯ → 📎 Attach a file</b> (a phone also has 📎 on its top bar), or paste / drag any file (image, PDF, text…): it uploads and inserts the file path. Then press Enter.</li>' +
     '<li><b>Download a file</b> — tap the ⬇ button (or <b>⋯ → Download</b> on a phone) and enter a name/relative path from the terminal\'s current folder (e.g. <code>report.zip</code>), or a full path (<code>~/output/report.zip</code>). It downloads to this device.</li>' +
-    '<li><b>Scroll</b> — mouse wheel or two-finger swipe scrolls the history.</li>' +
+    '<li><b>Scroll</b> — mouse wheel, or drag one finger up/down on a touch screen, scrolls the history.</li>' +
     '<li><b>Tabs</b> — <b>+</b> new session, <b>×</b> closes the tab and kills its session, <b>⟳</b> restarts the session fresh. Double-click (or double-tap) a tab to rename it — the label changes but its tmux session stays the same.</li>' +
     '</ul>' +
     '<div class="paste-row"><button class="tb-btn" type="button" data-help-close>Got it</button></div>';
