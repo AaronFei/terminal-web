@@ -3,10 +3,12 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import { URL } from "node:url";
+import { pipeline, Transform } from "node:stream";
 import type { Duplex } from "node:stream";
+import { pipeline as pipelineAsync } from "node:stream/promises";
 
 import { WebSocketServer, WebSocket } from "ws";
 import * as pty from "node-pty";
@@ -28,7 +30,10 @@ import {
   mateStartDir,
   findClientTty,
   refreshClient,
+  SingleFlight,
+  snapshotCollapsed,
 } from "./tmux.js";
+import type { WebTab } from "./tmux.js";
 import type { ServerMessage } from "./types.js";
 import { isClientMessage } from "./types.js";
 import { gateHttp, refuseUpgrade, hostAllowed, originAllowed } from "./auth.js";
@@ -36,6 +41,29 @@ import { gateHttp, refuseUpgrade, hostAllowed, originAllowed } from "./auth.js";
 const config = loadConfig();
 // Before anything can run tmux: from here on every call goes to this socket.
 setTmuxSocket(config.tmuxSocket);
+
+/**
+ * The commit this process is running, for GET /api/health: tsx runs the source
+ * as it was when the server started, so after a deploy this is what says
+ * whether the restart really picked up the new code. Read once, now — the
+ * checkout can move on underneath a running server. Null when it can't be
+ * told (no git, not a checkout).
+ */
+function readCommit(): string | null {
+  try {
+    const out = execFileSync("git", ["rev-parse", "--short", "HEAD"], {
+      cwd: config.repoRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 3000,
+    }).trim();
+    return /^[0-9a-f]{4,40}$/.test(out) ? out : null;
+  } catch {
+    return null;
+  }
+}
+const RUNNING_COMMIT = readCommit();
+const STARTED_AT = new Date().toISOString();
 
 // The cross-device tab list lives on the tmux sessions themselves (a @twtab
 // user option), so it can't drift from reality — see tmux.ts. This set just
@@ -393,15 +421,26 @@ async function serveStatic(
     return;
   }
 
-  const stream = fs.createReadStream(filePath);
-  stream.on("error", (err) => {
-    console.error(`[static] read error for ${filePath}:`, err);
-    if (!res.headersSent) {
-      res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
-    }
-    res.end();
+  sendFileBody(res, filePath, "static");
+}
+
+/**
+ * Stream a file as the body of a response whose headers are already out.
+ *
+ * Through pipeline rather than .pipe(): .pipe() does nothing when the response
+ * goes away early, so a download cancelled halfway — or a page closed while
+ * its bundle was loading — left the read stream paused and its fd open for
+ * good. pipeline tears both ends down when either one fails or closes. A read
+ * error past this point can't be answered with a status of its own, as the
+ * 200 is already sent: the response is cut off instead, and the client sees a
+ * body shorter than its Content-Length.
+ */
+function sendFileBody(res: http.ServerResponse, filePath: string, tag: string): void {
+  pipeline(fs.createReadStream(filePath), res, (err) => {
+    // The client leaving early is routine, not an error worth a log line.
+    if (!err || (err as NodeJS.ErrnoException).code === "ERR_STREAM_PREMATURE_CLOSE") return;
+    console.error(`[${tag}] read error for ${filePath}:`, err);
   });
-  stream.pipe(res);
 }
 
 // ---------------------------------------------------------------------------
@@ -484,6 +523,56 @@ async function readBody(
 // server so any browser sees the same sessions; display names persist here too.
 // ---------------------------------------------------------------------------
 
+// Every page asks for the tab list when it loads and on every reconnect, so a
+// deploy — which drops every socket on every device at once — had each of them
+// fork a `tmux list-sessions` of its own. Requests within WEB_TABS_TTL_MS of
+// each other share one; a list still being fetched is shared too.
+//
+// Anything this server does that changes the list (a tab adopted, killed or
+// renamed) drops the cached one, so the page that did it never gets the list
+// from before; a tab just opened is in it through liveSessions, which is read
+// fresh every time. Only changes made elsewhere — a session ended from a shell
+// nobody here is attached to — can take up to the TTL to show.
+const WEB_TABS_TTL_MS = 1000;
+let webTabsCache: { at: number; tabs: Promise<WebTab[] | null>; settled: WebTab[] | null } | null =
+  null;
+
+function cachedWebTabs(): Promise<WebTab[] | null> {
+  const now = Date.now();
+  if (webTabsCache && now - webTabsCache.at < WEB_TABS_TTL_MS) return webTabsCache.tabs;
+  const entry = { at: now, tabs: listWebTabs(), settled: null as WebTab[] | null };
+  void entry.tabs.then((tabs) => {
+    entry.settled = tabs;
+  });
+  webTabsCache = entry;
+  return entry.tabs;
+}
+
+function invalidateWebTabs(): void {
+  webTabsCache = null;
+}
+
+/**
+ * Whether a fresh tab list (see cachedWebTabs) already shows `name` as a tab,
+ * so attaching to it need not write the tag again. Only a list that has come
+ * back and is still inside the TTL counts; anything else says no, and the tag
+ * is written as it always was.
+ */
+function knownTagged(name: string): boolean {
+  const c = webTabsCache;
+  if (!c || !c.settled || Date.now() - c.at >= WEB_TABS_TTL_MS) return false;
+  return c.settled.some((t) => t.name === name);
+}
+
+/**
+ * Tag a session as a web tab, and drop the cached list once it is. For tabs
+ * that may have no socket (adopt), so are not covered by liveSessions: those
+ * only show up in the list through their tag.
+ */
+function tagAsWebTab(name: string): void {
+  tagWebSession(name, invalidateWebTabs);
+}
+
 /**
  * Return the web tabs, sourced from tmux (sessions carrying the @twtab tag),
  * unioned with sessions that have a live WebSocket right now (covering the
@@ -492,7 +581,7 @@ async function readBody(
  * current tabs instead of wrongly clearing them.
  */
 async function handleListSessions(res: http.ServerResponse): Promise<void> {
-  const tagged = await listWebTabs();
+  const tagged = await cachedWebTabs();
   if (tagged === null) {
     sendJsonHttp(res, 200, { tabs: null }); // unknown -> client keeps its state
     return;
@@ -539,7 +628,10 @@ async function handleRenameSession(
   }
   const displayName =
     typeof obj.displayName === "string" ? obj.displayName : name;
-  setWebTabLabel(name, displayName);
+  // The cached list goes now and again once tmux has the label: a list fetched
+  // in between may still hold the old one.
+  invalidateWebTabs();
+  setWebTabLabel(name, displayName, invalidateWebTabs);
   sendJsonHttp(res, 200, { ok: true });
 }
 
@@ -593,13 +685,27 @@ async function handleAdoptSessions(
     // A second half is never adopted as a tab of its own; its tab carries it.
     if (name.endsWith(MATE_SUFFIX)) continue;
     if (!alive.has(name) || adopted.includes(name)) continue;
-    tagWebSession(name);
+    tagAsWebTab(name);
     adopted.push(name);
   }
   if (adopted.length) {
     console.log(`[api] re-adopted as web tabs: ${adopted.join(", ")}`);
   }
   sendJsonHttp(res, 200, { adopted });
+}
+
+/**
+ * Kill a session on purpose — a tab closed, a session restarted — and resolve
+ * tmux's error (null on success). Callers take their snapshot first (see
+ * snapshotBeforeKill). A kill that worked is noted for the collapse guard, so
+ * the sessions it removed don't read as a crash; one that failed is not, as
+ * that is also how a kill that took the tmux server down with it looks.
+ */
+async function killSession(name: string): Promise<Error | null> {
+  const err = await runTmuxStatus(["kill-session", "-t", sessionTarget(name)]);
+  if (!err) noteDeliberateKill(name);
+  invalidateWebTabs();
+  return err;
 }
 
 /**
@@ -659,7 +765,7 @@ async function handleKillSession(
   // save covers both halves.
   await snapshotBeforeKill(name);
   for (const target of names) {
-    void runTmuxStatus(["kill-session", "-t", sessionTarget(target)]).then((err) => {
+    void killSession(target).then((err) => {
       // A tab that was never split has no second session, and "can't find
       // session" is the expected answer for it rather than a failure.
       if (err) console.error(`[api] kill-session "${target}" failed:`, err.message);
@@ -842,52 +948,120 @@ async function handleUpload(
   // saved file keeps its name and extension; fall back to a content-type ext
   // (mainly for clipboard image pastes, which carry no name), then ".bin".
   const safeName = safeUploadBaseName(nameParam);
+  const suffix = safeName ? `-${safeName}` : IMAGE_EXT[ctype] ?? ".bin";
 
   const maxBytes = config.uploadMaxBytes;
-  const chunks: Buffer[] = [];
-  let size = 0;
+  const tooLarge = (): void => {
+    const mb = Math.round(maxBytes / (1024 * 1024));
+    sendJsonHttp(res, 413, { error: `file too large (max ${mb} MB)` });
+  };
+
+  // A body that says up front it is too big is refused before any file is made.
+  const declared = Number(req.headers["content-length"]);
+  if (maxBytes > 0 && Number.isFinite(declared) && declared > maxBytes) {
+    tooLarge();
+    req.destroy();
+    return;
+  }
+
+  let file: { handle: fsp.FileHandle; filePath: string; filename: string };
   try {
-    for await (const chunk of req) {
-      const buf = chunk as Buffer;
-      size += buf.length;
+    await fsp.mkdir(config.uploadDir, { recursive: true });
+    file = await createUploadFile(suffix);
+  } catch (err) {
+    console.error("[upload] write error:", err);
+    sendJsonHttp(res, 500, { error: "could not save file" });
+    req.destroy();
+    return;
+  }
+  const { handle, filePath, filename } = file;
+
+  // Straight to disk as it arrives. This used to collect the whole body in
+  // memory and write it at the end — with the 1 GB default limit that peaked
+  // at twice the file, and two large uploads at once could take the NUC down.
+  //
+  // pipeline destroys the request on any failure, and that closes the socket,
+  // so an answer has to be written before it does: the 413 from inside the
+  // counter, the 500 from an error listener added ahead of pipeline's own.
+  let size = 0;
+  let failed: "too large" | "write" | null = null;
+  const counter = new Transform({
+    transform(chunk: Buffer, _enc, cb) {
+      size += chunk.length;
       if (maxBytes > 0 && size > maxBytes) {
-        const mb = Math.round(maxBytes / (1024 * 1024));
-        sendJsonHttp(res, 413, { error: `file too large (max ${mb} MB)` });
-        req.destroy();
+        failed = "too large";
+        tooLarge();
+        cb(new Error("upload over the size limit"));
         return;
       }
-      chunks.push(buf);
-    }
+      cb(null, chunk);
+    },
+  });
+  const out = handle.createWriteStream();
+  out.once("error", (err) => {
+    // pipeline hands a broken-off request's error on to this stream too; that
+    // one is not a write failure, and the request is already gone by then.
+    if (failed || req.destroyed) return;
+    failed = "write";
+    console.error("[upload] write error:", err);
+    if (!res.headersSent) sendJsonHttp(res, 500, { error: "could not save file" });
+  });
+
+  try {
+    await pipelineAsync(req, counter, out);
   } catch (err) {
-    console.error("[upload] read error:", err);
-    if (!res.headersSent) sendJsonHttp(res, 400, { error: "read failed" });
+    // Whatever went wrong, a partial file is never left behind: it would look
+    // like a finished upload to anything that went looking.
+    await fsp.unlink(filePath).catch(() => {});
+    if (failed === "too large") {
+      console.warn(`[upload] refused ${filename}: over ${maxBytes} bytes; partial file removed`);
+    } else if (!failed) {
+      // The client went away, or the request broke off.
+      console.warn(
+        `[upload] ${filename} broke off after ${size} bytes (${(err as Error).message}); ` +
+          "partial file removed"
+      );
+      if (!res.headersSent) sendJsonHttp(res, 400, { error: "read failed" });
+    }
     return;
   }
 
   if (size === 0) {
+    await fsp.unlink(filePath).catch(() => {});
     sendJsonHttp(res, 400, { error: "empty body" });
     return;
   }
 
-  try {
-    await fsp.mkdir(config.uploadDir, { recursive: true });
+  console.log(`[upload] saved ${filePath} (${size} bytes)`);
+  sendJsonHttp(res, 200, { path: filePath, name: filename, size });
+  void pruneUploads(); // keep the upload dir bounded
+}
+
+/**
+ * Create a new, empty upload file named after `suffix`, open for writing.
+ *
+ * Exclusive ("wx"): the random part of the name is what keeps two uploads in
+ * the same second apart, and with the file now written as it streams in, a
+ * clash would have two requests writing into one file. On the off chance the
+ * name is taken, a fresh one is drawn.
+ */
+async function createUploadFile(
+  suffix: string
+): Promise<{ handle: fsp.FileHandle; filePath: string; filename: string }> {
+  for (let attempt = 0; ; attempt++) {
     const stamp = new Date()
       .toISOString()
       .replace(/[:]/g, "-")
       .replace(/\..+$/, "")
       .replace("T", "_");
     const rand = Math.random().toString(36).slice(2, 8) || "x";
-    const suffix = safeName ? `-${safeName}` : IMAGE_EXT[ctype] ?? ".bin";
     const filename = `clip-${stamp}-${rand}${suffix}`;
     const filePath = path.join(config.uploadDir, filename);
-    await fsp.writeFile(filePath, Buffer.concat(chunks), { mode: 0o600 });
-    console.log(`[upload] saved ${filePath} (${size} bytes)`);
-    sendJsonHttp(res, 200, { path: filePath, name: filename, size });
-    void pruneUploads(); // keep the upload dir bounded
-
-  } catch (err) {
-    console.error("[upload] write error:", err);
-    sendJsonHttp(res, 500, { error: "could not save file" });
+    try {
+      return { handle: await fsp.open(filePath, "wx", 0o600), filePath, filename };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST" || attempt >= 4) throw err;
+    }
   }
 }
 
@@ -961,15 +1135,7 @@ async function handleDownload(
     res.end();
     return;
   }
-  const stream = fs.createReadStream(abs);
-  stream.on("error", (err) => {
-    console.error(`[download] read error for ${abs}:`, err);
-    if (!res.headersSent) {
-      res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
-    }
-    res.end();
-  });
-  stream.pipe(res);
+  sendFileBody(res, abs, "download");
   console.log(`[download] served ${abs} (${stat.size} bytes)`);
 }
 
@@ -1007,6 +1173,13 @@ const server = http.createServer((req, res) => {
 
       if (method === "POST" && requestUrl.pathname === "/upload") {
         await handleUpload(req, res, requestUrl.searchParams.get("name"));
+        return;
+      }
+
+      if (method === "GET" && requestUrl.pathname === "/api/health") {
+        // Behind the token gate like everything else: through Cloudflare it
+        // needs a sign-in, like any other route.
+        sendJsonHttp(res, 200, { ok: true, commit: RUNNING_COMMIT, startedAt: STARTED_AT });
         return;
       }
 
@@ -1114,6 +1287,14 @@ const MAX_ROWS = 500;
 // drifts from its model keeps a crooked border until something redraws it all.
 const REPAINT_DELAY_MS = 400;
 const HEARTBEAT_MS = 20_000;
+// Output backpressure. ws.send never refuses: on a slow link (a phone through
+// the tunnel) a burst like `cat` of a big file queued in this process without
+// limit. Past the high mark the pty is paused — tmux then holds the output, as
+// it does for any slow client — and resumed once the queue drains below the low.
+const WS_HIGH_WATER = 1024 * 1024;
+const WS_LOW_WATER = 256 * 1024;
+// While paused, how often to look again, beside the check in each send's callback.
+const WS_DRAIN_POLL_MS = 100;
 
 /** Parse a ?cols=/?rows= param, falling back when absent or out of bounds. */
 function parseDim(raw: string | null, fallback: number, max: number): number {
@@ -1209,7 +1390,13 @@ function logSafe(value: unknown): string {
   });
 }
 
-const wss = new WebSocketServer({ noServer: true });
+// The largest frame a client may send. What comes this way is keystrokes,
+// pastes and small JSON — files go over HTTP (/upload) — and ws's default of
+// 100 MB let any one client make the server hold that much for a single
+// message. A bigger frame closes the socket (1009).
+const WS_MAX_PAYLOAD = 1024 * 1024;
+
+const wss = new WebSocketServer({ noServer: true, maxPayload: WS_MAX_PAYLOAD });
 
 function sendJson(ws: WebSocket, msg: ServerMessage): void {
   if (ws.readyState === WebSocket.OPEN) {
@@ -1361,9 +1548,13 @@ function attachSession(
   //
   // Except the second half of a split: it is reached through the tab it is
   // named after, and a tab of its own is the one thing it must not become.
+  //
+  // The write is skipped when a list fetched a moment ago already shows it
+  // tagged — a deploy reconnects every tab on every device at once. It doesn't
+  // drop the cached list either: liveSessions already puts this tab in it.
   if (!session.endsWith(MATE_SUFFIX)) {
     liveSessions.add(session);
-    tagWebSession(session);
+    if (!knownTagged(session)) tagWebSession(session);
   }
   addSessionClient(session, ws);
 
@@ -1442,12 +1633,42 @@ function attachSession(
     }
   };
 
+  // Output backpressure (see WS_HIGH_WATER). Only this client's pty is paused:
+  // every socket has its own tmux client, so a slow phone holds up no one else.
+  let outputPaused = false;
+  let drainTimer: NodeJS.Timeout | null = null;
+  const stopDrainWatch = (): void => {
+    if (drainTimer) {
+      clearInterval(drainTimer);
+      drainTimer = null;
+    }
+  };
+  const checkDrained = (): void => {
+    if (!outputPaused) return;
+    // A socket that is no longer open never drains; let the pty go rather than
+    // leave it paused for good.
+    if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount >= WS_LOW_WATER) return;
+    outputPaused = false;
+    stopDrainWatch();
+    try {
+      proc.resume();
+    } catch {
+      /* the pty is already gone */
+    }
+  };
+
   // pty output -> ws (binary)
   const onData = proc.onData((data: string) => {
     if (ws.readyState !== WebSocket.OPEN) return;
     try {
       // node-pty emits strings; send raw bytes so xterm gets exact output.
-      ws.send(Buffer.from(data, "utf8"), { binary: true });
+      ws.send(Buffer.from(data, "utf8"), { binary: true }, checkDrained);
+      if (!outputPaused && ws.bufferedAmount > WS_HIGH_WATER) {
+        outputPaused = true;
+        proc.pause();
+        // The send callbacks see most of the drain; the timer catches the rest.
+        drainTimer = setInterval(checkDrained, WS_DRAIN_POLL_MS);
+      }
     } catch (err) {
       console.error("[ws] send error:", err);
     }
@@ -1460,8 +1681,12 @@ function attachSession(
     // Exit 1 with no signal is what a tmux client does when its server goes.
     if (exitCode === 1 && !signal) noteAbnormalPtyExit();
     closed = true; // pty is already gone; avoid kill() in cleanup
+    stopDrainWatch();
     liveSessions.delete(session);
     livePtys.delete(proc);
+    // The session may have ended with it (its last shell exited): the cached
+    // tab list, and the tag it says this session has, may be out of date.
+    invalidateWebTabs();
     if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
       try {
         ws.close(1000, "pty exited");
@@ -1534,7 +1759,7 @@ function attachSession(
         // connected (see the connection handler), so this kills that session
         // and no other.
         void snapshotBeforeKill(session)
-          .then(() => runTmuxStatus(["kill-session", "-t", sessionTarget(session)]))
+          .then(() => killSession(session))
           .then((err) => {
             if (err) {
               console.error(
@@ -1567,6 +1792,7 @@ function attachSession(
   });
 
   ws.on("close", () => {
+    stopDrainWatch();
     onData.dispose();
     onExit.dispose();
     removeSessionClient(session, ws);
@@ -1746,7 +1972,7 @@ const RESURRECT_SAVE = path.join(
  * point at the result. Hence the UTF-8 environment below, and this check: a
  * snapshot nobody has verified is how we got here.
  */
-async function readSnapshot(): Promise<{ panes: number; sessions: number; ageMs: number } | null> {
+async function readSnapshot(): Promise<{ panes: number; names: string[]; savedAt: number } | null> {
   const file = path.join(RESURRECT_DIR, "last");
   try {
     const [text, stat] = await Promise.all([
@@ -1754,8 +1980,8 @@ async function readSnapshot(): Promise<{ panes: number; sessions: number; ageMs:
       fsp.stat(file),
     ]);
     const lines = text.split("\n").filter((line) => line.startsWith("pane\t"));
-    const sessions = new Set(lines.map((line) => line.split("\t")[1]));
-    return { panes: lines.length, sessions: sessions.size, ageMs: Date.now() - stat.mtimeMs };
+    const names = new Set(lines.map((line) => line.split("\t")[1]));
+    return { panes: lines.length, names: [...names], savedAt: stat.mtimeMs };
   } catch {
     return null;
   }
@@ -1767,7 +1993,25 @@ async function readSnapshot(): Promise<{ panes: number; sessions: number; ageMs:
 // wrong" and the save is skipped, loudly, rather than writing over the only
 // record of what was there. Bounded in time: once the smaller set has been the
 // truth for this long, it IS the truth and snapshots resume.
+//
+// Sessions this server killed on purpose are taken off the count it compares
+// against (see snapshotCollapsed in tmux.ts). Closing a split tab is two of its
+// sessions at once — out of four, half — and the snapshot taken just before
+// the kill still held both, so every save after it was skipped for two hours.
 const COLLAPSE_GRACE_MS = 2 * 60 * 60_000;
+
+/** Session name -> when this server killed it on purpose (epoch ms). */
+const deliberateKills = new Map<string, number>();
+
+function noteDeliberateKill(name: string): void {
+  const now = Date.now();
+  deliberateKills.set(name, now);
+  // Past the grace period the guard no longer looks at the snapshot it would
+  // matter to, so older entries can go.
+  for (const [n, at] of deliberateKills) {
+    if (now - at > COLLAPSE_GRACE_MS + SNAPSHOT_TIMEOUT_MS) deliberateKills.delete(n);
+  }
+}
 
 /**
  * How long to wait for a save before going ahead without it. The snapshot is
@@ -1783,8 +2027,23 @@ const SNAPSHOT_TIMEOUT_MS = 10_000;
  */
 const SNAPSHOTS_ENABLED = !config.tmuxSocket;
 
-async function snapshotSessions(reason = "interval"): Promise<void> {
-  if (!SNAPSHOTS_ENABLED) return; // periodic, startup and before-kill alike
+/**
+ * One save at a time (see SingleFlight in tmux.ts). Closing several tabs in a
+ * row, or pressing restart a few times, used to run as many save.sh at once,
+ * all writing snapshots named for the same second.
+ */
+const snapshots = new SingleFlight(
+  (reasons) => saveSnapshot(reasons.join("; ")),
+  (err) => console.error("[snapshot] save threw:", err)
+);
+
+/** Take a snapshot that starts after this call; resolves when it is done. Never rejects. */
+function snapshotSessions(reason = "interval"): Promise<void> {
+  if (!SNAPSHOTS_ENABLED) return Promise.resolve(); // periodic, startup and before-kill alike
+  return snapshots.run(reason);
+}
+
+async function saveSnapshot(reason: string): Promise<void> {
   try {
     await fsp.access(RESURRECT_SAVE, fs.constants.X_OK);
   } catch {
@@ -1795,17 +2054,20 @@ async function snapshotSessions(reason = "interval"): Promise<void> {
   const names = await listTmuxSessions();
   if (!names || names.length === 0) return;
   const previous = await readSnapshot();
-  if (
-    previous &&
-    previous.ageMs < COLLAPSE_GRACE_MS &&
-    previous.sessions >= 2 &&
-    names.length * 2 <= previous.sessions
-  ) {
+  const guard = snapshotCollapsed({
+    live: names.length,
+    snapshot: previous,
+    killedAt: deliberateKills,
+    saveWindowMs: SNAPSHOT_TIMEOUT_MS,
+    graceMs: COLLAPSE_GRACE_MS,
+    now: Date.now(),
+  });
+  if (guard.collapsed) {
     console.error(
       `[snapshot] NOT saving: ${names.length} session(s) live but the last ` +
-        `snapshot holds ${previous.sessions} — keeping it rather than writing ` +
-        "over the only record of what was there. Restore from " +
-        `${RESURRECT_DIR} if this was not deliberate.`
+        `snapshot holds ${guard.baseline} not closed on purpose — keeping it ` +
+        "rather than writing over the only record of what was there. Restore " +
+        `from ${RESURRECT_DIR} if this was not deliberate.`
     );
     return;
   }
@@ -1859,16 +2121,32 @@ async function snapshotSessions(reason = "interval"): Promise<void> {
  * in the moment before means a death costs seconds instead of the up-to-five
  * minutes back to the last interval save, whatever it turns out to be.
  *
- * Never fatal, and bounded by SNAPSHOT_TIMEOUT_MS: the kill the user asked for
- * happens either way.
+ * Never fatal, and bounded: the kill the user asked for happens either way.
+ * A save already running is let finish and then a new one is taken — one that
+ * began before this was asked for may have listed the sessions too early — so
+ * the wait is at most two saves, and PRE_KILL_WAIT_MS caps it outright.
  */
 async function snapshotBeforeKill(name: string): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  const timedOut = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), PRE_KILL_WAIT_MS);
+  });
   try {
-    await snapshotSessions(`before killing "${name}"`);
+    const outcome = await Promise.race([snapshotSessions(`before killing "${name}"`), timedOut]);
+    if (outcome === "timeout") {
+      console.error(
+        `[snapshot] no snapshot after ${PRE_KILL_WAIT_MS} ms; killing "${name}" without waiting longer`
+      );
+    }
   } catch (err) {
     console.error("[snapshot] pre-kill save threw:", err);
+  } finally {
+    clearTimeout(timer);
   }
 }
+
+/** The longest a kill waits for its snapshot: two saves, with room for listing. */
+const PRE_KILL_WAIT_MS = 2 * SNAPSHOT_TIMEOUT_MS + 5_000;
 
 if (SNAPSHOTS_ENABLED) {
   setTimeout(() => void snapshotSessions(), FIRST_SNAPSHOT_MS).unref();
@@ -1890,6 +2168,8 @@ function logStartup(): void {
 
   if (config.tailscaleIp) {
     console.log(`  Tailscale: http://${config.tailscaleIp}:${port}/   <-- share this`);
+  } else if (!config.tailscaleProbed) {
+    console.log("  Tailscale: (not asked — HOST is set)");
   } else {
     console.log(
       "  Tailscale: (not detected — install/start tailscale or set HOST to your tailnet IP)"

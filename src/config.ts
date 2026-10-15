@@ -38,6 +38,8 @@ export interface Config {
   maxPtys: number;
   /** Detected Tailscale IPv4 address, if any (for nicer startup logging). */
   tailscaleIp: string | null;
+  /** Whether `tailscale ip -4` was asked at all: not when HOST is set. */
+  tailscaleProbed: boolean;
   /** tmux socket name (`tmux -L <name>`) every tmux call goes to. Empty = the
    *  default socket, i.e. the user's own tmux server. Meant for tests, so a
    *  scratch server can never touch the real one; it also turns snapshots off. */
@@ -78,14 +80,24 @@ const thisDir = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(thisDir, "..");
 
 /**
+ * How long `tailscale ip -4` gets before startup goes on without it. It talks to
+ * tailscaled, and at boot — or with tailscaled wedged — that can block for as
+ * long as the daemon likes. It runs before the server listens, so with no
+ * limit a stuck daemon kept the server from starting at all. Past the limit it
+ * counts as not detected, the same as tailscale being absent.
+ */
+const TAILSCALE_PROBE_TIMEOUT_MS = 3000;
+
+/**
  * Detect the first Tailscale IPv4 address via `tailscale ip -4`.
- * Returns null if tailscale is missing or returns nothing usable.
+ * Returns null if tailscale is missing, too slow, or returns nothing usable.
  */
 function detectTailscaleIp(): string | null {
   try {
     const out = execFileSync("tailscale", ["ip", "-4"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
+      timeout: TAILSCALE_PROBE_TIMEOUT_MS,
     });
     const first = out
       .split("\n")
@@ -146,12 +158,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 
   const port = parsePort(read("PORT"), 8090);
 
-  const tailscaleIp = detectTailscaleIp();
+  // Only asked when it decides something: with HOST set, the answer would just
+  // be printed, and asking can hang startup (see TAILSCALE_PROBE_TIMEOUT_MS).
+  const hostRaw = read("HOST");
+  const hostGiven = !!hostRaw && hostRaw.trim() !== "";
+  const tailscaleIp = hostGiven ? null : detectTailscaleIp();
 
   let host: string;
   let hostFromTailscale = false;
-  const hostRaw = read("HOST");
-  if (hostRaw && hostRaw.trim() !== "") {
+  if (hostGiven && hostRaw) {
     host = hostRaw.trim();
   } else if (tailscaleIp) {
     host = tailscaleIp;
@@ -199,6 +214,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     authToken: (read("AUTH_TOKEN") ?? "").trim(),
     maxPtys: Math.max(1, parseNonNegInt(read("MAX_PTYS"), 48)),
     tailscaleIp,
+    tailscaleProbed: !hostGiven,
     tmuxSocket,
     allowedHosts: parseAllowedHosts(read("ALLOWED_HOSTS")),
   };

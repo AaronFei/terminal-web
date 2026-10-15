@@ -242,20 +242,25 @@ export interface WebTab {
  * new-session`, which may not have registered the session yet, so an immediate
  * set-option can fail with "can't find session" — retry briefly until it sticks.
  */
-export function tagWebSession(name: string, attempt = 0): void {
+export function tagWebSession(name: string, onTagged?: () => void, attempt = 0): void {
   runTmuxCb(["set-option", "-t", paneTarget(name), TAB_TAG, "1"], (err) => {
-    if (err && attempt < 10) {
-      setTimeout(() => tagWebSession(name, attempt + 1), 150);
+    if (!err) {
+      onTagged?.();
+    } else if (attempt < 10) {
+      setTimeout(() => tagWebSession(name, onTagged, attempt + 1), 150);
     }
   });
 }
 
-/** Persist a web tab's display label on its tmux session. Best-effort. */
-export function setWebTabLabel(name: string, displayName: string): void {
+/**
+ * Persist a web tab's display label on its tmux session. Best-effort; `onDone`
+ * runs once tmux has answered, whether or not it took.
+ */
+export function setWebTabLabel(name: string, displayName: string, onDone?: () => void): void {
   // Strip control chars (newlines/tabs) so a label can never break the
   // space-delimited parsing in listWebTabs.
   const dn = displayName.replace(/[\x00-\x1f]/g, " ").trim().slice(0, 64) || name;
-  runTmuxCb(["set-option", "-t", paneTarget(name), TAB_LABEL, dn], () => {});
+  runTmuxCb(["set-option", "-t", paneTarget(name), TAB_LABEL, dn], () => onDone?.());
 }
 
 /**
@@ -335,4 +340,107 @@ export async function findClientTty(pid: number): Promise<string | null> {
 /** Redraw a client's whole screen, absolutely, from tmux's own grid. */
 export async function refreshClient(tty: string): Promise<void> {
   await runTmux(["refresh-client", "-t", tty]);
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot bookkeeping. Pure — no tmux, no files — so it can be exercised on
+// its own; server.ts wires it to tmux-resurrect's save.sh (see the snapshot
+// section there for why the server takes them at all).
+// ---------------------------------------------------------------------------
+
+/**
+ * Runs `task` one at a time. A request made while one is running waits for it
+ * and then for one more run, shared by everything that asked in the meantime.
+ *
+ * Every snapshot trigger used to start its own save.sh: closing three tabs in a
+ * row, or pressing restart twice, ran several at once, all writing files named
+ * for the same second. Simply joining the run already going would not do
+ * either: a caller about to kill a session needs a snapshot that STARTED after
+ * it asked — one already halfway through may have listed the sessions before
+ * whatever the caller is guarding against. So late requests share the next run
+ * rather than the current one, and there is at most one of those.
+ */
+export class SingleFlight {
+  private running: Promise<void> | null = null;
+  private queued: Promise<void> | null = null;
+  private queuedReasons: string[] = [];
+
+  /** `task` gets the reasons of every request the run covers. Its errors go
+   *  to `onError` and never reach the callers. */
+  constructor(
+    private readonly task: (reasons: string[]) => Promise<void>,
+    private readonly onError: (err: unknown) => void = () => {}
+  ) {}
+
+  /** Resolves once a run that started after this call has finished. */
+  run(reason: string): Promise<void> {
+    // The queued run first: between one run finishing and the queued one
+    // starting there is a moment with nothing running, and a request landing
+    // in it must join the queued run, not start a second one beside it.
+    if (this.queued) {
+      if (!this.queuedReasons.includes(reason)) this.queuedReasons.push(reason);
+      return this.queued;
+    }
+    if (!this.running) return this.start([reason]);
+    this.queuedReasons = [reason];
+    this.queued = this.running.then(() => {
+      const reasons = this.queuedReasons;
+      this.queued = null;
+      this.queuedReasons = [];
+      return this.start(reasons);
+    });
+    return this.queued;
+  }
+
+  private start(reasons: string[]): Promise<void> {
+    const run: Promise<void> = (async () => {
+      try {
+        await this.task(reasons);
+      } catch (err) {
+        this.onError(err);
+      }
+    })().finally(() => {
+      if (this.running === run) this.running = null;
+    });
+    this.running = run;
+    return run;
+  }
+}
+
+/**
+ * Whether the live session count has collapsed against the last snapshot — the
+ * signature of a tmux server that just died — so a save now would write over
+ * the only record of what was there. See COLLAPSE_GRACE_MS in server.ts.
+ *
+ * Sessions closed on purpose don't count against it. The snapshot taken before
+ * a kill still holds the sessions killed, so closing a split tab — two of four
+ * sessions — read as a collapse and stopped every save for two hours. A name in
+ * `killedAt` killed late enough that the snapshot may have listed it while it
+ * was still there (no earlier than `saveWindowMs` before it was written) is
+ * left out of the baseline. A name killed before that and still in the
+ * snapshot was made again in between, and counts. Only kills tmux confirmed
+ * belong in `killedAt`: a kill that took the server down with it reports a
+ * failure, and must leave the guard as it was.
+ */
+export function snapshotCollapsed(opts: {
+  /** Sessions live now. */
+  live: number;
+  /** The last snapshot's session names and when it was written (epoch ms). */
+  snapshot: { names: readonly string[]; savedAt: number } | null;
+  /** Session name -> when this server killed it on purpose (epoch ms). */
+  killedAt: ReadonlyMap<string, number>;
+  /** The longest a save can take, from listing the sessions to writing the file. */
+  saveWindowMs: number;
+  /** Past this age, a smaller set has been the truth long enough to be saved. */
+  graceMs: number;
+  now: number;
+}): { collapsed: boolean; baseline: number } {
+  const { live, snapshot, killedAt, saveWindowMs, graceMs, now } = opts;
+  if (!snapshot) return { collapsed: false, baseline: 0 };
+  const baseline = snapshot.names.filter((name) => {
+    const at = killedAt.get(name);
+    return at === undefined || at < snapshot.savedAt - saveWindowMs;
+  }).length;
+  const collapsed = now - snapshot.savedAt < graceMs && baseline >= 2 && live * 2 <= baseline;
+  return { collapsed, baseline };
 }
