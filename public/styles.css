@@ -562,6 +562,81 @@ body {
   color: #fff;
 }
 
+/* Passkeys panel (web/passkeys.ts), opened from help */
+.passkeys-box {
+  font-family: var(--mono);
+}
+.passkeys-box [hidden] {
+  display: none !important;
+}
+.pk-note,
+.pk-status {
+  color: #b8b8b8;
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 0 0 10px;
+}
+.pk-status:empty {
+  display: none;
+}
+.pk-status.pk-error {
+  color: #f14c4c;
+}
+.pk-list {
+  list-style: none;
+  margin: 0 0 10px;
+  padding: 0;
+  border-top: 1px solid #3a3a3a;
+}
+.pk-list li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid #3a3a3a;
+  font-size: 13px;
+  color: #d4d4d4;
+}
+.pk-list .pk-empty {
+  color: #8a8a8a;
+}
+.pk-text {
+  flex: 1;
+  min-width: 0;
+}
+.pk-item-name {
+  color: #fff;
+  overflow-wrap: anywhere;
+}
+.pk-meta {
+  color: #8a8a8a;
+  font-size: 11px;
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+}
+.tb-btn.pk-armed {
+  background: #a1260d;
+  border-color: #f14c4c;
+  color: #fff;
+}
+.pk-add {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+  margin-bottom: 10px;
+}
+.pk-add .pk-name {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 10px;
+}
+.pk-add .tb-btn {
+  white-space: nowrap;
+}
+.passkeys-box .tb-btn:disabled {
+  opacity: 0.5;
+}
+
 /* --------------------------------------------------------------------------
    Mobile layout: a dedicated compact top bar + a bottom "Sessions" drawer and
    an "actions" sheet. All of this is built in JS but stays hidden until the

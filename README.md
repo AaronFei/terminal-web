@@ -39,6 +39,8 @@ Node.js + TypeScript server using [`ws`](https://github.com/websockets/ws) and
 - **Attach any file** (picker / paste / drag) → upload → insert path, for
   **Claude Code** and other AI CLIs; **download** a file from the host
 - Font size, fullscreen, IME (CJK) input, and a `?` help overlay
+- Through a Cloudflare Tunnel: sign in with a shared token or, optionally, a
+  **passkey**
 - Optional **background service** (launchd on macOS, systemd on Linux) and a
   checked **deploy** script
 
@@ -49,7 +51,7 @@ Node.js + TypeScript server using [`ws`](https://github.com/websockets/ws) and
 ```bash
 git clone https://github.com/AaronFei/terminal-web.git && cd terminal-web
 sudo apt install tmux     # or: brew install tmux
-npm install               # needs Node 18+
+npm install               # needs Node 20+
 npm run build
 bash scripts/start.sh     # binds your Tailscale IP and prints the URL
 # no Tailscale?  HOST=192.168.1.50 bash scripts/start.sh   (or HOST=0.0.0.0)
@@ -69,7 +71,7 @@ as a systemd service.
 
 Not bundled or installed by this project:
 
-- **Node.js 18+** (ESM; the server runs via `tsx`)
+- **Node.js 20+** (ESM; the server runs via `tsx`)
 - **tmux** — the session backend (`brew install tmux`, `sudo apt install tmux`).
   tmux 3.4 has been seen to crash inside `kill-session`, taking every session
   with it; a newer tmux is recommended (see [Persistence](#persistence-across-reboots)
@@ -403,7 +405,7 @@ history you browse is tmux's.
   how many CSS pixels at the bottom of the frame the keyboard covers (0 when
   it's down). On load, the framed page posts
   `{source: 'terminal-web', type: 'viewport-please'}` to its parent to ask for
-  the current value.
+  the current value. For passkeys inside the frame, see [Security](#security).
 
 ---
 
@@ -435,6 +437,8 @@ Each tab is a tmux session.
 | Which sessions are tabs, and their labels | the tmux sessions themselves (`@twtab` / `@twlabel` options) |
 | Font size, key bar shown, the tab you were on (per device class: `touch` / `desktop`) | `~/.terminal-web/prefs.json`, via `GET`/`POST /api/prefs` |
 | Recently closed tab names (30 days) | `~/.terminal-web/closed.json` |
+| Sign-in sessions through Cloudflare: a SHA-256 of each session id (never the id or the token), how it was made, when it expires | `~/.terminal-web/auth-sessions.json` (0600) |
+| Registered passkeys: credential id, public key, counter, RP ID (hostname), name, dates | `~/.terminal-web/passkeys.json` (0600) |
 | Uploaded files | `UPLOAD_DIR` (default `~/terminal-web-uploads`) |
 | Session snapshots | `~/.local/share/tmux/resurrect` (tmux-resurrect) |
 | Split view per tab | this browser's `localStorage` only |
@@ -589,7 +593,15 @@ every route needs the sign-in cookie.
 | `POST /api/prefs` | `{scope, fontSize?, keybar?, activeTab?}` — merge into that device class's prefs. |
 | `GET\|HEAD /api/download?path=P&session=S` | Download any regular file the server's user can read. Relative `P` resolves against session `S`'s current directory, `~/…` against home. |
 | `GET /api/health` | `{ok, commit, startedAt}` — the commit the running server was started from. |
-| `POST /login` | The sign-in form (Cloudflare-fronted requests only). |
+| `POST /login` | The sign-in form, `token=…` (Cloudflare-fronted requests only; elsewhere it just redirects to `/`). |
+| `POST /logout` | Sign out: forget this session, clear the cookie, 303 to `/`. |
+| `POST /auth/passkey/login/options` | Start a passkey sign-in: `{challengeId, options}`. Needs no cookie; Cloudflare-fronted only (404 otherwise). |
+| `POST /auth/passkey/login/verify` | `{challengeId, response}` — finish it; sets the session cookie. 401 if the passkey isn't accepted. Cloudflare-fronted only. |
+| `GET /api/auth` | `{viaCloudflare, method: "token"\|"passkey"\|"legacy"\|null, passkeyCapable}` — how this request is signed in. |
+| `GET /api/passkeys` | `[{id, name, rpId, createdAt, lastUsedAt}]` — the registered passkeys (no keys). Works over the tailnet too. |
+| `POST /api/passkeys/delete` | `{id}` — remove a passkey and sign out every session it made. Works over the tailnet too. |
+| `POST /api/passkeys/register/options` | Start adding a passkey: `{challengeId, options}`. Signed in, Cloudflare-fronted only. |
+| `POST /api/passkeys/register/verify` | `{challengeId, response, name?}` — finish it (name ≤ 64 characters; defaults to the device type). |
 
 ---
 
@@ -612,12 +624,34 @@ upload files. Treat exposing it like handing out SSH access.
   a request gets a sign-in page that POSTs the token to `/login`; a correct
   token sets an **HttpOnly** cookie (`SameSite=Lax`, **Secure** when the request
   came over HTTPS, as it does through Cloudflare) and the WebSocket requires it
-  too. An old-style `?token=…` link still works on a GET and is redirected to
-  the same URL without the token. **With `AUTH_TOKEN` empty, every
-  Cloudflare-fronted request is refused (403)**, so a tunnel set up before the
-  token isn't a public shell. Use a long random token
-  (`openssl rand -hex 24`); a shared token is not per-user identity — put
-  Cloudflare Access in front for that.
+  too. The cookie holds a random session id the server issued, not the token;
+  the server keeps only a SHA-256 of it, in `~/.terminal-web/auth-sessions.json`
+  (0600). A session made with the token ends when `AUTH_TOKEN` changes, so
+  rotating the token signs every token session out. A cookie from before
+  sessions existed (it held the token itself) is still accepted while the token
+  is unchanged, and swapped for a session on the next page load. An old-style
+  `?token=…` link still works on a GET and is redirected to the same URL
+  without the token. **With `AUTH_TOKEN` empty, every Cloudflare-fronted
+  request is refused (403)**, so a tunnel set up before the token isn't a public
+  shell. Use a long random token (`openssl rand -hex 24`); a shared token is not
+  per-user identity — put Cloudflare Access in front for that.
+- **Passkeys (optional).** Through Cloudflare you can also sign in with a
+  passkey (Face ID, Touch ID, Windows Hello, a phone or a security key) instead
+  of typing the token. The token always keeps working; passkeys are an extra
+  way in, not a replacement. To add one, sign in with the token through the
+  https address, then **? → Passkeys → Add a passkey**. Each hostname has its
+  own passkeys (the WebAuthn RP ID is the request's hostname), so every machine
+  you run this on registers its own; a tailnet address can't hold one. The
+  same panel lists them, deletes one (which signs out every session it made)
+  and signs you out. Listing and deleting also work over the tailnet, which is
+  the way back in if a device is lost; deleting `~/.terminal-web/passkeys.json`
+  and restarting removes them all. Passkeys inside a cross-origin iframe (a
+  launcher page) only work if the frame allows them:
+  `<iframe allow="publickey-credentials-get; publickey-credentials-create" …>`.
+  Without that, sign in with the token inside the frame.
+- **Sign out** (**? → Passkeys → Sign out**, or `POST /logout`) ends the
+  current session. To end all of them, change `AUTH_TOKEN` and delete the
+  passkeys.
 - **Host check (DNS rebinding).** A direct request whose `Host` is a dotted
   hostname that isn't an IP address, isn't a `*.ts.net` name, and isn't listed
   in `ALLOWED_HOSTS` gets 403. Single-label names (`localhost`, a MagicDNS short
@@ -685,6 +719,12 @@ You reached the server by a hostname it doesn't know. Add it to
 **403 through Cloudflare**
 `AUTH_TOKEN` isn't set on the server. Set it and restart.
 
+**Passkey sign-in says "not accepted"**
+A passkey only works on the hostname it was added on; check **? → Passkeys**
+for its RP ID. The server expects the browser's origin to be
+`https://<host>`, which it learns from the `X-Forwarded-Proto` header
+cloudflared sends; a proxy in between must keep it. The token always works.
+
 **Client shows "reconnecting…" and never connects**
 The server may not be running, you can't reach `HOST:PORT`, or `MAX_PTYS`
 terminals are already open. Check the server log.
@@ -719,7 +759,11 @@ npm install && npm run build && npm run dev   # watcher + auto-restarting server
   new tab, switch, split, resize) and checks your own tmux sessions are
   untouched. It needs Chrome or Chromium (`CHROME=/path` to choose one).
   `bash scripts/smoke/run-smoke.sh --screenshots` regenerates the images in
-  `docs/` the same way.
+  `docs/` the same way. For anything that touches sign-in, also run
+  `npm run smoke:passkey`: it fakes Cloudflare with a `cf-ray` header, uses
+  test tokens and a virtual WebAuthn authenticator on `http://localhost`, and
+  covers token and passkey sign-in, the legacy cookie, sign-out, challenge
+  replay, a token change, deleting a passkey and the tailnet staying open.
 - **Never test against your real tmux.** If you run a server by hand, give it
   `TERMINAL_WEB_TMUX_SOCKET=<name>`, a scratch `HOME`, and a port other than
   your real one, and unset `TMUX` (it overrides everything else).

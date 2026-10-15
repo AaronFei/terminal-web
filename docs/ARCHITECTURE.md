@@ -12,7 +12,9 @@ invariant below needs the lead's sign-off first, and then an update here.
 | Path | Role |
 |---|---|
 | `src/server.ts` | HTTP (static, upload, download, `/api/*`), WebSocket upgrade, pty lifecycle, snapshots |
-| `src/auth.ts` | Shared-token gate for Cloudflare-fronted requests |
+| `src/auth.ts` | Sign-in gate for Cloudflare-fronted requests (login page, token, logout, the passkey HTTP endpoints), Host/Origin checks |
+| `src/auth-store.ts` | Sign-in sessions and passkeys: in memory, persisted to `~/.terminal-web/{auth-sessions,passkeys}.json` |
+| `src/passkeys.ts` | WebAuthn ceremonies (via `@simplewebauthn/server`) and their challenges |
 | `src/tmux.ts` | Every `tmux` invocation the server makes |
 | `src/config.ts` | Env vars and defaults |
 | `src/types.ts` | WebSocket control-message types |
@@ -22,6 +24,7 @@ invariant below needs the lead's sign-off first, and then an update here.
 | `web/layout.ts` | Pane sizing, split layout, keyboard slide, resize handling |
 | `web/tabs.ts`, `api.ts` | Tab lifecycle and server sync; HTTP calls and prefs |
 | `web/overlays.ts`, `clipboard.ts`, `transfer.ts` | Dialogs and the paste box; copy and paste; upload and download |
+| `web/passkeys.ts` | The Passkeys panel (from help): list, add, delete, sign out |
 | `web/ui/*.ts` | Top bar, key bar, selection bar, phone bar/drawer/sheet |
 | `public/` | `index.html`, `styles.css`, icons, manifest |
 | `tmux/web.tmux.conf` | tmux config the server's sessions load |

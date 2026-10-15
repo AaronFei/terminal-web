@@ -4,10 +4,17 @@
 #
 # Usage:  npm run smoke          (or: bash scripts/smoke/run-smoke.sh)
 #         bash scripts/smoke/run-smoke.sh --screenshots
+#         npm run smoke:passkey  (or: bash scripts/smoke/run-smoke.sh --passkey)
 #
 # --screenshots runs screenshots.mjs instead of the test: it rewrites
 # docs/screenshot.png and docs/mobile.png from the same kind of scratch server,
 # with a plain `terminal-web $` prompt so nothing about your machine shows.
+#
+# --passkey runs passkey.mjs: sign-in through a faked Cloudflare (a cf-ray
+# header) with test tokens and a virtual WebAuthn authenticator, on
+# http://localhost:<port>. That driver starts and restarts the scratch server
+# itself (it has to change AUTH_TOKEN mid-test), with the same isolation as
+# below, and leaves its PID in <scratch>/server.pid for the cleanup here.
 #
 # It tests whatever bundle is in public/dist, so run `npm run build` first.
 # (It never builds by itself: in a checkout a service runs from, that would
@@ -20,6 +27,8 @@
 #   SMOKE_CDP_PORT=<n>     Chrome debugging port (default 9333)
 #   SMOKE_KEEP=1           keep the scratch dir (server log, Chrome profile)
 #   SMOKE_VERBOSE=1        also print an outline of the page's DOM
+#   SMOKE_SHOTS=<dir>      --passkey: save PNGs of the login page and the
+#                          Passkeys panel there
 #
 # Safety. Your own tmux server, and any terminal-web service running as you,
 # must come through this untouched:
@@ -53,11 +62,15 @@ case "${1:-}" in
     DRIVER="smoke.mjs"
     EXPECTED_SESSIONS='smoke-a|smoke-b|smoke-a__b'
     ;;
+  --passkey)
+    DRIVER="passkey.mjs"
+    EXPECTED_SESSIONS='pk-a|web'
+    ;;
   --screenshots)
     DRIVER="screenshots.mjs"
     EXPECTED_SESSIONS='api|web|logs'
     ;;
-  *) die "unknown option '$1' (usage: run-smoke.sh [--screenshots])" ;;
+  *) die "unknown option '$1' (usage: run-smoke.sh [--screenshots|--passkey])" ;;
 esac
 
 # --- prerequisites -----------------------------------------------------------
@@ -113,6 +126,15 @@ cleanup() {
   # Our PIDs only. The server's children (tsx runs node as a child) are looked
   # up before it goes, so they can be checked afterwards.
   local kids="" p
+  # passkey.mjs runs its own server and removes server.pid once it has stopped
+  # it; a file still there means the driver died with the server up.
+  if [ -z "${SERVER_PID}" ] && [ -f "${SCR}/server.pid" ]; then
+    p="$(cat "${SCR}/server.pid")"
+    case "${p}" in
+      '' | *[!0-9]*) ;;
+      *) SERVER_PID="${p}"; echo "driver left server pid ${p} running; stopping it" ;;
+    esac
+  fi
   [ -z "${CHROME_PID}" ] || kill "${CHROME_PID}" 2>/dev/null
   if [ -n "${SERVER_PID}" ]; then
     kids="$(pgrep -P "${SERVER_PID}" 2>/dev/null || true)"
@@ -161,22 +183,25 @@ cleanup() {
 REAL_CHANGED=0
 
 # --- scratch server ----------------------------------------------------------
-env -u TMUX -u TMUX_PANE -u AUTH_TOKEN -u ALLOWED_HOSTS -u DEFAULT_SESSION -u UPLOAD_DIR \
-  HOME="${SCR}/home" TERMINAL_WEB_TMUX_SOCKET="${SOCK}" HOST=127.0.0.1 PORT="${PORT}" \
-  node_modules/.bin/tsx src/server.ts >"${SCR}/server.log" 2>&1 &
-SERVER_PID=$!
-echo "server pid ${SERVER_PID} on http://127.0.0.1:${PORT}"
-up=0
-for _ in $(seq 1 80); do
-  if curl -fsS -o /dev/null "http://127.0.0.1:${PORT}/" 2>/dev/null; then up=1; break; fi
-  kill -0 "${SERVER_PID}" 2>/dev/null || break
-  sleep 0.25
-done
-if [ "${up}" -ne 1 ]; then
-  echo "server did not come up; its log:" >&2
-  cat "${SCR}/server.log" >&2
-  cleanup
-  exit 1
+# (passkey.mjs starts its own, with the same environment.)
+if [ "${DRIVER}" != "passkey.mjs" ]; then
+  env -u TMUX -u TMUX_PANE -u AUTH_TOKEN -u ALLOWED_HOSTS -u DEFAULT_SESSION -u UPLOAD_DIR \
+    HOME="${SCR}/home" TERMINAL_WEB_TMUX_SOCKET="${SOCK}" HOST=127.0.0.1 PORT="${PORT}" \
+    node_modules/.bin/tsx src/server.ts >"${SCR}/server.log" 2>&1 &
+  SERVER_PID=$!
+  echo "server pid ${SERVER_PID} on http://127.0.0.1:${PORT}"
+  up=0
+  for _ in $(seq 1 80); do
+    if curl -fsS -o /dev/null "http://127.0.0.1:${PORT}/" 2>/dev/null; then up=1; break; fi
+    kill -0 "${SERVER_PID}" 2>/dev/null || break
+    sleep 0.25
+  done
+  if [ "${up}" -ne 1 ]; then
+    echo "server did not come up; its log:" >&2
+    cat "${SCR}/server.log" >&2
+    cleanup
+    exit 1
+  fi
 fi
 
 # --- headless Chrome ---------------------------------------------------------
@@ -200,7 +225,13 @@ fi
 
 # --- the test ----------------------------------------------------------------
 echo
-node "${SCRIPT_DIR}/${DRIVER}" "${REPO_ROOT}" "${CDP_PORT}" "http://127.0.0.1:${PORT}" "${SOCK}"
+if [ "${DRIVER}" = "passkey.mjs" ]; then
+  # localhost, not 127.0.0.1: WebAuthn needs a hostname for its RP ID, and
+  # http://localhost counts as a secure context.
+  node "${SCRIPT_DIR}/${DRIVER}" "${REPO_ROOT}" "${CDP_PORT}" "http://localhost:${PORT}" "${SOCK}" "${SCR}"
+else
+  node "${SCRIPT_DIR}/${DRIVER}" "${REPO_ROOT}" "${CDP_PORT}" "http://127.0.0.1:${PORT}" "${SOCK}"
+fi
 SMOKE_EXIT=$?
 echo
 

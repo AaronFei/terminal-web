@@ -36,11 +36,14 @@ import {
 import type { WebTab } from "./tmux.js";
 import type { ServerMessage } from "./types.js";
 import { isClientMessage } from "./types.js";
-import { gateHttp, refuseUpgrade, hostAllowed, originAllowed } from "./auth.js";
+import { gateHttp, handleAuthApi, refuseUpgrade, hostAllowed, originAllowed } from "./auth.js";
+import { initAuthStore } from "./auth-store.js";
 
 const config = loadConfig();
 // Before anything can run tmux: from here on every call goes to this socket.
 setTmuxSocket(config.tmuxSocket);
+// Sign-in sessions and passkeys, read once; requests only use the memory copy.
+initAuthStore(config.authToken);
 
 /**
  * The commit this process is running, for GET /api/health: tsx runs the source
@@ -1166,10 +1169,14 @@ const server = http.createServer((req, res) => {
         return;
       }
 
-      // Token gate for Cloudflare-fronted requests: the login page, the login
-      // POST and the ?token=… sign-in for every route, and the refusal when no
-      // token is configured. Direct/tailnet requests pass straight through.
+      // Sign-in gate for Cloudflare-fronted requests: the login page, the login
+      // and logout POSTs, the passkey sign-in, the ?token=… sign-in for every
+      // route, and the refusal when no token is configured. Direct/tailnet
+      // requests pass straight through.
       if (await gateHttp(req, res, requestUrl, config.authToken)) return;
+
+      // /api/auth and /api/passkeys…: the app's Passkeys panel.
+      if (await handleAuthApi(req, res, requestUrl, config.authToken)) return;
 
       if (method === "POST" && requestUrl.pathname === "/upload") {
         await handleUpload(req, res, requestUrl.searchParams.get("name"));
