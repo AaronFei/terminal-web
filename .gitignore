@@ -9,3 +9,6 @@ public/dist/
 
 # Local environment overrides
 .env
+
+# deploy.sh bookkeeping (lock hash of the last npm ci on this machine)
+.deploy/

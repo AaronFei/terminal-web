@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Start terminal-web in "production-ish" mode:
 #   - ensure the client bundle is built
-#   - bind the server to the Tailscale IP when available
+#   - bind the server to the Tailscale IP when available (otherwise HOST must
+#     be set; it never falls back to 0.0.0.0 on its own)
 #   - launch the server (npm start -> tsx src/server.ts)
 #
 # Usage: bash scripts/start.sh   (or ./scripts/start.sh after chmod +x)
@@ -30,9 +31,9 @@ if ! command -v tmux >/dev/null 2>&1; then
 fi
 
 if ! command -v tailscale >/dev/null 2>&1; then
-  echo "WARNING: 'tailscale' not found on PATH. Falling back to a non-Tailnet host." >&2
-  echo "         Without Tailscale the server is reachable to anyone who can reach" >&2
-  echo "         the bound address, and there is NO app-level auth." >&2
+  echo "WARNING: 'tailscale' not found on PATH; set HOST to choose a bind address." >&2
+  echo "         Off the tailnet the server is reachable to anyone who can reach" >&2
+  echo "         the bound address; AUTH_TOKEN only gates Cloudflare-fronted requests." >&2
 fi
 
 # --- Build the client bundle if missing --------------------------------------
@@ -56,16 +57,24 @@ if [ -z "${HOST:-}" ] && command -v tailscale >/dev/null 2>&1; then
   fi
 fi
 
-export PORT
-if [ -n "${HOST:-}" ]; then
-  export HOST
+# Never fall back to 0.0.0.0 on our own (the server would): that quietly
+# exposes the terminal on every interface. Binding all of them must be asked
+# for with HOST=0.0.0.0.
+if [ -z "${HOST:-}" ]; then
+  echo "ERROR: no Tailscale IPv4 detected and HOST not set; refusing to bind 0.0.0.0" >&2
+  echo "       on my own. Bring Tailscale up, or pick the bind address:" >&2
+  echo "         HOST=<ip> bash scripts/start.sh" >&2
+  echo "         HOST=0.0.0.0 bash scripts/start.sh   # all interfaces, on purpose" >&2
+  exit 1
 fi
 
+export PORT
+export HOST
+
 # --- Announce the reachable URL ----------------------------------------------
-DISPLAY_HOST="${HOST:-0.0.0.0}"
-echo "Starting terminal-web on http://${DISPLAY_HOST}:${PORT}"
-if [ "${DISPLAY_HOST}" = "0.0.0.0" ]; then
-  echo "(HOST not set to a specific IP; the server will log the concrete URLs it binds.)"
+echo "Starting terminal-web on http://${HOST}:${PORT}"
+if [ "${HOST}" = "0.0.0.0" ]; then
+  echo "(HOST=0.0.0.0 binds every interface; the server will log the concrete URLs it binds.)"
 fi
 
 # --- Run the server ----------------------------------------------------------

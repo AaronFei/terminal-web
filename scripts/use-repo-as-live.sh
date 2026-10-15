@@ -3,8 +3,9 @@
 #
 # Why this exists: scripts/service.sh already installs terminal-web repo-live on
 # macOS (launchd) and Linux (systemd --user) — the service runs straight out of
-# the checkout. One host deviates: the WSL box set up by
-# scripts/wsl-install-stack.sh runs a *system-wide* unit out of a separate
+# the checkout. One host deviates: the WSL box, set up by a host-setup script
+# that lives outside this repo (wsl-install-stack.sh), runs a *system-wide* unit
+# out of a separate
 # /opt/terminal-web copy kept in sync by rsync. That split is what lets the live
 # UI silently drift from the repo. This script closes the gap on such a host and
 # is a deliberate no-op everywhere else.
