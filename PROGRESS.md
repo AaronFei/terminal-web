@@ -31,7 +31,7 @@ must keep.
 | T3 | Input, minimal: reconnect focus fix; key bar dropped while disconnected | – | done (cd935fa) |
 | T4 | Front-end split, resize and lifecycle bugs | T3 | done (0ecf298) |
 | T5 | Front-end touch, resources and cleanups | T4 | in progress |
-| T6 | `service.sh` / `deploy.sh` hardening | – | in progress |
+| T6 | `service.sh` / `deploy.sh` hardening | – | done |
 | T7 | README, `.env.example`, `web.tmux.conf` comment | T1–T6 | todo |
 | T8 | Split `web/terminal.ts` into modules | T5 | todo |
 | D | Deploy to both boxes, rotate tokens, clear `AUTH_TOKEN` from tmux's global env | all, plus user OK | todo |
@@ -41,6 +41,7 @@ must keep.
 - T3 `cd935fa`: a reconnect re-focuses only when `activeSession === this` and focus is free (body or an xterm textarea); key-bar presses use `sendKey` and are dropped while disconnected, with a throttled 「未連線，按鍵沒有送出」; a paste over the 64 KB cap now shows a status instead of vanishing silently. Review: the diff touches no line of the frozen input path; tsc and build pass; one punctuation fix made at review.
 - T4 `0ecf298`: background sizing skips 'both' tabs and sizes a 'two' tab's mate; restackSplit on a WIDE_PX flip; the resting height is held only on touch devices and re-taken on a width change; a mate's `closed` lays out only the open tab, through a shared `dropTab`; prefs save `activeTab.name`; the label is re-asserted only after this device's own restart; a pane flicked past doesn't attach; `isActive` matches what's visible; sync is gated on `tabsReady`; names are capped at 61; keyboard geometry is cached and the slide only grows. Review: sanitizeName is used only for user/URL names, so server-listed names aren't truncated; init has no early return that skips tabsReady. Accepted trade-off: rotating with the keyboard up resizes twice.
 - T1 `ccda845`: every tmux call goes through the src/tmux.ts helpers (`-L` when `TERMINAL_WEB_TMUX_SOCKET` is set; snapshots off then); targets are exact; invalid names get a 400 or a 1008 close, never a fallback; the child env drops every config var plus TMUX/TMUX_PANE; cookie parsing and the upgrade handler can't throw; a Cloudflare request with no token configured gets 403; Host/Origin checks with `ALLOWED_HOSTS`; the debug log is escaped; login is a POST `/login`, and `?token=` redirects without the token. Lead's own smoke test on a scratch socket: 200/403/401/200/403 as expected, a same-origin WS opens and an evil one gets 403, typed input round-trips, the real tmux is unchanged. Deviation accepted: `set-option` needs `=name:` (ARCHITECTURE updated).
+- T6: service.sh carries over HOST/PORT/token/PATH/extra env on reinstall; on Linux the token lives in a 0600 env file, on macOS the plist is written 0600; no silent 0.0.0.0 bind; the launchd bootstrap retries; logs over 10 MB rotate; deploy.sh runs `npm ci` when the lock changes (`.deploy/lock.sha`), typechecks before restarting, and checks the commit from /api/health afterwards; the wsl script reference is reworded. Simulated with a scratch HOME and stubs; the real plist was untouched. Deploy note: seed `.deploy/lock.sha` on both boxes before the first deploy so it doesn't run `npm ci` under the live server; run install with `env -u AUTH_TOKEN` (this shell has the leaked token).
 
 ## Found during review
 
