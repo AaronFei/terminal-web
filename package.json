@@ -13,6 +13,7 @@
     "dev": "bash scripts/dev.sh",
     "build": "node esbuild.mjs",
     "start": "tsx src/server.ts",
+    "smoke": "bash scripts/smoke/run-smoke.sh",
     "postinstall": "node scripts/fix-pty-perms.mjs"
   },
   "dependencies": {
