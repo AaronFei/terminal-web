@@ -65,7 +65,16 @@ overrides `TMUX_TMPDIR`. Only an explicit socket isolates a test:
 `env -u TMUX -u TMUX_PANE tmux -L <scratch> ...`. Before any kill, run
 `list-sessions` with the exact same flags and confirm it shows only your test
 sessions. A test server must run with `TERMINAL_WEB_TMUX_SOCKET=<scratch>`, an
-env var added in task T1. Never run one before T1 has landed.
+env var added in task T1, and must also run with `HOME=<scratch dir>`, on
+`HOST=127.0.0.1` and a port other than 8090. Never run one before T1 has
+landed. The scratch `HOME` is required because the server keeps
+`~/.terminal-web/{closed,prefs}.json`, uploads to `~/terminal-web-uploads`, and
+reads resurrect snapshots from `~/.local/share/tmux/resurrect`. On top of that,
+`tmux/web.tmux.conf` loads tmux-continuum with auto-restore, so with the real
+`HOME` a brand-new scratch tmux server would restore the user's real sessions
+into itself, Claude processes included. Only kill test processes you started,
+by PID; never `pkill node` or `pkill tsx`, because the production servers run
+under the same user.
 
 ### Auth
 
