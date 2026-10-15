@@ -54,7 +54,12 @@ Closing a tab kills both halves.
 
 ### tmux targets are exact
 
-Every `-t` naming a session uses `=name` (or `=name:` for a window or pane).
+Every `-t` naming a session goes through `sessionTarget()` (`=name`, for
+`kill-session` and `has-session`) or `paneTarget()` (`=name:`, for
+`display-message` and also `set-option`: tmux 3.6's `set-option -t` takes a
+pane target, so `=name` fails with "no such session" there). Both live in
+`src/tmux.ts`, and every tmux invocation goes through its helpers, which add
+`-L <socket>` when `TERMINAL_WEB_TMUX_SOCKET` is set.
 Without the `=`, tmux falls back to a unique-prefix match: killing `dev` after it
 is already gone would kill `devops`.
 
