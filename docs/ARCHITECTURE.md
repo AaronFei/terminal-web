@@ -102,7 +102,25 @@ under the same user.
 
 - `AUTH_TOKEN` gates only Cloudflare-fronted requests, detected by the
   `cf-ray` / `cf-connecting-ip` headers. Tailnet access is open by design.
-- A sign-in sets the HttpOnly + Secure cookie `tw_auth`.
+- Two ways to sign in through Cloudflare: the shared token (always available,
+  never switched off) or a passkey (WebAuthn). Passkeys are optional extras;
+  with none registered everything works with the token alone.
+- A sign-in sets the HttpOnly cookie `tw_auth` (Secure behind https). Its value
+  is a random server-issued session id, never the token itself. The server
+  keeps only a SHA-256 of each id, in `~/.terminal-web/auth-sessions.json`
+  (0600), with how it was made: `token` (plus a fingerprint of the token in
+  force) or `passkey` (plus the credential id). A token session dies when
+  `AUTH_TOKEN` changes; a passkey session dies when its passkey is deleted. A
+  legacy cookie whose value equals the current token is still accepted.
+- Passkeys are per host: the RP ID is the hostname of the request, never
+  hard-coded, so Mac and NUC each register their own. They live in
+  `~/.terminal-web/passkeys.json` (0600) with the RP ID they belong to.
+  Ceremonies run only on Cloudflare-fronted requests (the browser needs https
+  and a domain; a tailnet IP can't hold a passkey). Registering needs a signed-in
+  session. Listing and deleting also work over the tailnet, which is the
+  recovery path, as is deleting `passkeys.json`.
+- Challenges are random, single-use, bound to their RP ID and expire after
+  5 minutes. Verification is done by `@simplewebauthn/server`.
 - Secrets and server config must not leak into the child shell's environment.
 
 ### Snapshots before kills

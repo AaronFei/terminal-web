@@ -3,8 +3,8 @@
 This tracks the work on everything raised by the 2026-10-15 review: one
 reviewer each for input, front end, server and README. The lead dispatches
 each task to an `opus-implementer` in its own git worktree, reviews the diff and
-the check results, and merges into `main` locally. Nothing is pushed or deployed
-until the user agrees. `docs/ARCHITECTURE.md` holds the invariants every task
+the check results, and merges into `main` locally. Pushed and deployed on 2026-10-15
+with the user's OK. `docs/ARCHITECTURE.md` holds the invariants every task
 must keep.
 
 ## Decisions
@@ -22,6 +22,11 @@ must keep.
 - 2026-10-15: The module split (T8) waits until T3–T5 are merged.
 - 2026-10-15: The token is rotated at deploy time, on both boxes, after T1.
 
+- 2026-10-15: Passkeys are added as an optional second way in through
+  Cloudflare. The token is never switched off (the user declined a
+  passkey-only mode). Each host registers its own passkeys (RP ID = request
+  hostname). The cookie becomes a server-issued session id.
+
 ## Tasks
 
 | ID | Scope | Depends on | Status |
@@ -34,7 +39,8 @@ must keep.
 | T6 | `service.sh` / `deploy.sh` hardening | – | done |
 | T7 | README, `.env.example`, `web.tmux.conf` comment | T1–T6 | done |
 | T8 | Split `web/terminal.ts` into modules | T5 | done |
-| D | Deploy to both boxes, rotate tokens, clear `AUTH_TOKEN` from tmux's global env | all, plus user OK | todo |
+| P1 | Passkey sign-in (optional, alongside the token), server-issued session cookies | D | in progress |
+| D | Deploy to both boxes, rotate tokens, clear `AUTH_TOKEN` from tmux's global env | all, plus user OK | done (9a281ec) |
 
 ## Done
 
@@ -47,10 +53,10 @@ must keep.
 - T8: the client is split into 16 modules (entry `web/terminal.ts`, `session.ts`, foundation `config/dom/state/status/overlays/clipboard/transfer/api/layout/ui/selbar`, app `tabs/ui/{topbar,keybar,mobile}`). Load-time side effects live in build/init functions called in the original order; shared state is written through setters; Session gets app hooks injected. Lead re-verification on merged main: the frozen input blocks are byte-identical (67 and 248 lines); the Session class differs only in `export` and one setter; a headless Chrome smoke run (load, attach, type `HI_42`, new tab, switch, split, narrow↔wide restack) passes with 0 exceptions; the real tmux is unchanged. ARCHITECTURE updated with the module map and the build-function rule.
 - T7: README rewritten against the code (auth scope and the new 403/Host/Origin/login behaviour, security notes on download/upload, env table plus .env.example, key bar, copy/paste, keyboard slide, iframe postMessage contract, WS protocol, HTTP API table, install over HTTPS, pinned node-pty, service.sh/deploy.sh, closing tabs, split, lazy attach, reboot persistence, debug flags, Contributing); help text in overlays.ts; web.tmux.conf comments; `scripts/smoke/` (`npm run smoke`, plus `--screenshots`); screenshots regenerated (a generic prompt, nothing personal); demo.gif dropped from the README. Lead check: the screenshots are viewed and clean; README has no personal infra beyond the repo URL and the plist label the code uses. Personal tailnet IPs removed from ARCHITECTURE before publishing.
 
+- D (2026-10-15): pushed 9a281ec; both boxes reinstalled through service.sh with fresh tokens (Mac plist now 0600; NUC token moved out of the unit into a 0600 env file, `KillMode=process` kept); `/api/health` reports 9a281ec on both; every tmux session survived (Mac 18, NUC 20); `AUTH_TOKEN` cleared from both tmux global envs. Through each Cloudflare hostname: no cookie 401, wrong token 401, right token 303 plus `tw_auth`, the old token 401, a cross-site POST 403, a same-origin WS opens and a cross-site one is refused. cloudflared keeps the Host header, so the Origin check doesn't break the tunnel. Snapshots save after the restart. Agent worktrees removed. The WSL box is the user's to deploy.
+
 ## Found during review
 
 - Left for later (small): the help and paste-box copy still says "tap Copy / tap Paste"; the phone title-bar dot has no idle state; a socket stuck in CONNECTING after a wake waits for the browser's own timeout.
-
-- To check at deploy: whether cloudflared keeps the original Host header (the default). If it rewrites it, the Origin check returns 403 for WS and POST through the tunnel.
 
 - `isolation: worktree` branches from `origin/main`, not local `main`. Each task prompt must start with `git merge --ff-only main`. T1 and T6 were dispatched before this was known, so they're based on e8b80cc and merged by cherry-pick.
