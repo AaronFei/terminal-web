@@ -80,8 +80,8 @@ let touchSelectMode = false;
 // the interval of any legitimate re-typing of the same characters.
 const IME_DEDUP_MS = 300;
 
-// Cap on the bytes of discrete injections (uploaded file path, paste, key-bar
-// press) buffered while the WebSocket is down, so a long outage can't grow the
+// Cap on the bytes of discrete injections (uploaded file path, paste)
+// buffered while the WebSocket is down, so a long outage can't grow the
 // queue without bound. 64 KB is far more than any real path/paste.
 const MAX_PENDING_SEQ = 64 * 1024;
 
@@ -436,7 +436,7 @@ class Session {
   private composing = false;
   private reattachAfterCompose = false;
 
-  // Discrete injections (file path, paste, key-bar seq) buffered while the WS is
+  // Discrete injections (file path, paste) buffered while the WS is
   // not OPEN, flushed on the next reconnect (see connect's onopen). Raw typing
   // is never buffered — only these one-shot sends routed through sendSeq().
   private pendingSeq: string[] = [];
@@ -974,7 +974,7 @@ class Session {
   }
 
   /**
-   * Send a discrete injection (key-bar sequence, paste, uploaded file path).
+   * Send a discrete injection (paste, uploaded file path).
    * Unlike raw keystrokes, these are buffered and replayed on reconnect when the
    * socket is down — a big upload can saturate the uplink, trip the 20s
    * heartbeat, and land the path insert mid-reconnect, which would otherwise be
@@ -987,6 +987,18 @@ class Session {
     }
     const buffered = this.pendingSeq.reduce((n, s) => n + s.length, 0);
     if (buffered + seq.length <= MAX_PENDING_SEQ) this.pendingSeq.push(seq);
+    else flashWhileDown('not sent: too much to hold while reconnecting', 2500);
+  }
+
+  /**
+   * Send a key-bar press. Dropped, like a typed key, while the socket is down:
+   * replaying arrows, Enter or ^C minutes later can run a command again.
+   * Returns whether it was sent.
+   */
+  sendKey(seq: string): boolean {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+    this.send(seq);
+    return true;
   }
 
   /**
@@ -1474,7 +1486,12 @@ class Session {
         this.reattachAfterCompose = true;
       } else {
         this.resync();
-        if (isActive(this)) this.term.focus();
+        // Only the terminal that has the keys (in a split both halves reconnect
+        // after a deploy), and never out of something focused on purpose: a
+        // rename box, the paste box, a confirm dialog.
+        const a = document.activeElement;
+        const free = !a || a === document.body || a.classList.contains('xterm-helper-textarea');
+        if (activeSession === this && free) this.term.focus();
       }
     };
 
@@ -2786,6 +2803,17 @@ function applyMods(seq: string): string {
   return seq;
 }
 
+// A key-bar press made while disconnected is dropped; say so, but at most once
+// per KEY_DROP_FLASH_MS so mashing the keys doesn't keep re-flashing it.
+const KEY_DROP_FLASH_MS = 1500;
+let keyDropFlashAt = -Infinity;
+function flashKeyDropped(): void {
+  const now = performance.now();
+  if (now - keyDropFlashAt < KEY_DROP_FLASH_MS) return;
+  keyDropFlashAt = now;
+  flashWhileDown('未連線，按鍵沒有送出', KEY_DROP_FLASH_MS);
+}
+
 for (const def of KEYS) {
   if (def.rowBreak) {
     const brk = document.createElement('div');
@@ -2836,7 +2864,9 @@ for (const def of KEYS) {
       refreshModVisuals();
       return;
     }
-    if (def.seq !== undefined) activeSession?.sendSeq(applyMods(def.seq));
+    if (def.seq !== undefined && activeSession && !activeSession.sendKey(applyMods(def.seq))) {
+      flashKeyDropped();
+    }
     if (ctrlArmed || altArmed) {
       ctrlArmed = false;
       altArmed = false;
@@ -3220,6 +3250,15 @@ function flashStatus(text: string, ms: number): void {
   showStatus(text);
   window.setTimeout(() => {
     if (statusEl?.textContent === text) hideStatus();
+  }, ms);
+}
+
+// flashStatus for a message shown during an outage: when it ends, put
+// "reconnecting…" back instead of leaving the bar empty while still down.
+function flashWhileDown(text: string, ms: number): void {
+  flashStatus(text, ms);
+  window.setTimeout(() => {
+    if (!statusEl?.classList.contains('visible')) reflectActiveStatus();
   }, ms);
 }
 

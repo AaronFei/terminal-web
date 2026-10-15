@@ -26,12 +26,12 @@ must keep.
 
 | ID | Scope | Depends on | Status |
 |---|---|---|---|
-| T1 | Server security: exact tmux targets, test socket, env scrub, cookie decode, fail-closed auth, Origin/Host check, name validation | – | todo |
+| T1 | Server security: exact tmux targets, test socket, env scrub, cookie decode, fail-closed auth, Origin/Host check, name validation | – | in progress |
 | T2 | Server resources: stream pipeline, streamed upload, WS backpressure, maxPayload, single-flight snapshots, collapse baseline, tailscale timeout, `/api/health` | T1 | todo |
-| T3 | Input, minimal: reconnect focus fix; key bar dropped while disconnected | – | todo |
+| T3 | Input, minimal: reconnect focus fix; key bar dropped while disconnected | – | in progress |
 | T4 | Front-end split, resize and lifecycle bugs | T3 | todo |
 | T5 | Front-end touch, resources and cleanups | T4 | todo |
-| T6 | `service.sh` / `deploy.sh` hardening | – | todo |
+| T6 | `service.sh` / `deploy.sh` hardening | – | in progress |
 | T7 | README, `.env.example`, `web.tmux.conf` comment | T1–T6 | todo |
 | T8 | Split `web/terminal.ts` into modules | T5 | todo |
 | D | Deploy to both boxes, rotate tokens, clear `AUTH_TOKEN` from tmux's global env | all, plus user OK | todo |
