@@ -29,8 +29,8 @@ invariant below needs the lead's sign-off first, and then an update here.
 
 ## Deployments
 
-- Mac: launchd `com.aaronfei.terminal-web`, bound to tailnet IP `100.81.231.8:8090`.
-- NUC (Linux): `systemd --user` `terminal-web.service`, `KillMode=process` so tmux survives restarts, `100.84.185.98:8090`.
+- macOS: a launchd user agent (installed by `scripts/service.sh`), bound to the machine's tailnet IP on :8090.
+- Linux: `systemd --user` `terminal-web.service` with `KillMode=process`, so tmux survives restarts; also bound to the tailnet IP on :8090.
 - Each box is also public through its own Cloudflare Tunnel.
 - `tsx` does not hot-reload. A server change needs a restart on both boxes; a client-only change needs `npm run build`.
 
@@ -82,7 +82,7 @@ is already gone would kill `devops`.
 
 ### Never touch the user's live tmux server from a test
 
-Claude Code on this Mac runs inside tmux, so `$TMUX` is set, and `$TMUX`
+A developer's own shell (or Claude Code) often runs inside tmux, so `$TMUX` is set, and `$TMUX`
 overrides `TMUX_TMPDIR`. Only an explicit socket isolates a test:
 `env -u TMUX -u TMUX_PANE tmux -L <scratch> ...`. Before any kill, run
 `list-sessions` with the exact same flags and confirm it shows only your test
