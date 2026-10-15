@@ -39,7 +39,7 @@ must keep.
 | T6 | `service.sh` / `deploy.sh` hardening | – | done |
 | T7 | README, `.env.example`, `web.tmux.conf` comment | T1–T6 | done |
 | T8 | Split `web/terminal.ts` into modules | T5 | done |
-| P1 | Passkey sign-in (optional, alongside the token), server-issued session cookies | D | done (0261852), not deployed |
+| P1 | Passkey sign-in (optional, alongside the token), server-issued session cookies | D | done (0261852), deployed f91c3dd |
 | D | Deploy to both boxes, rotate tokens, clear `AUTH_TOKEN` from tmux's global env | all, plus user OK | done (9a281ec) |
 
 ## Done

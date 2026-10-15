@@ -496,25 +496,29 @@ export async function gateHttp(
     return true;
   }
 
-  // Old bookmarks carry the token in the URL. Still honoured on a GET, then
-  // dropped from the URL straight away.
+  const auth = cookieAuth(req, token);
+
+  // Old bookmarks and launchers carry the token in the URL. Still honoured on
+  // a GET, then dropped from the URL straight away. A visitor who is already
+  // signed in keeps their session whatever the URL says: a launcher still
+  // holding a rotated-out token used to put up the login page on every open,
+  // and a correct one minted a new session each time.
   const supplied = url.searchParams.get("token");
   if (supplied !== null && (method === "GET" || method === "HEAD")) {
-    if (safeEqual(supplied, token)) {
-      url.searchParams.delete("token");
-      const qs = url.searchParams.toString();
-      res.writeHead(302, {
-        "Set-Cookie": tokenSessionCookie(req),
-        Location: url.pathname + (qs ? `?${qs}` : ""),
-      });
-      res.end();
+    const good = safeEqual(supplied, token);
+    if (!good && !auth) {
+      sendLoginPage(res, "Wrong token.");
       return true;
     }
-    sendLoginPage(res, "Wrong token.");
+    url.searchParams.delete("token");
+    const qs = url.searchParams.toString();
+    const headers: Record<string, string> = { Location: url.pathname + (qs ? `?${qs}` : "") };
+    if (!auth || auth.kind === "legacy") headers["Set-Cookie"] = tokenSessionCookie(req);
+    res.writeHead(302, headers);
+    res.end();
     return true;
   }
 
-  const auth = cookieAuth(req, token);
   if (auth) {
     // A cookie that holds the token itself: let it through, and swap it for a
     // session on this same response (setHeader survives the writeHead the

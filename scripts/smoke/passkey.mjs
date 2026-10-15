@@ -162,7 +162,7 @@ async function http(pathname, { cf = true, cookie, method = 'GET', body, headers
   const text = await res.text();
   const setCookie = res.headers.getSetCookie?.() ?? [];
   const tw = setCookie.map((c) => /^tw_auth=([^;]*)/.exec(c)).find(Boolean);
-  return { status: res.status, text, setCookie, cookieValue: tw ? tw[1] : undefined };
+  return { status: res.status, text, setCookie, cookieValue: tw ? tw[1] : undefined, location: res.headers.get('location') };
 }
 const isLoginPage = (r) => r.status === 401 && /sign in/.test(r.text);
 const isApp = (r) => r.status === 200 && /id="terminal"/.test(r.text);
@@ -468,6 +468,17 @@ try {
   secrets.push(oldToken.cookieValue);
   step('h.tokenInUrl', `${oldToken.status} -> ${oldToken.text.length ? 'body' : 'no body'}, cookie ${oldToken.cookieValue ? 'session' : 'none'}`,
     oldToken.status === 302 && SESSION_ID_RE.test(oldToken.cookieValue ?? '') && oldToken.cookieValue !== TOKEN1);
+  // A launcher's URL token with a session already in place: a stale token
+  // doesn't put up the login page, a right one doesn't mint another session,
+  // and a stale one without a session still does.
+  const stale = await http('/?session=x&token=stale', { cookie: oldToken.cookieValue });
+  step('h.staleUrlTokenWithSession', `${stale.status} -> ${stale.location ?? '?'}, cookie ${stale.cookieValue ? 'new' : 'kept'}`,
+    stale.status === 302 && !stale.cookieValue && (stale.location ?? '') === '/?session=x');
+  const again = await http('/?token=' + encodeURIComponent(TOKEN1), { cookie: oldToken.cookieValue });
+  step('h.rightUrlTokenWithSession', `${again.status}, cookie ${again.cookieValue ? 'new' : 'kept'}`,
+    again.status === 302 && !again.cookieValue);
+  const staleNoSession = await http('/?token=stale');
+  step('h.staleUrlTokenNoSession', staleNoSession.status, isLoginPage(staleNoSession));
 
   // (i) the tailnet (no cf-ray): no passkey endpoints, the app opens with no cookie
   const tn = [
