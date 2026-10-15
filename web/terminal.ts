@@ -52,6 +52,11 @@ const WIDE_PX = 760;
 // what a tmux-resurrect restore drops — the same way it drops @twtab — and a
 // name survives it. `work` has `work__b`; nothing else needs storing.
 const MATE_SUFFIX = '__b';
+// The server takes session names of up to 64 characters and refuses longer
+// ones rather than cutting them short. A tab's second half is its name plus
+// the suffix, so a tab's own name has to leave room for it: one at the full 64
+// would get a split whose second session can never attach.
+const MAX_TAB_NAME = 64 - MATE_SUFFIX.length;
 
 /** The name of the second session beside `name`. */
 function mateNameOf(name: string): string {
@@ -120,10 +125,13 @@ const TOUCH_DEVICE = navigator.maxTouchPoints > 0;
 
 const encoder = new TextEncoder();
 
-/** Sanitize a session name to [A-Za-z0-9_-]{1,64}; null if nothing usable. */
+/**
+ * Sanitize a tab's session name to [A-Za-z0-9_-]{1,61} (see MAX_TAB_NAME);
+ * null if nothing usable.
+ */
 function sanitizeName(raw: string | null | undefined): string | null {
   if (typeof raw !== 'string') return null;
-  const cleaned = raw.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64);
+  const cleaned = raw.replace(/[^A-Za-z0-9_-]/g, '').slice(0, MAX_TAB_NAME);
   return cleaned.length ? cleaned : null;
 }
 
@@ -440,6 +448,10 @@ class Session {
   // not OPEN, flushed on the next reconnect (see connect's onopen). Raw typing
   // is never buffered — only these one-shot sends routed through sendSeq().
   private pendingSeq: string[] = [];
+
+  // Set by restart(), used up by the next socket to open: that reconnect is
+  // into a session made from scratch, which has lost the label (see onopen).
+  private relabelOnOpen = false;
 
   // Which of this tab's two terminals is on screen. A per-device choice now
   // that the pair is two sessions rather than one tmux window: a phone and a
@@ -1371,6 +1383,9 @@ class Session {
       return;
     }
     requestAnimationFrame(() => {
+      // Hidden again before this frame came round: a tab flicked past on the
+      // way to another one. It was never looked at, so it does not attach.
+      if (this.disposed || this.el.classList.contains('hidden')) return;
       this.fit();
       // Attach now, not at page load: this is the first frame where this pane
       // is laid out, so fit() has the real size to hand the server.
@@ -1386,6 +1401,7 @@ class Session {
     this.term.reset();
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ type: 'restart' }));
+      this.relabelOnOpen = true; // the kill takes @twlabel with it; see onopen
     }
   }
 
@@ -1476,7 +1492,14 @@ class Session {
       // Re-assert a custom label: the server stores it on the tmux session
       // (@twlabel), which is wiped when the session is killed+recreated by a
       // restart, so a renamed tab would otherwise revert to its raw name.
-      if (this.displayName !== this.name) renameOnServer(this.name, this.displayName);
+      // Only after this device's own restart, though. Any other reconnect is
+      // into the same session, label intact — and a phone waking up reconnects
+      // before its sync has fetched a name given on another device, so saying
+      // its own stale one again would undo that rename everywhere.
+      if (this.relabelOnOpen) {
+        this.relabelOnOpen = false;
+        if (this.displayName !== this.name) renameOnServer(this.name, this.displayName);
+      }
       // Re-fit + re-focus so typing resumes smoothly after a reconnect — UNLESS
       // an IME composition is in flight: on iOS these cancel the soft keyboard's
       // active composition, dropping the 注音 candidate bar and turning input
@@ -1512,7 +1535,16 @@ class Session {
             if (this.isMate) {
               const tab = sessions.find((s) => s.mate === this);
               if (tab) {
-                tab.setView('one');
+                // Only the open tab is laid out again. layOutTab shows what it
+                // is given, so running it on a tab in the background would put
+                // that tab's pane over the one you are looking at and hand it
+                // the keys.
+                if (tab === activeTab) {
+                  tab.setView('one');
+                } else {
+                  tab.view = 'one';
+                  saveTabs();
+                }
                 tab.mate = null; // pressing 2 or ⊞ again makes a new one
                 if (activeSession === this) activeSession = tab;
               }
@@ -1583,9 +1615,16 @@ const sessions: Session[] = [];
 let activeTab: Session | null = null;
 let activeSession: Session | null = null;
 
-/** Whether this terminal is one of the ones currently on screen. */
+/**
+ * Whether this terminal is one of the ones currently on screen. The same rule
+ * layOutTab shows them by: the open tab's first terminal unless it is on 'two',
+ * its second unless it is on 'one'. Being the open tab is not enough — on 'two'
+ * the first one is hidden, and a toast about it would be about nothing you see.
+ */
 function isActive(s: Session): boolean {
-  return s === activeTab || (activeTab?.mate === s && activeTab.view !== 'one');
+  if (!activeTab) return false;
+  if (s === activeTab) return activeTab.view !== 'two';
+  return s === activeTab.mate && activeTab.view !== 'one';
 }
 
 /** Point typing and the key bar at one of the open tab's terminals. */
@@ -1623,6 +1662,10 @@ function updateTabDot(s: Session): void {
   refreshMobileUI();
 }
 
+// Whether the split last laid out went one above the other. Only read while a
+// tab on 'both' is open, and that tab was laid out when it was opened.
+let splitStacked = false;
+
 /**
  * Put a tab's terminals on screen: one of them, the other, or both — side by
  * side when there is room for two usable ones, stacked when there is not.
@@ -1636,6 +1679,7 @@ function layOutTab(tab: Session): void {
   const mate = tab.view === 'one' ? tab.mate : tab.ensureMate();
   const both = tab.view === 'both' && !!mate;
   const vertical = both && termArea.clientWidth < WIDE_PX;
+  if (both) splitStacked = vertical; // what restackSplit watches for a change
 
   tab.half = both;
   if (mate) mate.half = both;
@@ -1887,15 +1931,7 @@ function closeSession(s: Session): void {
   recentlyClosed.set(s.name, performance.now());
   // Closing a tab kills its tmux session for good (its programs are terminated).
   s.kill();
-  sessions.splice(idx, 1);
-  s.tabEl?.remove();
-  s.dispose();
-  if (activeTab === s) {
-    activeTab = null;
-    activeSession = null;
-    const next = sessions[idx] ?? sessions[idx - 1] ?? null;
-    if (next) activateSession(next);
-  }
+  dropTab(s, idx);
   if (sessions.length === 0) addFallbackTab();
   refreshMobileUI();
   saveTabs();
@@ -2039,7 +2075,9 @@ function saveTabs(): void {
   } catch {
     /* ignore */
   }
-  if (activeSession) savePrefs({ activeTab: activeSession.name });
+  // The tab, not the half of it that has the keys: a second half's name
+  // (X__b) is not a tab, and init would find nothing to open by it.
+  if (activeTab) savePrefs({ activeTab: activeTab.name });
 }
 
 function loadTabs(): { tabs: SavedTab[]; active: string | null } {
@@ -2270,25 +2308,47 @@ window.addEventListener('pagehide', () => {
 function removeLocalSession(s: Session): void {
   const idx = sessions.indexOf(s);
   if (idx < 0) return;
-  sessions.splice(idx, 1);
-  s.tabEl?.remove();
-  s.dispose();
-  if (activeTab === s) {
-    activeTab = null;
-    activeSession = null;
-    const next = sessions[idx] ?? sessions[idx - 1] ?? null;
-    if (next) activateSession(next);
-  }
+  dropTab(s, idx);
   refreshMobileUI();
 }
 
+/**
+ * Take tab `s` (at `idx`) out of the strip and free both its terminals — what
+ * closeSession and removeLocalSession share. If it was open, the tab beside it
+ * opens instead.
+ *
+ * "Open" is judged by the keys as well as by activeTab: should anything ever
+ * leave activeSession on this tab's terminals while another tab is open, the
+ * key bar, pastes and uploads would go on aiming at a disposed terminal, and
+ * the toast would say "reconnecting…" about it for good. Then the tab that is
+ * really open is opened again, which points the keys back at it.
+ */
+function dropTab(s: Session, idx: number): void {
+  const held = activeTab === s || activeSession === s || (!!s.mate && activeSession === s.mate);
+  sessions.splice(idx, 1);
+  s.tabEl?.remove();
+  s.dispose(); // its mate too
+  if (held) {
+    const stillOpen = activeTab !== s ? activeTab : null;
+    activeTab = null;
+    activeSession = null;
+    const next = stillOpen ?? sessions[idx] ?? sessions[idx - 1] ?? null;
+    if (next) activateSession(next);
+  }
+}
+
 let syncing = false;
+// Set once init has built the tabs. Before that the strip is empty because it
+// has not been filled yet, not because every tab was closed — a sync landing
+// then (the interval, or the page gaining focus while init waits on the
+// server) would make a fallback tab, or race init in building the same ones.
+let tabsReady = false;
 
 // Reconcile our local tabs with the server's list: adopt sessions opened (or
 // renamed) on other devices, drop sessions closed elsewhere. The active tab is
 // per-device and never changed here unless its session disappeared.
 async function syncFromServer(): Promise<void> {
-  if (syncing) return;
+  if (syncing || !tabsReady) return;
   syncing = true;
   try {
     const serverTabs = await fetchServerTabs();
@@ -2359,10 +2419,23 @@ async function syncFromServer(): Promise<void> {
 // Layout: key bar height + iOS keyboard offset; fit the active session.
 // ---------------------------------------------------------------------------
 function fitActive(): void {
+  restackSplit();
   // Both halves of a split, not just the one with the keys: the keyboard coming
   // up takes rows from each of them.
   activeTab?.fit();
   if (activeTab?.view !== 'one') activeTab?.mate?.fit();
+}
+
+/**
+ * Lay the split on screen out again when the window has crossed WIDE_PX —
+ * rotating a tablet, dragging a window narrower — so its halves go from side by
+ * side to stacked or back. Nothing else would: the halves of a split never
+ * publish a size (see fit), so setPaneDims never runs while one is up. Only on
+ * a change of answer, because layOutTab re-shows both panes and re-fits them.
+ */
+function restackSplit(): void {
+  if (activeTab?.view !== 'both') return;
+  if (termArea.clientWidth < WIDE_PX !== splitStacked) layOutTab(activeTab);
 }
 
 // Resizing a tmux window makes it reflow its whole history, so the panes nobody
@@ -2382,12 +2455,19 @@ function setPaneDims(cols: number, rows: number): void {
   if (bgResizeTimer !== null) clearTimeout(bgResizeTimer);
   bgResizeTimer = window.setTimeout(() => {
     bgResizeTimer = null;
+    // Each hidden terminal takes the size it will have when its tab is next
+    // shown, so showing it costs no resize. That is the full pane for a tab on
+    // 'one', and on 'two' for its second half too, which is then what fills
+    // the pane. A tab on 'both' is left alone, both halves of it: they open at
+    // half the pane, at the size they last measured themselves, and handing
+    // them the full one here would send each a SIGWINCH now and another on
+    // the way back. (The first half of a tab on 'two' is not shown at all; it
+    // keeps following the full pane, the size 'one' would give it.)
     for (const s of sessions) {
+      if (s.view === 'both') continue;
       if (!isActive(s)) s.applyDims(paneCols, paneRows);
+      if (s.view === 'two' && s.mate && !isActive(s.mate)) s.mate.applyDims(paneCols, paneRows);
     }
-    // A window that got narrow enough (or wide enough) wants its two terminals
-    // stacked rather than side by side, or the other way round.
-    if (activeTab?.view === 'both') layOutTab(activeTab);
   }, BG_RESIZE_DELAY);
 }
 
@@ -2407,6 +2487,10 @@ function updateKeybarHeight(): void {
   }
   // The terminal's height is measured from the key bar, and is set in JS now
   // rather than by CSS, so it has to be re-measured whenever the bar changes.
+  // Everything that calls this (a resize, the bar toggled, the mobile
+  // breakpoint, fullscreen) can also move the terminal's top, so both cached
+  // lengths go.
+  forgetTermGeometry();
   updateKeyboardOffset();
 }
 
@@ -2447,11 +2531,27 @@ function cssPx(el: HTMLElement, prop: string): number {
   return parseFloat(getComputedStyle(el).getPropertyValue(prop)) || 0;
 }
 
+// The terminal's top and the key bar's height, as updateKeyboardOffset last
+// read them. It runs on every frame the terminal draws while the keyboard is
+// up, and each read is a getComputedStyle, so they are kept until something
+// that really moves them: a resize or rotation, the key bar shown, hidden or
+// re-wrapped, fullscreen (see updateKeybarHeight), or a change of width.
+let termTopPx: number | null = null;
+let keybarPx: number | null = null;
+function forgetTermGeometry(): void {
+  termTopPx = null;
+  keybarPx = null;
+}
+
 // The terminal's height with no keyboard up. Everything the keyboard does is
 // measured against this, and the terminal keeps it while a keyboard is open so
 // the pty is never resized by one — a resize would send tmux a SIGWINCH, and a
 // program on the alternate screen has no scrollback to put the lost rows back.
 let restingTermH: number | null = null;
+// The window width restingTermH was taken at. A soft keyboard never changes
+// the width; a rotation or a real resize does, and then the old resting height
+// is meaningless and is taken again.
+let restingWidth: number | null = null;
 // Below this, treat it as noise rather than a keyboard. Low enough to catch an
 // iPad's shortcut bar (~45-55px) when a hardware keyboard is attached, which
 // covers the prompt just as effectively as a full keyboard does.
@@ -2466,6 +2566,13 @@ const KEYBOARD_MIN_VISIBLE_PX = 72;
 let framedCovered = 0;
 
 let keyboardUp = false;
+// The slide in use, and the terminal it was worked out for. While the keyboard
+// stays up it only grows: Claude Code draws lines below its prompt and takes
+// them away again as you type, and following each one would bounce the whole
+// terminal up and down under your fingers. It starts over when the keyboard
+// goes away or the keys move to another terminal.
+let slidePx = 0;
+let slideFor: Session | null = null;
 let kbOffsetFrame = 0;
 function scheduleKeyboardOffset(): void {
   if (kbOffsetFrame) return;
@@ -2476,8 +2583,13 @@ function scheduleKeyboardOffset(): void {
 }
 
 function updateKeyboardOffset(): void {
-  const top = cssPx(termArea, 'top');
-  const keybarH = cssPx(root, '--keybar-h');
+  const width = window.innerWidth;
+  const resized = width !== restingWidth;
+  if (resized) forgetTermGeometry(); // a rotation moves the safe areas too
+  if (termTopPx === null) termTopPx = cssPx(termArea, 'top');
+  if (keybarPx === null) keybarPx = cssPx(root, '--keybar-h');
+  const top = termTopPx;
+  const keybarH = keybarPx;
   // Everything hidden below what can be seen, however we came to know about it:
   // a shrunken visual viewport, a shrunken layout viewport, or a framing page
   // telling us. Only one of the three is ever non-zero.
@@ -2491,11 +2603,24 @@ function updateKeyboardOffset(): void {
   // A soft keyboard is only up while something is focused, so with nothing
   // focused this IS the resting height. While typing, take any increase: the
   // keyboard can only ever cost room, so more room means the resting value was
-  // stale (rotated mid-type, say) rather than that the keyboard grew.
+  // stale rather than that the keyboard grew.
+  //
+  // Only a touch device has a soft keyboard. On a desktop xterm's textarea is
+  // focused the whole time, so holding the height there meant it could only
+  // ever grow: a shorter window (or DevTools docked below) cut off the bottom
+  // rows, or was taken for a keyboard and slid the terminal up.
+  //
+  // And on any device a new width is a rotation or a real resize — the
+  // keyboard never changes it — so the resting height is taken again, even
+  // mid-type. Rotating with the keyboard up then sizes the terminal to what is
+  // left above the keyboard until it goes away, rather than keeping the old
+  // orientation's height and running off the bottom of the screen.
   const el = document.activeElement;
-  const typing = el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement;
-  if (!typing || restingTermH === null || available > restingTermH) {
+  const typing =
+    TOUCH_DEVICE && (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement);
+  if (!typing || resized || restingTermH === null || available > restingTermH) {
     restingTermH = available;
+    restingWidth = width;
   }
   root.style.setProperty('--term-h', `${Math.round(restingTermH)}px`);
 
@@ -2508,8 +2633,18 @@ function updateKeyboardOffset(): void {
   const room = Math.max(0, restingTermH - KEYBOARD_MIN_VISIBLE_PX);
   const maxOffset = covered > KEYBOARD_MIN_PX ? Math.min(Math.round(covered), room) : 0;
   keyboardUp = maxOffset > 0;
-  const needed = activeSession ? Math.ceil(activeSession.contentBottomPx() - available) : maxOffset;
-  const offset = Math.max(0, Math.min(maxOffset, needed));
+  if (!keyboardUp || activeSession !== slideFor) slidePx = 0; // see slidePx
+  slideFor = activeSession;
+  let offset = 0;
+  if (keyboardUp) {
+    const needed = activeSession
+      ? Math.ceil(activeSession.contentBottomPx() - available)
+      : maxOffset;
+    // Never past maxOffset, though: a keyboard that got shorter (its
+    // suggestion strip gone) leaves less to clear, not more.
+    offset = Math.max(0, Math.min(maxOffset, Math.max(slidePx, needed)));
+  }
+  slidePx = offset;
   root.style.setProperty('--kb-offset', `${offset}px`);
 
   if (VV_DEBUG) {
@@ -3228,15 +3363,25 @@ if (window.parent !== window) {
 }
 
 if (window.visualViewport) {
-  window.visualViewport.addEventListener('resize', updateKeyboardOffset);
-  window.visualViewport.addEventListener('scroll', updateKeyboardOffset);
+  // Once a frame at most: a keyboard sliding up fires these in bursts, and the
+  // terminal drawing schedules the same update (see onRender).
+  window.visualViewport.addEventListener('resize', scheduleKeyboardOffset);
+  window.visualViewport.addEventListener('scroll', scheduleKeyboardOffset);
   // Read the resting gap now, before anything is focused. Without this the
   // first reading would be taken as the keyboard opened, and a keyboard-sized
   // resting gap means the terminal never moves out from under it.
   updateKeyboardOffset();
-  // Once more after layout settles (a PWA's safe areas, Safari's chrome).
-  window.setTimeout(updateKeyboardOffset, 1200);
+  // Once more after layout settles (a PWA's safe areas, Safari's chrome) —
+  // which can move the terminal's top, so that is read again too.
+  window.setTimeout(() => {
+    forgetTermGeometry();
+    updateKeyboardOffset();
+  }, 1200);
 }
+// Fullscreen takes the browser's chrome away and the safe areas with it, and
+// can be left with Esc rather than our button: re-measure either way.
+document.addEventListener('fullscreenchange', updateKeybarHeight);
+document.addEventListener('webkitfullscreenchange', updateKeybarHeight);
 window.addEventListener('beforeunload', () => {
   for (const s of sessions) s.dispose();
 });
@@ -3586,8 +3731,10 @@ async function init(): Promise<void> {
   const active = wanted.map((n) => sessions.find((s) => s.name === n)).find(Boolean);
   activateSession(active ?? sessions[0]);
 
-  // Everything restored: from here on, changes are the user's and get saved.
+  // Everything restored: from here on, changes are the user's and get saved,
+  // and the server's tab list may be synced against ours.
   prefsReady = true;
+  tabsReady = true;
 }
 
 void init();
