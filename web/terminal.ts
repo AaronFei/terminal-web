@@ -9,6 +9,15 @@ import { WebglAddon } from '@xterm/addon-webgl';
 // ---------------------------------------------------------------------------
 const MIN_DELAY = 500;
 const MAX_DELAY = 5000;
+// Heartbeat (see Session.startPing): a ping every PING_MS; a socket that lets
+// one go unanswered for PING_TIMEOUT_MS — nothing at all arriving — is taken
+// for dead. Right after the page wakes the bar is WAKE_PING_MS, since that is
+// when a dead one is most likely and the user is waiting on it. A tick running
+// PING_LATE_MS past its time means the page was frozen, not the socket.
+const PING_MS = 20_000;
+const PING_TIMEOUT_MS = 2 * PING_MS;
+const WAKE_PING_MS = 5_000;
+const PING_LATE_MS = 10_000;
 const MIN_FONT = 8;
 const MAX_FONT = 28;
 const KEYBAR_HEIGHT = 48; // px when shown
@@ -77,7 +86,7 @@ function primaryNameOf(name: string): string {
 // a finger drag is normally hijacked for scrolling and there is no way to make a
 // text selection by touch (on desktop you hold Option to bypass tmux's mouse
 // reporting; a tablet has no such key). While this is on, a one-finger drag
-// selects text instead of scrolling, and lifting the finger copies it.
+// selects text instead of scrolling, and the selection bar's 複製 copies it.
 let touchSelectMode = false;
 // Window to drop a duplicated IME emission. The CapsLock-switch double-send
 // arrives ~100-120ms apart (keydown-finalize then compositionend-finalize), so
@@ -271,7 +280,7 @@ function openPasteBox(): void {
 }
 
 // Quick help overlay: how to copy / paste / attach files. Shown from the "?"
-// button and once automatically on first visit.
+// button and the ⋯ sheet's Help row.
 function openHelp(): void {
   if (document.querySelector('.help-overlay')) return;
   const selKey = isMac ? '⌥ Option' : 'Shift';
@@ -415,7 +424,15 @@ class Session {
   private ws: WebSocket | null = null;
   private reconnectDelay = MIN_DELAY;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private pingTimer: ReturnType<typeof setInterval> | null = null;
+  private pingTimer: ReturnType<typeof setTimeout> | null = null;
+  // When pingTimer was meant to fire, to tell a late tick from a frozen page.
+  private pingTickAt = 0;
+  // The last time anything arrived on the socket.
+  private lastRxAt = 0;
+  // When the oldest ping not yet answered went out (0: none out), and by when
+  // something has to have arrived.
+  private pingSentAt = 0;
+  private pingDue = 0;
   private disposed = false;
   // Until when a connect may create this session if it is not there. The
   // server refuses to bring back a closed tab for a connect that does not ask
@@ -473,7 +490,13 @@ class Session {
       fontFamily:
         'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
       fontSize: currentFont,
-      scrollback: 100000,
+      // Next to nothing ever lands here. The pty runs tmux, which puts xterm on
+      // its alternate screen for as long as it is attached (web.tmux.conf does
+      // not override smcup/rmcup), and the alternate screen has no scrollback;
+      // the history you scroll through is tmux's own, reached through copy-mode
+      // by the wheel and by touch (see wireTouchScroll). 100000 here only
+      // reserved room for lines that never come.
+      scrollback: 1000,
       allowProposedApi: true,
       // Hold Option (macOS) / Shift (others) and drag to select text even while
       // tmux mouse mode is on, so it can be copied.
@@ -490,16 +513,8 @@ class Session {
     this.el.className = 'term-pane hidden';
     termArea.append(this.el);
     this.term.open(this.el);
-
-    if (WEBGL_ENABLED) {
-      try {
-        const webgl = new WebglAddon();
-        webgl.onContextLoss(() => webgl.dispose());
-        this.term.loadAddon(webgl);
-      } catch {
-        /* fall back to the DOM renderer */
-      }
-    }
+    // The WebGL renderer is not loaded here but when this terminal is first
+    // shown (see loadWebgl).
 
     // Windows/Linux copy-paste. macOS gets this for free: ⌘ is never a terminal
     // key, so xterm ignores ⌘V and the browser's own paste runs — text, images
@@ -599,20 +614,25 @@ class Session {
   }
 
   /**
-   * A cell's size and where the grid starts, in CSS pixels. The pane is padded,
-   * so its border box is a few pixels wider than the terminal inside it — worth
-   * allowing for when the cells themselves are only about eight across.
+   * A cell's size and where the grid starts: `left`/`top` on the page, and
+   * `offX`/`offY` from the pane's padding box, which is what the selection
+   * handles are positioned in. Measured off xterm's own .xterm-screen, which is
+   * exactly cols x rows cells. The pane is not: it has its padding, whatever
+   * FitAddon could not fit a whole cell into, and on a desktop the scrollbar —
+   * divide that by the column count and the error grows a little every column,
+   * so a touch near the right edge lands a cell or two short.
    */
-  private cellSize(): { w: number; h: number; left: number; top: number } {
-    const rect = this.el.getBoundingClientRect();
-    const style = getComputedStyle(this.el);
-    const padX = parseFloat(style.paddingLeft) || 0;
-    const padY = parseFloat(style.paddingTop) || 0;
+  private cellSize(): { w: number; h: number; left: number; top: number; offX: number; offY: number } {
+    const screen = this.el.querySelector<HTMLElement>('.xterm-screen') ?? this.el;
+    const rect = screen.getBoundingClientRect();
+    const pane = this.el.getBoundingClientRect();
     return {
-      w: Math.max(1, rect.width - padX * 2) / Math.max(1, this.term.cols),
-      h: Math.max(1, rect.height - padY * 2) / Math.max(1, this.term.rows),
-      left: rect.left + padX,
-      top: rect.top + padY,
+      w: Math.max(1, rect.width) / Math.max(1, this.term.cols),
+      h: Math.max(1, rect.height) / Math.max(1, this.term.rows),
+      left: rect.left,
+      top: rect.top,
+      offX: rect.left - pane.left - this.el.clientLeft,
+      offY: rect.top - pane.top - this.el.clientTop,
     };
   }
 
@@ -707,8 +727,8 @@ class Session {
     const cell = this.cellSize();
     const viewTop = this.term.buffer.active.viewportY;
     const place = (h: HTMLElement, col: number, row: number, below: boolean): void => {
-      h.style.left = `${col * cell.w}px`;
-      h.style.top = `${(row - viewTop + (below ? 1 : 0)) * cell.h}px`;
+      h.style.left = `${cell.offX + col * cell.w}px`;
+      h.style.top = `${cell.offY + (row - viewTop + (below ? 1 : 0)) * cell.h}px`;
       h.classList.add('visible');
     };
     place(this.handleA, sCol, sRow, false);
@@ -724,20 +744,37 @@ class Session {
     this.term.clearSelection();
   }
 
-  /** The run of word-ish characters around a cell, as a range. */
+  /**
+   * The run of word-ish characters around a cell, as a range of cells.
+   *
+   * Walked cell by cell rather than through translateToString, which gives one
+   * string index per character: a CJK character or an emoji takes two cells,
+   * so on any line with one in it the string index and the column part ways,
+   * and the word found was some way left of the finger.
+   */
   wordRangeAt(col: number, row: number): [[number, number], [number, number]] | null {
-    const line = this.term.buffer.active.getLine(row);
+    const buf = this.term.buffer.active;
+    const line = buf.getLine(row);
     if (!line) return null;
-    const text = line.translateToString(false);
-    const isWord = (ch: string): boolean => !!ch && !/\s/.test(ch);
-    if (!isWord(text[col] ?? '')) return null;
-    let a = col;
-    let b = col;
-    while (a > 0 && isWord(text[a - 1] ?? '')) a -= 1;
-    while (b < text.length - 1 && isWord(text[b + 1] ?? '')) b += 1;
+    const scratch = buf.getNullCell();
+    // A wide character's second cell has width 0 and no characters of its own;
+    // the character is the one in the cell before.
+    const lead = (x: number): number => (x > 0 && line.getCell(x, scratch)?.getWidth() === 0 ? x - 1 : x);
+    const width = (x: number): number => Math.max(1, line.getCell(x, scratch)?.getWidth() ?? 1);
+    const isWord = (x: number): boolean => {
+      const ch = line.getCell(x, scratch)?.getChars() ?? '';
+      return !!ch && !/\s/.test(ch);
+    };
+    const at = lead(col);
+    if (!isWord(at)) return null;
+    let a = at;
+    while (a > 0 && isWord(lead(a - 1))) a = lead(a - 1);
+    // b is the last cell of the last character, so a wide one is taken whole.
+    let b = at + width(at) - 1;
+    while (b + 1 < line.length && isWord(b + 1)) b = b + 1 + width(b + 1) - 1;
     return [
       [a, row],
-      [b, row],
+      [Math.min(b, line.length - 1), row],
     ];
   }
 
@@ -1142,7 +1179,7 @@ class Session {
         }, 500);
         tracking = true;
         scrolling = false;
-        // Cell under the finger, so tmux targets the right pane if it's split.
+        // Cell under the finger, the position the wheel events report to tmux.
         col = Math.max(1, Math.min(this.term.cols, Math.floor((t.clientX - rectLeft) / cellW) + 1));
         row = Math.max(1, Math.min(this.term.rows, Math.floor((t.clientY - rectTop) / cellH) + 1));
       },
@@ -1162,9 +1199,9 @@ class Session {
           }
           selMoved = true;
           if (SEL_DEBUG) this.debugSend('sel-drag', `to ${cellAt(t.clientX, t.clientY).join(',')}`);
-          // Ordering, clipping to one window of a split tab, and placing the
-          // handles all live in setSelectionRange — the drag just says where
-          // the two ends are, exactly as dragging a handle afterwards does.
+          // Ordering and placing the handles live in setSelectionRange — the
+          // drag just says where the two ends are, exactly as dragging a handle
+          // afterwards does.
           this.setSelectionRange([anchorCol, anchorRow], cellAt(t.clientX, t.clientY));
           return;
         }
@@ -1197,11 +1234,10 @@ class Session {
       { capture: true, passive: false },
     );
 
-    // Copy a finished touch selection. The bubble-phase `copySelection` handler
-    // (wired in the constructor) copies term.getSelection() on touchend, so a
-    // moved selection lands on the clipboard automatically; a tap with no drag
-    // left the selection cleared, so nothing is copied. Select mode stays armed
-    // until toggled off again.
+    // A finished touch gesture. Nothing is copied here — copySelection in the
+    // constructor runs on mouseup, which a touch drag does not produce; a touch
+    // selection waits for 複製 on the selection bar. A tap with no drag left the
+    // selection cleared. Select mode stays armed until toggled off again.
     const end = (): void => {
       // A drag that actually selected something leaves the selection up along
       // with its actions, so it can be redone before anything is copied.
@@ -1225,6 +1261,16 @@ class Session {
     );
     this.el.addEventListener('touchend', end, { capture: true, passive: true });
     this.el.addEventListener('touchcancel', end, { capture: true, passive: true });
+    // A gesture the system takes over (a long press it decides is its own, an
+    // edge swipe) ends in touchcancel, with no touchend to use up pressFired —
+    // and left set, it swallowed the next tap's touchend instead.
+    this.el.addEventListener(
+      'touchcancel',
+      () => {
+        pressFired = false;
+      },
+      { capture: true, passive: true },
+    );
   }
 
   // Emit |ticks| SGR mouse-wheel events (Cb 64 = up, 65 = down; press-only).
@@ -1386,11 +1432,35 @@ class Session {
       // Hidden again before this frame came round: a tab flicked past on the
       // way to another one. It was never looked at, so it does not attach.
       if (this.disposed || this.el.classList.contains('hidden')) return;
+      // Before fit: the renderer is what measures the cells it fits to.
+      this.loadWebgl();
       this.fit();
       // Attach now, not at page load: this is the first frame where this pane
       // is laid out, so fit() has the real size to hand the server.
       this.start();
     });
+  }
+
+  /**
+   * Switch to the WebGL renderer, once, the first time this terminal is on
+   * screen. Every tab used to take a WebGL context the moment it was built,
+   * mates and tabs nobody ever opened included — and a browser only keeps so
+   * many: Chrome drops the oldest past 16, and an iPhone can kill the page for
+   * the memory. A terminal never shown never needs one. If it cannot be had, or
+   * the context is lost later, xterm carries on with its DOM renderer; the
+   * addon goes with the terminal when it is disposed.
+   */
+  private webglTried = false;
+  private loadWebgl(): void {
+    if (this.webglTried || !WEBGL_ENABLED) return;
+    this.webglTried = true;
+    try {
+      const webgl = new WebglAddon();
+      webgl.onContextLoss(() => webgl.dispose());
+      this.term.loadAddon(webgl);
+    } catch {
+      /* fall back to the DOM renderer */
+    }
   }
 
   focus(): void {
@@ -1417,19 +1487,121 @@ class Session {
     });
   }
 
+  // Heartbeat. The server answers each {type:'ping'} with a pong, and anything
+  // at all arriving counts as an answer. A phone that sleeps can come back to a
+  // socket that is half open: readyState still says OPEN, the dot stays green,
+  // and every key goes nowhere — nothing but an unanswered ping ever shows it.
+  // One timer per session does all of it: it pings every PING_MS, and the same
+  // timer is brought forward for a check right after the page wakes (wake).
   private startPing(): void {
-    this.stopPing();
-    this.pingTimer = setInterval(() => {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({ type: 'ping' }));
-      }
-    }, 20000);
+    this.lastRxAt = performance.now();
+    this.pingSentAt = 0;
+    this.schedulePing(PING_MS);
   }
   private stopPing(): void {
     if (this.pingTimer !== null) {
-      clearInterval(this.pingTimer);
+      clearTimeout(this.pingTimer);
       this.pingTimer = null;
     }
+  }
+  private schedulePing(ms: number): void {
+    this.stopPing();
+    this.pingTickAt = performance.now() + ms;
+    this.pingTimer = setTimeout(() => this.heartbeat(), ms);
+  }
+
+  /** Send a ping that must be answered within `timeout` ms. */
+  private ping(timeout: number): void {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const now = performance.now();
+    if (!this.pingSentAt || this.lastRxAt >= this.pingSentAt) {
+      // Nothing outstanding: this ping starts the clock.
+      this.pingSentAt = now;
+      this.pingDue = now + timeout;
+    } else {
+      // One is out already: sending another buys it no more time.
+      this.pingDue = Math.min(this.pingDue, now + timeout);
+    }
+    ws.send(JSON.stringify({ type: 'ping' }));
+    this.schedulePing(Math.max(0, Math.min(PING_MS, this.pingDue - now)));
+  }
+
+  private heartbeat(): void {
+    this.pingTimer = null;
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const now = performance.now();
+    const unanswered = this.pingSentAt > 0 && this.lastRxAt < this.pingSentAt;
+    if (unanswered && now >= this.pingDue) {
+      // Far later than it was set for: the page was frozen, and whatever came
+      // in meanwhile may still be queued behind this very timer. Ask again
+      // rather than condemn a socket on the strength of our own sleep.
+      if (now - this.pingTickAt > PING_LATE_MS) {
+        this.pingSentAt = 0;
+        this.ping(WAKE_PING_MS);
+        return;
+      }
+      this.dropSocket(ws);
+      return;
+    }
+    this.ping(PING_TIMEOUT_MS);
+  }
+
+  /**
+   * The page is back in view, or back online: find out now whether this
+   * terminal's connection survived rather than when the next ping is due. A
+   * reconnect waiting out its backoff goes at once; an open socket gets a ping
+   * it must answer within WAKE_PING_MS.
+   */
+  wake(): void {
+    if (this.disposed || !this.started) return;
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+      this.reconnectDelay = MIN_DELAY;
+      this.connect();
+      return;
+    }
+    const ws = this.ws;
+    if (!ws) return;
+    if (ws.readyState === WebSocket.OPEN) {
+      // Start the clock over: a ping left over from before the sleep may be
+      // long past its deadline, and this check is owed its full WAKE_PING_MS.
+      this.pingSentAt = 0;
+      this.ping(WAKE_PING_MS);
+    } else if (ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED) {
+      // Closed, or closing, with no close event to show for it yet — what a
+      // page restored from the back/forward cache can be left holding.
+      this.dropSocket(ws);
+    }
+  }
+
+  /**
+   * Give up on a socket that stopped answering. close() alone is not enough:
+   * on a dead connection the close handshake can take a minute to give up, and
+   * until it does no close event comes. So it is cut loose — its handlers
+   * removed, so a late close or message cannot touch the connection that
+   * replaces it — and the close is handled here, now.
+   */
+  private dropSocket(socket: WebSocket): void {
+    socket.onopen = null;
+    socket.onmessage = null;
+    socket.onclose = null;
+    socket.onerror = null;
+    try {
+      socket.close();
+    } catch {
+      /* ignore */
+    }
+    this.socketClosed(socket);
+  }
+
+  private socketClosed(socket: WebSocket): void {
+    this.stopPing();
+    if (this.ws === socket) this.ws = null;
+    this.setConnected(false);
+    this.scheduleReconnect();
   }
 
   private setConnected(state: boolean): void {
@@ -1519,6 +1691,7 @@ class Session {
     };
 
     socket.onmessage = (ev: MessageEvent) => {
+      this.lastRxAt = performance.now(); // any message answers a ping
       if (ev.data instanceof ArrayBuffer) {
         this.term.write(new Uint8Array(ev.data));
         return;
@@ -1560,12 +1733,7 @@ class Session {
       }
     };
 
-    socket.onclose = () => {
-      this.stopPing();
-      if (this.ws === socket) this.ws = null;
-      this.setConnected(false);
-      this.scheduleReconnect();
-    };
+    socket.onclose = () => this.socketClosed(socket);
 
     socket.onerror = () => {
       try {
@@ -1655,11 +1823,16 @@ function reflectActiveStatus(): void {
 
 function updateTabDot(s: Session): void {
   if (s.isMate) return; // no tab of its own to report on
-  s.tabDot?.classList.toggle('connected', s.connected);
-  // A tab nobody has opened yet is not "disconnected" — there is nothing wrong
-  // with it, it just hasn't attached. Hollow dot rather than a grey one.
-  s.tabDot?.classList.toggle('idle', !s.started);
-  refreshMobileUI();
+  // The strip's dot and the drawer's, changed where they are. Re-rendering the
+  // drawer for this rebuilt the list under the finger on every connect and
+  // disconnect, and a tap that landed as it did was lost.
+  for (const dot of [s.tabDot, drawerDots.get(s)]) {
+    dot?.classList.toggle('connected', s.connected);
+    // A tab nobody has opened yet is not "disconnected" — there is nothing
+    // wrong with it, it just hasn't attached. Hollow dot rather than a grey one.
+    dot?.classList.toggle('idle', !s.started);
+  }
+  refreshMobileTitle();
 }
 
 // Whether the split last laid out went one above the other. Only read while a
@@ -2689,6 +2862,15 @@ function makeButton(
   return b;
 }
 
+// Give the keys back to the terminal after a control is used — on a desktop.
+// On touch, focus() raises the soft keyboard (see activateSession and
+// closeDrawer), so an iPad's ⌨, ⟳, 1/2/⊞ or A± popped it up every time; there
+// the control's preventDefaulted pointerdown has already left focus, and the
+// keyboard, as they were.
+function refocusTerminal(): void {
+  if (!TOUCH_DEVICE) activeSession?.focus();
+}
+
 function changeFont(delta: number): void {
   currentFont = Math.min(MAX_FONT, Math.max(MIN_FONT, currentFont + delta));
   try {
@@ -2702,7 +2884,7 @@ function changeFont(delta: number): void {
     s.mate?.setFont(currentFont); // a second half is not in `sessions`
   }
   fitActive(); // the cell size changed: re-measure and push the new size to all panes
-  activeSession?.focus();
+  refocusTerminal();
 }
 
 function toggleFullscreen(): void {
@@ -2732,11 +2914,11 @@ addBtn.addEventListener('pointerdown', (e) => {
 makeButton(controlsEl, 'tb-btn tb-icon', '☰', 'Sessions', () => openDrawer());
 const keysBtn = makeButton(controlsEl, 'tb-btn tb-icon', '⌨', 'Toggle on-screen keys', () => {
   setKeybarVisible(keybarEl.classList.contains('hidden'));
-  activeSession?.focus();
+  refocusTerminal();
 });
 makeButton(controlsEl, 'tb-btn tb-icon', '⟳', 'Restart this session', () => {
   activeSession?.restart();
-  activeSession?.focus();
+  refocusTerminal();
 });
 
 // Split view. A tab can show a second terminal beside its own: this picks
@@ -2764,7 +2946,7 @@ for (const def of LAYOUT_BUTTONS) {
     def.mode,
     makeButton(layoutSeg, 'tb-btn', def.label, def.title, () => {
       activeTab?.setView(def.mode);
-      activeSession?.focus();
+      refocusTerminal();
     }),
   );
 }
@@ -2883,7 +3065,7 @@ interface KeyDef {
   label?: string;
   seq?: string;
   mod?: 'ctrl' | 'alt';
-  action?: 'copy' | 'paste' | 'select';
+  action?: 'select';
   /** Force a line break here (mobile only): the keys after it wrap to a new row. */
   rowBreak?: boolean;
 }
@@ -2894,8 +3076,9 @@ const KEYS: KeyDef[] = [
   { label: 'Alt', mod: 'alt' },
   { label: '^C', seq: '\x03' },
   { label: 'Enter', seq: '\r' },
-  // Touch text-selection toggle: while armed, drag on the terminal to select and
-  // lift to copy (a tablet's stand-in for desktop Option-drag selection).
+  // Touch text-selection toggle: while armed, drag on the terminal to select,
+  // then copy from the selection bar (a tablet's stand-in for desktop
+  // Option-drag selection).
   { label: '選取', action: 'select' },
   // On a phone the arrows get their own second row; everything else stays on the first.
   { rowBreak: true },
@@ -2972,25 +3155,10 @@ for (const def of KEYS) {
     const refocus = e.pointerType !== 'touch';
     if (def.action === 'select') {
       // Toggle touch-select mode. While on, dragging the terminal selects text
-      // (and lifting copies it) instead of scrolling; tap again to go back to
-      // scrolling. Never refocus — that would pop the soft keyboard.
+      // (copied from the selection bar) instead of scrolling; tap again to go
+      // back to scrolling. Never refocus — that would pop the soft keyboard.
       setTouchSelectMode(!touchSelectMode);
       flashStatus(touchSelectMode ? '選取模式:拖曳選字,放開後再按複製' : '選取關閉', 1800);
-      return;
-    }
-    if (def.action === 'copy') {
-      const sel = activeSession?.term.getSelection() ?? '';
-      if (sel) {
-        void copyText(sel).then((ok) => flashStatus(ok ? 'copied' : 'copy failed', 1200));
-      } else {
-        flashStatus('nothing selected', 1200);
-      }
-      if (refocus) activeSession?.focus();
-      return;
-    }
-    if (def.action === 'paste') {
-      pasteFromClipboard();
-      if (refocus) activeSession?.focus();
       return;
     }
     if (def.mod) {
@@ -3100,9 +3268,13 @@ drawerOverlay.addEventListener('pointerdown', (e) => {
 });
 
 let drawerOpen = false;
+// Each row's status dot, so a change of connection can be shown in place
+// (see updateTabDot) instead of by building the list again.
+const drawerDots = new Map<Session, HTMLElement>();
 
 function renderDrawer(): void {
   drawerList.textContent = '';
+  drawerDots.clear();
   for (const s of sessions) {
     const row = document.createElement('div');
     row.className = 'drawer-row' + (s === activeTab ? ' active' : '');
@@ -3110,7 +3282,8 @@ function renderDrawer(): void {
     const body = document.createElement('div');
     body.className = 'drawer-body';
     const dot = document.createElement('span');
-    dot.className = 'tab-dot' + (s.connected ? ' connected' : '');
+    dot.className = 'tab-dot' + (s.connected ? ' connected' : '') + (s.started ? '' : ' idle');
+    drawerDots.set(s, dot);
     const name = document.createElement('span');
     name.className = 'drawer-name';
     name.textContent = s.displayName;
@@ -3261,7 +3434,7 @@ sheet.append(
   sheetRow('⟳', 'Restart this session', () => {
     closeSheet();
     activeSession?.restart();
-    activeSession?.focus();
+    refocusTerminal();
   }),
   sheetRow('📋', 'Paste', () => {
     closeSheet();
@@ -3314,13 +3487,17 @@ function closeSheet(): void {
 }
 
 // Keep the mobile bar's title + connection dot current, and re-render the open
-// drawer when the session list / active tab / connection state changes.
+// drawer when the session list or the active tab changes. A change of
+// connection alone goes through updateTabDot, which leaves the list standing.
 function refreshMobileUI(): void {
+  refreshMobileTitle();
+  if (drawerOpen) renderDrawer();
+}
+function refreshMobileTitle(): void {
   const s = activeTab;
   mTitleLabel.textContent = s ? s.displayName : '—';
   mTitleDot.classList.toggle('connected', !!s?.connected);
   mKeysBtn.classList.toggle('active', !keybarEl.classList.contains('hidden'));
-  if (drawerOpen) renderDrawer();
 }
 refreshMobileUI();
 
@@ -3352,7 +3529,8 @@ if (window.parent !== window) {
     const covered = Math.max(0, Math.min(2000, Math.round(n)));
     if (covered === framedCovered) return;
     framedCovered = covered;
-    updateKeyboardOffset();
+    // Once a frame at most, like the visualViewport listeners below.
+    scheduleKeyboardOffset();
   });
   // We may have finished loading after the last one was sent.
   try {
@@ -3382,9 +3560,11 @@ if (window.visualViewport) {
 // can be left with Esc rather than our button: re-measure either way.
 document.addEventListener('fullscreenchange', updateKeybarHeight);
 document.addEventListener('webkitfullscreenchange', updateKeybarHeight);
-window.addEventListener('beforeunload', () => {
-  for (const s of sessions) s.dispose();
-});
+// Nothing is torn down on unload. The browser closes the sockets itself, and a
+// page put in the back/forward cache comes back whole: its sockets are closed
+// or dead by then, which the reconnect and wakeOnScreen's pageshow check pick
+// up. Disposing every session here used to bring that page back with no
+// terminals in it.
 
 // ---------------------------------------------------------------------------
 // File paste / drag-drop / picker -> upload -> insert the saved path into the
@@ -3742,8 +3922,24 @@ void init();
 // Keep the tab list in sync with the server: when the page regains focus /
 // visibility, and on a light interval while visible.
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') void syncFromServer();
+  if (document.visibilityState === 'visible') {
+    wakeOnScreen();
+    void syncFromServer();
+  }
 });
+
+// The terminals on screen check their connections the moment the page comes
+// back (see Session.wake): after a phone sleeps, the socket is the likeliest
+// thing to have died, and the person who just picked it up is about to type.
+// The rest keep to their usual heartbeat and backoff.
+function wakeOnScreen(): void {
+  if (!activeTab) return;
+  for (const s of [activeTab, activeTab.mate]) {
+    if (s && isActive(s)) s.wake();
+  }
+}
+window.addEventListener('pageshow', wakeOnScreen);
+window.addEventListener('online', wakeOnScreen);
 window.addEventListener('focus', () => void syncFromServer());
 setInterval(() => {
   if (document.visibilityState === 'visible') void syncFromServer();
