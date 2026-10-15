@@ -1,24 +1,120 @@
 import { execFile, execFileSync } from "node:child_process";
+import type { ExecFileSyncOptions } from "node:child_process";
+import * as pty from "node-pty";
 
-/**
- * Sanitize a requested tmux session name.
- *
- * Per the protocol: keep only [A-Za-z0-9_-], length 1..64. Anything that does
- * not yield a valid name falls back to "web".
- */
-export function sanitizeSession(name: string | null | undefined): string {
-  if (typeof name !== "string") return "web";
-  const cleaned = name.replace(/[^A-Za-z0-9_-]/g, "");
-  if (cleaned.length === 0) return "web";
-  return cleaned.slice(0, 64);
+// ---------------------------------------------------------------------------
+// Running tmux.
+//
+// Every tmux the server starts goes through runTmuxCb / runTmuxSync /
+// spawnTmuxPty below — nothing else in the server names the binary. That is
+// what makes TERMINAL_WEB_TMUX_SOCKET safe to rely on: with it set, every one
+// of them talks to `tmux -L <socket>` and none can reach the user's own server,
+// where Claude Code sessions with real work in them are running.
+// ---------------------------------------------------------------------------
+
+/** "" = tmux's default socket (production); otherwise a `-L` socket name. */
+let tmuxSocket = "";
+
+/** Point every tmux call at `-L socket` ("" = the default socket). Call once, at startup. */
+export function setTmuxSocket(socket: string): void {
+  tmuxSocket = socket;
+}
+
+function tmuxArgv(args: string[]): string[] {
+  return tmuxSocket ? ["-L", tmuxSocket, ...args] : args;
 }
 
 /**
- * Build the argv passed to the `tmux` binary (node-pty spawns "tmux" + these).
+ * The environment a tmux child runs with. On a test socket, TMUX and TMUX_PANE
+ * go: the server under test may well have been started from inside tmux, and
+ * a client that inherits $TMUX treats itself as nested in that (real) server.
+ * The -L should win over it, but nothing here should hinge on that. On the
+ * default socket the env is left exactly as it was.
+ */
+function tmuxEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  if (!tmuxSocket) return env;
+  const out = { ...env };
+  delete out.TMUX;
+  delete out.TMUX_PANE;
+  return out;
+}
+
+type ExecCallback = (err: Error | null, stdout: string) => void;
+
+/** execFile("tmux", args) on the configured socket; stdout as utf8. */
+function runTmuxCb(args: string[], cb: ExecCallback): void {
+  execFile("tmux", tmuxArgv(args), { env: tmuxEnv(), encoding: "utf8" }, (err, stdout) =>
+    cb(err, stdout)
+  );
+}
+
+/** execFileSync("tmux", args) on the configured socket. */
+function runTmuxSync(args: string[], opts: ExecFileSyncOptions = {}): void {
+  execFileSync("tmux", tmuxArgv(args), { ...opts, env: tmuxEnv(opts.env) });
+}
+
+/** A pty running a tmux client on the configured socket (see tmuxArgs). */
+export function spawnTmuxPty(args: string[], opts: pty.IPtyForkOptions): pty.IPty {
+  return pty.spawn("tmux", tmuxArgv(args), { ...opts, env: tmuxEnv(opts.env) });
+}
+
+/** Run tmux; resolve its stdout, or null if it failed. Never throws. */
+function runTmux(args: string[]): Promise<string | null> {
+  return new Promise((resolve) => {
+    runTmuxCb(args, (err, stdout) => resolve(err ? null : stdout));
+  });
+}
+
+/** Run tmux; resolve the error (null on success). Never throws. */
+export function runTmuxStatus(args: string[]): Promise<Error | null> {
+  return new Promise((resolve) => {
+    runTmuxCb(args, (err) => resolve(err));
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Session names and targets.
+// ---------------------------------------------------------------------------
+
+const SESSION_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+/**
+ * A requested tmux session name, exactly as sent, or null if it is not one.
+ *
+ * Names are [A-Za-z0-9_-], 1..64 long, and are never cleaned up into something
+ * that is: this used to strip what didn't fit, cut the rest to 64 and fall back
+ * to "web" on nothing, so a request could act on a session it never named. A
+ * kill sent for "x y" killed "xy"; the second half `X__b` of a 64-character
+ * tab, cut to 64, was `X` — the first half; and anything empty landed on "web".
+ */
+export function sessionName(raw: unknown): string | null {
+  return typeof raw === "string" && SESSION_NAME_RE.test(raw) ? raw : null;
+}
+
+/**
+ * `-t` targets. `=` makes tmux match the name exactly; without it tmux falls
+ * back to a unique-prefix match, so killing "dev" after it is already gone
+ * would kill "devops". The session form is for commands whose -t is a
+ * target-session (kill-session, has-session); the `:` form names that
+ * session's current window/pane, for those whose -t is a target-pane
+ * (display-message — and set-option: since options can be pane-scoped its -t
+ * is a pane target, which `=name` alone fails to resolve with "no such
+ * session", while `=name:` still sets the option on the session).
+ */
+export function sessionTarget(name: string): string {
+  return `=${name}`;
+}
+export function paneTarget(name: string): string {
+  return `=${name}:`;
+}
+
+/**
+ * Build the argv for the tmux client a tab's pty runs (see spawnTmuxPty).
  *
  * Uses `new-session -A` so it attaches to an existing session of the same name
  * or creates it if missing — the core of the resume behavior. The session is
- * assumed to already be sanitized by the caller.
+ * assumed to have been checked by the caller (see sessionName). `-s` takes a
+ * name, not a target, so it has no `=` to add.
  *
  * `-u` forces tmux to treat the client as UTF-8 capable regardless of the
  * locale it detects, so CJK/wide characters render correctly instead of being
@@ -39,14 +135,13 @@ export function tmuxArgs(session: string, confPath: string, startDir?: string): 
  */
 export function mateStartDir(mate: string, base: string): Promise<string | null> {
   return new Promise((resolve) => {
-    execFile("tmux", ["has-session", "-t", `=${mate}`], (err) => {
+    runTmuxCb(["has-session", "-t", sessionTarget(mate)], (err) => {
       if (!err) {
         resolve(null); // already there: attaching must not move it
         return;
       }
-      execFile(
-        "tmux",
-        ["display-message", "-p", "-t", `=${base}:`, "#{pane_current_path}"],
+      runTmuxCb(
+        ["display-message", "-p", "-t", paneTarget(base), "#{pane_current_path}"],
         (err2, stdout) => {
           const dir = err2 ? "" : stdout.trim();
           resolve(dir.startsWith("/") ? dir : null);
@@ -54,6 +149,18 @@ export function mateStartDir(mate: string, base: string): Promise<string | null>
       );
     });
   });
+}
+
+/** The active pane's working directory in a session, or null if unknown. */
+export async function sessionCwd(name: string): Promise<string | null> {
+  const out = await runTmux([
+    "display-message",
+    "-p",
+    "-t",
+    paneTarget(name),
+    "#{pane_current_path}",
+  ]);
+  return out === null ? null : out.trim() || null;
 }
 
 /**
@@ -67,8 +174,7 @@ export function mateStartDir(mate: string, base: string): Promise<string | null>
  */
 export function listTmuxSessions(): Promise<string[] | null> {
   return new Promise((resolve) => {
-    execFile(
-      "tmux",
+    runTmuxCb(
       ["list-sessions", "-F", "#{session_name}"],
       (err, stdout) => {
         if (err) {
@@ -92,7 +198,7 @@ export function listTmuxSessions(): Promise<string[] | null> {
  */
 export function ensureTmuxAvailable(): boolean {
   try {
-    execFileSync("tmux", ["-V"], { stdio: "ignore" });
+    runTmuxSync(["-V"], { stdio: "ignore" });
     return true;
   } catch {
     return false;
@@ -137,7 +243,7 @@ export interface WebTab {
  * set-option can fail with "can't find session" — retry briefly until it sticks.
  */
 export function tagWebSession(name: string, attempt = 0): void {
-  execFile("tmux", ["set-option", "-t", name, TAB_TAG, "1"], (err) => {
+  runTmuxCb(["set-option", "-t", paneTarget(name), TAB_TAG, "1"], (err) => {
     if (err && attempt < 10) {
       setTimeout(() => tagWebSession(name, attempt + 1), 150);
     }
@@ -149,7 +255,7 @@ export function setWebTabLabel(name: string, displayName: string): void {
   // Strip control chars (newlines/tabs) so a label can never break the
   // space-delimited parsing in listWebTabs.
   const dn = displayName.replace(/[\x00-\x1f]/g, " ").trim().slice(0, 64) || name;
-  execFile("tmux", ["set-option", "-t", name, TAB_LABEL, dn], () => {});
+  runTmuxCb(["set-option", "-t", paneTarget(name), TAB_LABEL, dn], () => {});
 }
 
 /**
@@ -171,7 +277,7 @@ export function listWebTabs(): Promise<WebTab[] | null> {
     " "
   );
   return new Promise((resolve) => {
-    execFile("tmux", ["list-sessions", "-F", fmt], (err, stdout) => {
+    runTmuxCb(["list-sessions", "-F", fmt], (err, stdout) => {
       if (err) {
         resolve(null);
         return;
@@ -195,13 +301,6 @@ export function listWebTabs(): Promise<WebTab[] | null> {
       rows.sort((a, b) => a.created - b.created);
       resolve(rows.map(({ name, displayName }) => ({ name, displayName })));
     });
-  });
-}
-
-/** Run tmux; resolve its stdout, or null if it failed. Never throws. */
-function runTmux(args: string[]): Promise<string | null> {
-  return new Promise((resolve) => {
-    execFile("tmux", args, (err, stdout) => resolve(err ? null : stdout));
   });
 }
 

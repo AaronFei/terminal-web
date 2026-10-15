@@ -6,14 +6,20 @@ import os from "node:os";
 import { execFile } from "node:child_process";
 import crypto from "node:crypto";
 import { URL } from "node:url";
+import type { Duplex } from "node:stream";
 
 import { WebSocketServer, WebSocket } from "ws";
 import * as pty from "node-pty";
 
-import { loadConfig } from "./config.js";
+import { loadConfig, CONFIG_ENV_VARS } from "./config.js";
 import {
-  sanitizeSession,
+  sessionName,
+  sessionTarget,
   tmuxArgs,
+  spawnTmuxPty,
+  setTmuxSocket,
+  runTmuxStatus,
+  sessionCwd as tmuxSessionCwd,
   ensureTmuxAvailable,
   tagWebSession,
   setWebTabLabel,
@@ -25,9 +31,11 @@ import {
 } from "./tmux.js";
 import type { ServerMessage } from "./types.js";
 import { isClientMessage } from "./types.js";
-import { gateHttp, isAuthed } from "./auth.js";
+import { gateHttp, refuseUpgrade, hostAllowed, originAllowed } from "./auth.js";
 
 const config = loadConfig();
+// Before anything can run tmux: from here on every call goes to this socket.
+setTmuxSocket(config.tmuxSocket);
 
 // The cross-device tab list lives on the tmux sessions themselves (a @twtab
 // user option), so it can't drift from reality — see tmux.ts. This set just
@@ -437,6 +445,11 @@ function safeUploadBaseName(raw: string | null): string | null {
   return base.length ? base : null;
 }
 
+function sendForbidden(res: http.ServerResponse, why: string): void {
+  res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
+  res.end(`${why}\n`);
+}
+
 function sendJsonHttp(
   res: http.ServerResponse,
   status: number,
@@ -517,7 +530,13 @@ async function handleRenameSession(
     sendJsonHttp(res, 400, { error: "missing name" });
     return;
   }
-  const name = sanitizeSession(obj.name);
+  // Exactly the name sent, or nothing: a cleaned-up name could label (or, in
+  // the kill below, destroy) a session the caller never named.
+  const name = sessionName(obj.name);
+  if (!name) {
+    sendJsonHttp(res, 400, { error: "invalid name" });
+    return;
+  }
   const displayName =
     typeof obj.displayName === "string" ? obj.displayName : name;
   setWebTabLabel(name, displayName);
@@ -552,6 +571,17 @@ async function handleAdoptSessions(
     sendJsonHttp(res, 400, { error: "missing names" });
     return;
   }
+  // Every name must be one as sent. The client only ever sends valid ones, so
+  // a bad one means something is wrong with the request, not just that entry.
+  const wanted: string[] = [];
+  for (const raw of names.slice(0, 64)) {
+    const name = sessionName(raw);
+    if (!name) {
+      sendJsonHttp(res, 400, { error: "invalid name" });
+      return;
+    }
+    wanted.push(name);
+  }
   const existing = await listTmuxSessions();
   if (!existing) {
     sendJsonHttp(res, 200, { adopted: [] }); // tmux unreachable — say nothing
@@ -559,9 +589,7 @@ async function handleAdoptSessions(
   }
   const alive = new Set(existing);
   const adopted: string[] = [];
-  for (const raw of names.slice(0, 64)) {
-    if (typeof raw !== "string") continue;
-    const name = sanitizeSession(raw);
+  for (const name of wanted) {
     // A second half is never adopted as a tab of its own; its tab carries it.
     if (name.endsWith(MATE_SUFFIX)) continue;
     if (!alive.has(name) || adopted.includes(name)) continue;
@@ -599,12 +627,22 @@ async function handleKillSession(
     sendJsonHttp(res, 400, { error: "missing name" });
     return;
   }
-  const name = sanitizeSession(obj.name);
+  // The one irreversible thing this server does, so the name must be exactly
+  // the one sent. Cleaning it up instead killed sessions nobody asked about:
+  // "x y" became "xy", and an empty or all-symbol name became "web".
+  const name = sessionName(obj.name);
+  if (!name) {
+    sendJsonHttp(res, 400, { error: "invalid name" });
+    return;
+  }
   // A tab is up to two sessions — its own and, if it was ever split, the one
   // named after it. Closing the tab closes both; nothing else is touched, and
   // the second name is derived here rather than taken from the request, so a
-  // caller cannot name a session of its own to take down with it.
-  const names = name.endsWith(MATE_SUFFIX) ? [name] : [name, mateNameOf(name)];
+  // caller cannot name a session of its own to take down with it. A first half
+  // too long to have a second (over 64 with the suffix) simply has none: no
+  // session by that name can exist, since the server refuses to make one.
+  const mate = mateNameOf(name);
+  const names = name.endsWith(MATE_SUFFIX) || !sessionName(mate) ? [name] : [name, mate];
   for (const target of names) {
     // Killing a session is the only irreversible thing this server does, so it
     // says so either way. Logging just the failures left no record of what had
@@ -621,7 +659,7 @@ async function handleKillSession(
   // save covers both halves.
   await snapshotBeforeKill(name);
   for (const target of names) {
-    execFile("tmux", ["kill-session", "-t", target], (err) => {
+    void runTmuxStatus(["kill-session", "-t", sessionTarget(target)]).then((err) => {
       // A tab that was never split has no second session, and "can't find
       // session" is the expected answer for it rather than a failure.
       if (err) console.error(`[api] kill-session "${target}" failed:`, err.message);
@@ -722,9 +760,9 @@ async function handleSetPrefs(
   const next: UiPrefs = { ...(all[scope] ?? {}) };
   // Only the fields actually present change; everything else is left alone, so
   // a client that knows about one pref can't blank the ones it doesn't.
-  if (typeof obj.activeTab === "string" && obj.activeTab.trim()) {
-    next.activeTab = sanitizeSession(obj.activeTab);
-  }
+  // A name that isn't one exactly is ignored, not cleaned up into another tab.
+  const activeTab = sessionName(obj.activeTab);
+  if (activeTab) next.activeTab = activeTab;
   if (typeof obj.fontSize === "number" && Number.isFinite(obj.fontSize)) {
     next.fontSize = Math.min(28, Math.max(8, Math.round(obj.fontSize)));
   }
@@ -865,15 +903,10 @@ async function handleUpload(
 // ---------------------------------------------------------------------------
 /** The active pane's working directory for a tmux session, or null if unknown. */
 function sessionCwd(session: string | null): Promise<string | null> {
-  if (!session) return Promise.resolve(null);
-  const name = sanitizeSession(session);
-  return new Promise((resolve) => {
-    execFile(
-      "tmux",
-      ["display-message", "-p", "-t", name, "-F", "#{pane_current_path}"],
-      (err, stdout) => resolve(err ? null : stdout.toString().trim() || null)
-    );
-  });
+  // Not a valid name: unknown, rather than the cwd of a session it was
+  // cleaned up into.
+  const name = sessionName(session);
+  return name ? tmuxSessionCwd(name) : Promise.resolve(null);
 }
 
 async function handleDownload(
@@ -955,9 +988,22 @@ const server = http.createServer((req, res) => {
       const requestUrl = new URL(req.url, "http://localhost");
       const method = req.method ?? "GET";
 
-      // Token gate (no-op when AUTH_TOKEN is unset). Handles the login page and
-      // the ?token=… sign-in for every route.
-      if (gateHttp(req, res, requestUrl, config.authToken)) return;
+      // DNS rebinding and cross-site requests (see auth.ts). Before the token
+      // gate, so the login POST is covered too. Only state-changing requests
+      // are origin-checked: a cross-site GET can't read the answer.
+      if (!hostAllowed(req, config.allowedHosts)) {
+        sendForbidden(res, "Host not allowed. Add it to ALLOWED_HOSTS if it is yours.");
+        return;
+      }
+      if (method !== "GET" && method !== "HEAD" && !originAllowed(req)) {
+        sendForbidden(res, "Cross-origin request refused.");
+        return;
+      }
+
+      // Token gate for Cloudflare-fronted requests: the login page, the login
+      // POST and the ?token=… sign-in for every route, and the refusal when no
+      // token is configured. Direct/tailnet requests pass straight through.
+      if (await gateHttp(req, res, requestUrl, config.authToken)) return;
 
       if (method === "POST" && requestUrl.pathname === "/upload") {
         await handleUpload(req, res, requestUrl.searchParams.get("name"));
@@ -1076,10 +1122,16 @@ function parseDim(raw: string | null, fallback: number, max: number): number {
   return n;
 }
 
-// This server's own configuration env vars. They must NOT leak into the user's
-// shell: e.g. zsh's `%m` prompt escape reads $HOST, so an exported HOST (the
-// bind address) would make the prompt show "100" instead of the real hostname.
-const SERVER_ENV_VARS = ["HOST", "PORT", "DEFAULT_SESSION"];
+// This server's own configuration env vars — every one config.ts reads, taken
+// from its list so the two can't drift. They must NOT leak into the user's
+// shell: AUTH_TOKEN is a secret anything in the terminal could read, and zsh's
+// `%m` prompt escape reads $HOST, so an exported HOST (the bind address) would
+// make the prompt show "100" instead of the real hostname.
+//
+// TMUX and TMUX_PANE too: a server started from inside tmux would otherwise
+// hand them on, and a tmux client that sees $TMUX thinks it is nested in that
+// server — attaching refuses, and on a test socket it names the wrong server.
+const SERVER_ENV_VARS: readonly string[] = [...CONFIG_ENV_VARS, "TMUX", "TMUX_PANE"];
 
 function hasUtf8(value: string | undefined): boolean {
   return typeof value === "string" && /utf-?8/i.test(value);
@@ -1143,6 +1195,20 @@ function noteAbnormalPtyExit(): void {
   });
 }
 
+/**
+ * A client-supplied value made safe to put in a log line: control characters
+ * (newlines above all) and the Unicode line separators become `\xNN` / `\uNNNN`
+ * escapes, so nothing a client sends can end the line and forge the next one.
+ */
+function logSafe(value: unknown): string {
+  return String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, (c) => {
+    const code = c.charCodeAt(0);
+    return code <= 0xff
+      ? `\\x${code.toString(16).padStart(2, "0")}`
+      : `\\u${code.toString(16).padStart(4, "0")}`;
+  });
+}
+
 const wss = new WebSocketServer({ noServer: true });
 
 function sendJson(ws: WebSocket, msg: ServerMessage): void {
@@ -1176,7 +1242,22 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
   } catch {
     requested = null;
   }
-  const session = sanitizeSession(requested ?? config.defaultSession);
+  // No ?session at all: the default one (validated at startup). Otherwise the
+  // name exactly as sent, or nothing. It used to be cleaned up and cut to 64,
+  // and a cut name is someone else's: the second half `X__b` of a 64-character
+  // tab `X` was cut back to `X` itself, so both halves of the split attached to
+  // the first one — and a restart in either killed it.
+  const session = requested === null ? config.defaultSession : sessionName(requested);
+  if (!session) {
+    console.warn(`[ws] refused invalid session name "${logSafe(requested)}"`);
+    sendJson(ws, { type: "info", message: "Invalid session name." });
+    try {
+      ws.close(1008, "invalid session name");
+    } catch {
+      /* ignore */
+    }
+    return;
+  }
 
   // Guard the host's system-wide pty table: refuse the connection (before
   // spawning any pty) once we're at the cap, rather than letting a runaway or
@@ -1250,7 +1331,7 @@ function attachSession(
 ): void {
   let proc: pty.IPty;
   try {
-    proc = pty.spawn("tmux", tmuxArgs(session, config.tmuxConfPath, startDir), {
+    proc = spawnTmuxPty(tmuxArgs(session, config.tmuxConfPath, startDir), {
       name: "xterm-256color",
       cols,
       rows,
@@ -1448,8 +1529,13 @@ function attachSession(
         // Same kill, same insurance as closing a tab: restarting one session is
         // not meant to cost the other twelve, which is what it does on the day
         // this command takes the server with it.
-        void snapshotBeforeKill(session).then(() => {
-          execFile("tmux", ["kill-session", "-t", session], (err) => {
+        //
+        // `session` was checked to be exactly a valid name when this socket
+        // connected (see the connection handler), so this kills that session
+        // and no other.
+        void snapshotBeforeKill(session)
+          .then(() => runTmuxStatus(["kill-session", "-t", sessionTarget(session)]))
+          .then((err) => {
             if (err) {
               console.error(
                 `[ws] restart: kill-session "${session}" failed:`,
@@ -1458,11 +1544,12 @@ function attachSession(
               sendJson(ws, { type: "info", message: "Restart failed." });
             }
           });
-        });
       } else if (parsed.type === "debug") {
+        // Every field the client controls goes through logSafe, so a newline
+        // in one can't start a forged line of its own in the log.
         console.error(
-          `[ime-debug] session=${session} event=${parsed.event} ` +
-            `data=${JSON.stringify(parsed.data ?? "")} at=${parsed.at ?? ""}`
+          `[ime-debug] session=${session} event=${logSafe(parsed.event)} ` +
+            `data=${logSafe(JSON.stringify(parsed.data ?? ""))} at=${logSafe(parsed.at ?? "")}`
         );
       }
     } catch (err) {
@@ -1492,34 +1579,60 @@ wss.on("error", (err) => {
   console.error("[wss] server error:", err);
 });
 
+/** Answer an upgrade we won't do with a bare HTTP status, and drop the socket. */
+function refuseSocket(socket: Duplex, status: string): void {
+  try {
+    if (socket.writable) socket.write(`HTTP/1.1 ${status}\r\nConnection: close\r\n\r\n`);
+  } catch {
+    /* the socket may already be gone */
+  }
+  socket.destroy();
+}
+
 // Upgrade only on the /ws path; reject everything else.
 server.on("upgrade", (req, socket, head) => {
-  let pathname = "/";
+  // Nothing in here may throw out of the listener: there is no request
+  // handler's catch around an upgrade, so a throw would reach
+  // uncaughtException and leave the socket hanging open.
   try {
-    pathname = new URL(req.url ?? "/", "http://localhost").pathname;
-  } catch {
-    socket.destroy();
-    return;
-  }
+    let pathname = "/";
+    try {
+      pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+    } catch {
+      refuseSocket(socket, "400 Bad Request");
+      return;
+    }
 
-  if (pathname !== "/ws") {
-    socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
-    socket.destroy();
-    return;
-  }
+    if (pathname !== "/ws") {
+      refuseSocket(socket, "404 Not Found");
+      return;
+    }
 
-  // The terminal stream is the sensitive part: reject the upgrade unless the
-  // request carries the auth cookie (the browser sends it automatically once
-  // signed in). No-op when AUTH_TOKEN is unset.
-  if (!isAuthed(req, config.authToken)) {
-    socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
-    socket.destroy();
-    return;
-  }
+    // A WebSocket isn't covered by CORS: without these, any page open in a
+    // browser on the tailnet could open one and type into a shell (see
+    // auth.ts). The Origin check applies to every upgrade, not only to
+    // state-changing HTTP — the socket IS the state change.
+    if (!hostAllowed(req, config.allowedHosts) || !originAllowed(req)) {
+      refuseSocket(socket, "403 Forbidden");
+      return;
+    }
 
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit("connection", ws, req);
-  });
+    // The terminal stream is the sensitive part: through Cloudflare, refuse the
+    // upgrade unless the request carries the auth cookie (the browser sends it
+    // automatically once signed in), and always when no token is configured.
+    const refusal = refuseUpgrade(req, config.authToken);
+    if (refusal) {
+      refuseSocket(socket, refusal);
+      return;
+    }
+
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, req);
+    });
+  } catch (err) {
+    console.error("[ws] upgrade error:", err);
+    refuseSocket(socket, "500 Internal Server Error");
+  }
 });
 
 // Heartbeat: terminate sockets that stopped responding to pings.
@@ -1662,7 +1775,16 @@ const COLLAPSE_GRACE_MS = 2 * 60 * 60_000;
  */
 const SNAPSHOT_TIMEOUT_MS = 10_000;
 
+/**
+ * Off on a test socket (TERMINAL_WEB_TMUX_SOCKET): resurrect's scripts run
+ * plain `tmux`, which is the user's own server, not the scratch one. A test
+ * that snapshotted would be reading the real server — and, run with the real
+ * HOME, writing over the real `last`. Periodic, startup and before-kill alike.
+ */
+const SNAPSHOTS_ENABLED = !config.tmuxSocket;
+
 async function snapshotSessions(reason = "interval"): Promise<void> {
+  if (!SNAPSHOTS_ENABLED) return; // periodic, startup and before-kill alike
   try {
     await fsp.access(RESURRECT_SAVE, fs.constants.X_OK);
   } catch {
@@ -1748,9 +1870,11 @@ async function snapshotBeforeKill(name: string): Promise<void> {
   }
 }
 
-setTimeout(() => void snapshotSessions(), FIRST_SNAPSHOT_MS).unref();
-const snapshotTimer = setInterval(() => void snapshotSessions(), SNAPSHOT_MS);
-snapshotTimer.unref();
+if (SNAPSHOTS_ENABLED) {
+  setTimeout(() => void snapshotSessions(), FIRST_SNAPSHOT_MS).unref();
+  const snapshotTimer = setInterval(() => void snapshotSessions(), SNAPSHOT_MS);
+  snapshotTimer.unref();
+}
 
 // ---------------------------------------------------------------------------
 // Startup & graceful shutdown
@@ -1779,6 +1903,22 @@ function logStartup(): void {
   }
   console.log(`  Default session: "${config.defaultSession}"  (override with ?session=NAME)`);
   console.log(`  Max concurrent terminals: ${config.maxPtys}  (set MAX_PTYS to change)`);
+  if (config.tmuxSocket) {
+    console.log(
+      `  tmux socket: -L ${config.tmuxSocket}  (TERMINAL_WEB_TMUX_SOCKET; snapshots off)`
+    );
+  } else {
+    console.log("  tmux socket: default");
+  }
+  if (config.allowedHosts.length) {
+    console.log(`  Extra allowed hosts: ${config.allowedHosts.join(", ")}`);
+  }
+  if (!config.authToken) {
+    console.warn(
+      "  WARNING: AUTH_TOKEN is empty. Requests through Cloudflare will be refused (403); " +
+        "direct/tailnet access stays open."
+    );
+  }
   console.log("");
 }
 
