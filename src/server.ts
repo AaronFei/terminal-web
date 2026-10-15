@@ -1393,8 +1393,11 @@ function logSafe(value: unknown): string {
 // The largest frame a client may send. What comes this way is keystrokes,
 // pastes and small JSON — files go over HTTP (/upload) — and ws's default of
 // 100 MB let any one client make the server hold that much for a single
-// message. A bigger frame closes the socket (1009).
-const WS_MAX_PAYLOAD = 1024 * 1024;
+// message. A bigger frame closes the socket (1009). Not 1 MB: a paste goes up
+// as ONE frame with no size cap of its own on the client (its input path is
+// frozen), so a cap that low would quietly lose a large paste along with the
+// connection. 16 MB is past any paste a person makes and still bounded.
+const WS_MAX_PAYLOAD = 16 * 1024 * 1024;
 
 const wss = new WebSocketServer({ noServer: true, maxPayload: WS_MAX_PAYLOAD });
 
