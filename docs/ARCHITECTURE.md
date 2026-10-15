@@ -16,7 +16,13 @@ invariant below needs the lead's sign-off first, and then an update here.
 | `src/tmux.ts` | Every `tmux` invocation the server makes |
 | `src/config.ts` | Env vars and defaults |
 | `src/types.ts` | WebSocket control-message types |
-| `web/terminal.ts` | The whole client (bundled by `esbuild.mjs` to `public/dist/`) |
+| `web/terminal.ts` | Client entry (bundled by `esbuild.mjs` to `public/dist/`): calls each module's `build*`/`init*` in a fixed order, then `init()` |
+| `web/session.ts` | The `Session` class: one xterm + WebSocket per tmux session, including the frozen input path |
+| `web/config.ts`, `dom.ts`, `state.ts`, `status.ts` | Constants and flags; the fixed DOM nodes; shared state (`sessions`, `activeTab`, `activeSession`, written only through their setters); the status toast |
+| `web/layout.ts` | Pane sizing, split layout, keyboard slide, resize handling |
+| `web/tabs.ts`, `api.ts` | Tab lifecycle and server sync; HTTP calls and prefs |
+| `web/overlays.ts`, `clipboard.ts`, `transfer.ts` | Dialogs and the paste box; copy and paste; upload and download |
+| `web/ui/*.ts` | Top bar, key bar, selection bar, phone bar/drawer/sheet |
 | `public/` | `index.html`, `styles.css`, icons, manifest |
 | `tmux/web.tmux.conf` | tmux config the server's sessions load |
 | `scripts/` | `service.sh` (launchd/systemd), `deploy.sh`, `start.sh`, `dev.sh` |
@@ -32,12 +38,23 @@ invariant below needs the lead's sign-off first, and then an update here.
 
 ### Input path is frozen
 
-The keyboard, IME and paste handling in `web/terminal.ts` covers the custom key
+The keyboard, IME and paste handling in `web/session.ts` covers the custom key
 event handler, `wireInput`, the composition handlers, the iOS keyCode-229
 rescue, the pre-edit drop and `IME_DEDUP_MS` in `onData`, and `send`. It was
 tuned bug by bug against Windows Bopomofo, CapsLock IME switching and iOS CJK
 keyboards. Do not restructure it, rename it or "simplify" it. A change there
 needs a concrete bug, the smallest possible diff and the lead's sign-off.
+
+### Client modules keep their load-time side effects in build functions
+
+At load time a module only declares things, reads values (the URL,
+localStorage, matchMedia) and creates detached DOM. Anything that touches the
+page — attaching to the document, global listeners, timers, network calls —
+lives in a `build*`/`init*` function, and `web/terminal.ts` calls those in a
+fixed order. esbuild turns top-level `let`/`const` into `var`, so a module that
+reads another module's binding too early gets a silent `undefined` instead of a
+TDZ error. `Session` doesn't import the app layer: what it needs from there is
+injected with `setSessionHooks`.
 
 ### The soft keyboard never resizes the pty
 
