@@ -28,8 +28,8 @@ must keep.
 |---|---|---|---|
 | T1 | Server security: exact tmux targets, test socket, env scrub, cookie decode, fail-closed auth, Origin/Host check, name validation | – | in progress |
 | T2 | Server resources: stream pipeline, streamed upload, WS backpressure, maxPayload, single-flight snapshots, collapse baseline, tailscale timeout, `/api/health` | T1 | todo |
-| T3 | Input, minimal: reconnect focus fix; key bar dropped while disconnected | – | in progress |
-| T4 | Front-end split, resize and lifecycle bugs | T3 | todo |
+| T3 | Input, minimal: reconnect focus fix; key bar dropped while disconnected | – | done (cd935fa) |
+| T4 | Front-end split, resize and lifecycle bugs | T3 | in progress |
 | T5 | Front-end touch, resources and cleanups | T4 | todo |
 | T6 | `service.sh` / `deploy.sh` hardening | – | in progress |
 | T7 | README, `.env.example`, `web.tmux.conf` comment | T1–T6 | todo |
@@ -38,4 +38,8 @@ must keep.
 
 ## Done
 
+- T3 `cd935fa`: a reconnect re-focuses only when `activeSession === this` and focus is free (body or an xterm textarea); key-bar presses use `sendKey` and are dropped while disconnected, with a throttled 「未連線，按鍵沒有送出」; a paste over the 64 KB cap now shows a status instead of vanishing silently. Review: the diff touches no line of the frozen input path; tsc and build pass; one punctuation fix made at review.
+
 ## Found during review
+
+- `isolation: worktree` branches from `origin/main`, not local `main`. Each task prompt must start with `git merge --ff-only main`. T1 and T6 were dispatched before this was known, so they're based on e8b80cc and merged by cherry-pick.
