@@ -33,7 +33,7 @@ must keep.
 | T5 | Front-end touch, resources and cleanups | T4 | done |
 | T6 | `service.sh` / `deploy.sh` hardening | – | done |
 | T7 | README, `.env.example`, `web.tmux.conf` comment | T1–T6 | todo |
-| T8 | Split `web/terminal.ts` into modules | T5 | todo |
+| T8 | Split `web/terminal.ts` into modules | T5 | in progress |
 | D | Deploy to both boxes, rotate tokens, clear `AUTH_TOKEN` from tmux's global env | all, plus user OK | todo |
 
 ## Done
