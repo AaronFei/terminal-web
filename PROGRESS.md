@@ -39,7 +39,7 @@ must keep.
 | T6 | `service.sh` / `deploy.sh` hardening | – | done |
 | T7 | README, `.env.example`, `web.tmux.conf` comment | T1–T6 | done |
 | T8 | Split `web/terminal.ts` into modules | T5 | done |
-| P1 | Passkey sign-in (optional, alongside the token), server-issued session cookies | D | in progress |
+| P1 | Passkey sign-in (optional, alongside the token), server-issued session cookies | D | done (0261852), not deployed |
 | D | Deploy to both boxes, rotate tokens, clear `AUTH_TOKEN` from tmux's global env | all, plus user OK | done (9a281ec) |
 
 ## Done
@@ -55,8 +55,10 @@ must keep.
 
 - D (2026-10-15): pushed 9a281ec; both boxes reinstalled through service.sh with fresh tokens (Mac plist now 0600; NUC token moved out of the unit into a 0600 env file, `KillMode=process` kept); `/api/health` reports 9a281ec on both; every tmux session survived (Mac 18, NUC 20); `AUTH_TOKEN` cleared from both tmux global envs. Through each Cloudflare hostname: no cookie 401, wrong token 401, right token 303 plus `tw_auth`, the old token 401, a cross-site POST 403, a same-origin WS opens and a cross-site one is refused. cloudflared keeps the Host header, so the Origin check doesn't break the tunnel. Snapshots save after the restart. Agent worktrees removed. The WSL box is the user's to deploy.
 
+- P1 `0261852`: `src/auth-store.ts` (sessions and passkeys, in memory, written 0600 via temp+rename), `src/passkeys.ts` (@simplewebauthn/server 14.0.3; challenges single-use, RP-bound, 5 min, max 100), `src/auth.ts` (session cookies, legacy cookie swapped on the fly, `/logout`, passkey sign-in endpoints Cloudflare-only, `/api/auth`, `/api/passkeys` list/delete also on the tailnet, register Cloudflare + signed-in only), a passkey button on the login page (inline script, token form unchanged), and a Passkeys panel from Help. engines raised to node >= 20 (the library needs it; both boxes run newer). `npm run smoke:passkey` drives Chrome's virtual authenticator with a fake cf-ray. Lead review: read the diff; accepted the topOrigin choice (the signature is still bound to our RP ID and the result only goes to our server) and the legacy swap creating a few sessions per page load. Lead checks on merged main: tsc, build, `npm run smoke` and `npm run smoke:passkey` (64 ok lines) pass; the real tmux is unchanged. Production check: cloudflared sends `X-Forwarded-Proto: https` (the live cookie carries Secure), so the expected origin will be https.
+
 ## Found during review
 
-- Left for later (small): the help and paste-box copy still says "tap Copy / tap Paste"; the phone title-bar dot has no idle state; a socket stuck in CONNECTING after a wake waits for the browser's own timeout.
+- Left for later (small): through Cloudflare `manifest.webmanifest` gets 401, because a manifest fetch carries no cookie (fix: `crossorigin="use-credentials"` on the link); the help and paste-box copy still says "tap Copy / tap Paste"; the phone title-bar dot has no idle state; a socket stuck in CONNECTING after a wake waits for the browser's own timeout.
 
 - `isolation: worktree` branches from `origin/main`, not local `main`. Each task prompt must start with `git merge --ff-only main`. T1 and T6 were dispatched before this was known, so they're based on e8b80cc and merged by cherry-pick.
