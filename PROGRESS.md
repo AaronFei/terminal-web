@@ -59,6 +59,6 @@ must keep.
 
 ## Found during review
 
-- Left for later (small): through Cloudflare `manifest.webmanifest` gets 401, because a manifest fetch carries no cookie (fix: `crossorigin="use-credentials"` on the link); the help and paste-box copy still says "tap Copy / tap Paste"; the phone title-bar dot has no idle state; a socket stuck in CONNECTING after a wake waits for the browser's own timeout.
+- Left for later (small): the help and paste-box copy still says "tap Copy / tap Paste"; the phone title-bar dot has no idle state; a socket stuck in CONNECTING after a wake waits for the browser's own timeout.
 
 - `isolation: worktree` branches from `origin/main`, not local `main`. Each task prompt must start with `git merge --ff-only main`. T1 and T6 were dispatched before this was known, so they're based on e8b80cc and merged by cherry-pick.

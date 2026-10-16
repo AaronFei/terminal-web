@@ -238,13 +238,12 @@ cdp.on('message', (raw) => {
     problems.push(`exception: ${d.exception?.description ?? d.text}`);
   } else if (msg.method === 'Log.entryAdded' && msg.params.entry.level === 'error') {
     const { text, url = '' } = msg.params.entry;
-    // Expected here: 401s are the point (login page, refused passkeys), the
-    // 400/413 come from the malformed-body checks, and the browser fetches the
-    // web manifest without cookies, so behind the sign-in it always gets a 401.
+    // Expected here: 401s are the point (login page, refused passkeys), and
+    // the 400/413 come from the malformed-body checks. The web manifest is
+    // fetched with credentials (index.html), so it must not fail.
     const expected =
-      /status of 401/.test(text) ||
-      (/status of (400|413)/.test(text) && url.includes('/auth/passkey/login/verify')) ||
-      /Manifest fetch .* failed, code 401/.test(text);
+      (/status of 401/.test(text) && !/Manifest/.test(text) && !url.includes('manifest')) ||
+      (/status of (400|413)/.test(text) && url.includes('/auth/passkey/login/verify'));
     if (!expected) problems.push(`log: ${text} ${url}`);
   }
 });
