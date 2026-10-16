@@ -639,7 +639,7 @@ upload files. Treat exposing it like handing out SSH access.
   passkey (Face ID, Touch ID, Windows Hello, a phone or a security key) instead
   of typing the token. The token always keeps working; passkeys are an extra
   way in, not a replacement. To add one, sign in with the token through the
-  https address, then **? → Passkeys → Add a passkey**. Each hostname has its
+  https address, then **⋯ → Passkeys → Add a passkey**. Each hostname has its
   own passkeys (the WebAuthn RP ID is the request's hostname), so every machine
   you run this on registers its own; a tailnet address can't hold one. The
   same panel lists them, deletes one (which signs out every session it made)
@@ -649,7 +649,7 @@ upload files. Treat exposing it like handing out SSH access.
   launcher page) only work if the frame allows them:
   `<iframe allow="publickey-credentials-get; publickey-credentials-create" …>`.
   Without that, sign in with the token inside the frame.
-- **Sign out** (**? → Passkeys → Sign out**, or `POST /logout`) ends the
+- **Sign out** (**⋯ → Passkeys → Sign out**, or `POST /logout`) ends the
   current session. To end all of them, change `AUTH_TOKEN` and delete the
   passkeys.
 - **Host check (DNS rebinding).** A direct request whose `Host` is a dotted
@@ -720,7 +720,7 @@ You reached the server by a hostname it doesn't know. Add it to
 `AUTH_TOKEN` isn't set on the server. Set it and restart.
 
 **Passkey sign-in says "not accepted"**
-A passkey only works on the hostname it was added on; check **? → Passkeys**
+A passkey only works on the hostname it was added on; check **⋯ → Passkeys**
 for its RP ID. The server expects the browser's origin to be
 `https://<host>`, which it learns from the `X-Forwarded-Proto` header
 cloudflared sends; a proxy in between must keep it. The token always works.

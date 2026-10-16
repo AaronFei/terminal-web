@@ -83,7 +83,7 @@ export function openHelp(): void {
     '<li><b>Download a file</b> — tap the ⬇ button (or <b>⋯ → Download</b> on a phone) and enter a name/relative path from the terminal\'s current folder (e.g. <code>report.zip</code>), or a full path (<code>~/output/report.zip</code>). It downloads to this device.</li>' +
     '<li><b>Scroll</b> — mouse wheel, or drag one finger up/down on a touch screen, scrolls the history.</li>' +
     '<li><b>Tabs</b> — <b>+</b> new session, <b>×</b> closes the tab and kills its session, <b>⟳</b> restarts the session fresh. Double-click (or double-tap) a tab to rename it — the label changes but its tmux session stays the same.</li>' +
-    '<li><b>Passkeys</b> — through the https address you can sign in with a passkey instead of the token (the token keeps working). Add, remove or sign out under <b>Passkeys</b> below.</li>' +
+    '<li><b>Passkeys</b> — through the https address you can sign in with a passkey instead of the token (the token keeps working). Add, remove or sign out under <b>⋯ → Passkeys</b>.</li>' +
     '</ul>' +
     '<div class="paste-row"><button class="tb-btn" type="button" data-help-passkeys>Passkeys</button><button class="tb-btn" type="button" data-help-close>Got it</button></div>';
   overlay.append(box);
