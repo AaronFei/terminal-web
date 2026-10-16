@@ -72,7 +72,7 @@ export function openHelp(): void {
   box.innerHTML =
     '<div class="help-title">How to copy / paste / files</div>' +
     '<ul class="help-list">' +
-    `<li><b>Copy</b> — hold <b>${selKey}</b> and drag to select; it copies automatically. (Or select, then <b>${copyKey}</b>.) On a phone/tablet, tap <b>選取</b> on the key bar and drag over the text, or long-press a word; adjust with the handles, then tap <b>複製</b>.</li>` +
+    `<li><b>Copy</b> — hold <b>${selKey}</b> and drag to select; it copies automatically. (Or select, then <b>${copyKey}</b>.) On a phone/tablet, long-press a word, or choose <b>⋯ → Select text by dragging</b> and drag over the text; adjust with the handles, then tap <b>複製</b> (<b>取消</b> leaves select mode).</li>` +
     `<li><b>Paste</b> — click the terminal, then <b>${pasteKey}</b>${
       isMac ? '' : ' (or Ctrl+Shift+V)'
     }. On a phone/tablet, open <b>⋯ → 📋 Paste</b>; if the browser can't read the clipboard, paste into the box that appears.</li>` +

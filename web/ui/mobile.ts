@@ -7,7 +7,7 @@ import { openPasskeys } from '../passkeys.js';
 import { promptDownload } from '../transfer.js';
 import { pasteFromClipboard } from '../clipboard.js';
 import { LAYOUT_BUTTONS, sheetLayoutButtons } from '../layout.js';
-import { copySelectionNow } from './selbar.js';
+import { copySelectionNow, setTouchSelectMode } from './selbar.js';
 import type { Session } from '../session.js';
 import {
   activateSession,
@@ -287,6 +287,11 @@ sheet.append(
     },
     true,
   ),
+  sheetRow('✂', 'Select text by dragging', () => {
+    closeSheet();
+    setTouchSelectMode(true);
+    flashStatus('選取模式：拖曳選字，再按複製；按取消離開', 2400);
+  }),
   sheetRow(
     '📎',
     'Attach a file',

@@ -7,18 +7,14 @@ import { flashStatus } from '../status.js';
 import { copyText } from '../clipboard.js';
 import { cssPx } from '../layout.js';
 
-// Touch "select" mode (toggled from the key bar). tmux runs with `mouse on`, so
+// Touch "select" mode (turned on from the ⋯ sheet). tmux runs with `mouse on`, so
 // a finger drag is normally hijacked for scrolling and there is no way to make a
 // text selection by touch (on desktop you hold Option to bypass tmux's mouse
 // reporting; a tablet has no such key). While this is on, a one-finger drag
 // selects text instead of scrolling, and the selection bar's 複製 copies it.
+// The bar stays up for as long as the mode is on, so its 取消 is always there
+// to leave it — there is no key to tap again any more.
 export let touchSelectMode = false;
-// The key bar's 選取 key, set when the key bar is built (see ui/keybar.ts).
-let selectBtn: HTMLElement | null = null;
-
-export function setSelectBtn(b: HTMLElement): void {
-  selectBtn = b;
-}
 
 // --- selection actions (touch) ---------------------------------------------
 // Copying used to happen the instant you lifted your finger, so one imprecise
@@ -47,11 +43,12 @@ export function hideSelectionBar(): void {
   selBar.classList.add('hidden');
 }
 
-/** Turn touch-select mode on or off, keeping the key and the bar in step. */
+/** Turn touch-select mode on or off, keeping the bar in step. */
 export function setTouchSelectMode(on: boolean): void {
   touchSelectMode = on;
-  selectBtn?.classList.toggle('armed', on);
-  if (!on) {
+  if (on) {
+    showSelectionBar();
+  } else {
     activeSession?.clearSelectionRange();
     hideSelectionBar();
   }
@@ -90,4 +87,17 @@ selBarButton('取消', '', () => {
 
 export function buildSelBar(): void {
   document.body.append(selBar);
+  // A drag in select mode hides the bar while it runs, and the session shows it
+  // again only when the drag selected something. After a plain tap, or a tab
+  // switch, bring it back so 取消 is still there. Runs after the session's own
+  // touchend handler, which is registered on the terminal itself.
+  document.addEventListener(
+    'touchend',
+    () => {
+      setTimeout(() => {
+        if (touchSelectMode) showSelectionBar();
+      }, 0);
+    },
+    { passive: true },
+  );
 }

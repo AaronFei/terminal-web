@@ -377,9 +377,9 @@ history you browse is tmux's.
 - **Phone top bar** (narrower than 640 px) — `☰`, the current session's name
   (tap for the session drawer), `📎` (attach a file), `⌨`, `⋯`.
 - **`⋯` actions sheet** — font size (A− / A+), split view, restart,
-  **📋 Paste**, **⧉ Copy the screen**, **📎 Attach a file**, download,
-  fullscreen, help.
-- **Key bar** — `Esc` `Tab` `Ctrl` `Alt` `^C` `Enter` `選取`, then (on a phone,
+  **📋 Paste**, **⧉ Copy the screen**, **✂ Select text by dragging**,
+  **📎 Attach a file**, download, fullscreen, help, passkeys.
+- **Key bar** — `Esc` `Tab` `Ctrl` `Alt` `^C` `Enter`, then (on a phone,
   on its own row) `^End` `^X^S` `←` `↑` `↓` `→`.
   - `Ctrl` and `Alt` are **sticky**: tap to arm (they highlight), and the next
     key is sent with that modifier — `Ctrl` then `c` is `Ctrl-C`;
@@ -387,7 +387,6 @@ history you browse is tmux's.
   - `^End` sends Ctrl+End (jumps to the bottom in Claude Code's fullscreen
     view).
   - `^X^S` sends Ctrl+X then Ctrl+S in one tap (emacs's save).
-  - `選取` toggles touch selection mode (see [Copy & paste](#copy-paste--clipboard)).
   - A key pressed while the terminal is **disconnected is dropped**, not sent
     later, with a brief 「未連線，按鍵沒有送出」 notice.
 
@@ -510,10 +509,10 @@ This app works around that, so HTTPS isn't required.
 
 **Touch (phone / tablet)**
 
-- **Copy:** tap **選取** on the key bar, then drag over the text — or just
-  **long-press a word** to select it. Adjust either end with the drag
+- **Copy:** **long-press a word** to select it, or choose **⋯ → ✂ Select
+  text by dragging** and drag over the text. Adjust either end with the drag
   handles, then tap **複製** on the selection bar (**全選** selects the whole
-  screen, **取消** cancels). **⋯ → ⧉ Copy the screen** does select-all and copy
+  screen, **取消** cancels and leaves select mode). **⋯ → ⧉ Copy the screen** does select-all and copy
   in one tap.
 - **Paste:** **⋯ → 📋 Paste**. Over HTTPS it pastes directly; over plain HTTP a
   small box opens — paste into it and it's sent to the terminal.

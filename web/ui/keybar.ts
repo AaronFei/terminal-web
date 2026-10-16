@@ -2,10 +2,9 @@
 
 import { keybarEl } from '../dom.js';
 import { activeSession } from '../state.js';
-import { flashStatus, flashWhileDown } from '../status.js';
+import { flashWhileDown } from '../status.js';
 import { savePrefs } from '../api.js';
 import { fitActive, updateKeybarHeight } from '../layout.js';
-import { setSelectBtn, setTouchSelectMode, touchSelectMode } from './selbar.js';
 import { keysBtn } from './topbar.js';
 import { refreshMobileUI } from './mobile.js';
 
@@ -30,7 +29,6 @@ interface KeyDef {
   label?: string;
   seq?: string;
   mod?: 'ctrl' | 'alt';
-  action?: 'select';
   /** Force a line break here (mobile only): the keys after it wrap to a new row. */
   rowBreak?: boolean;
 }
@@ -41,10 +39,6 @@ const KEYS: KeyDef[] = [
   { label: 'Alt', mod: 'alt' },
   { label: '^C', seq: '\x03' },
   { label: 'Enter', seq: '\r' },
-  // Touch text-selection toggle: while armed, drag on the terminal to select,
-  // then copy from the selection bar (a tablet's stand-in for desktop
-  // Option-drag selection).
-  { label: '選取', action: 'select' },
   // On a phone the arrows get their own second row; everything else stays on the first.
   { rowBreak: true },
   // Ctrl+End: jump to the bottom in Claude Code's fullscreen view (CSI 1;5F).
@@ -110,7 +104,6 @@ export function buildKeybar(): void {
     b.textContent = def.label ?? '';
     b.title = def.label ?? '';
     if (def.mod) modButtons[def.mod] = b;
-    if (def.action === 'select') setSelectBtn(b);
     b.addEventListener('pointerdown', (e) => {
       e.preventDefault();
       // On touch, never refocus the terminal: focusing its textarea pops up the
@@ -118,14 +111,6 @@ export function buildKeybar(): void {
       // focus isn't needed — preventDefault already keeps whatever focus state
       // (and thus the keyboard) the user already had.
       const refocus = e.pointerType !== 'touch';
-      if (def.action === 'select') {
-        // Toggle touch-select mode. While on, dragging the terminal selects text
-        // (copied from the selection bar) instead of scrolling; tap again to go
-        // back to scrolling. Never refocus — that would pop the soft keyboard.
-        setTouchSelectMode(!touchSelectMode);
-        flashStatus(touchSelectMode ? '選取模式:拖曳選字,放開後再按複製' : '選取關閉', 1800);
-        return;
-      }
       if (def.mod) {
         if (def.mod === 'ctrl') ctrlArmed = !ctrlArmed;
         else altArmed = !altArmed;

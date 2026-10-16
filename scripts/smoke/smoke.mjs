@@ -9,7 +9,8 @@
 //
 // It loads the page, checks a terminal attaches, types a command and reads it
 // back out of tmux, opens a second tab, switches between tabs, opens a split,
-// and narrows and widens the window. Each check prints one line; the exit code
+// narrows and widens the window, and turns touch select on and off from the ⋯
+// sheet. Each check prints one line; the exit code
 // is 0 only when every check passed and the page threw nothing.
 // SMOKE_VERBOSE=1 also prints an outline of the page's DOM.
 import { createRequire } from 'node:module';
@@ -200,6 +201,32 @@ try {
   step('f.cssVars', await evaluate(`['--term-h', '--keybar-h', '--kb-offset', '--kb-gap'].map((v) => v + '=' + document.documentElement.style.getPropertyValue(v)).join(' ')`));
   const sizes = await tmux('list-sessions', '-F', '#S #{window_width}x#{window_height}');
   step('f.tmuxSessions', sizes.out.trim().split('\n').join(', '));
+
+  // (g) touch select lives in the ⋯ sheet, not on the key bar: turning it on
+  // puts up the selection bar (its 取消 is the way out), and a stray tap
+  // elsewhere doesn't lose it.
+  const SEL_STATE = `(() => { const b = document.getElementById('selbar'); return b && !b.classList.contains('hidden') ? 'shown' : 'hidden'; })()`;
+  const keyLabels = await evaluate(`[...document.querySelectorAll('#keybar .kb-key')].map((b) => b.textContent).join(' ')`);
+  step('g.keybarNoSelectKey', keyLabels, !keyLabels.includes('選取'));
+  const opened = await evaluate(`(() => {
+    const row = [...document.querySelectorAll('.sheet-row')].find((r) => r.textContent.includes('Select text'));
+    if (!row) return 'no row';
+    row.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
+    return 'tapped';
+  })()`);
+  await sleep(100);
+  const afterOn = await evaluate(SEL_STATE);
+  step('g.selectRowShowsBar', `${opened} -> ${afterOn}`, opened === 'tapped' && afterOn === 'shown');
+  await evaluate(`document.dispatchEvent(new TouchEvent('touchend', { bubbles: true }))`);
+  await sleep(100);
+  step('g.barSurvivesTap', await evaluate(SEL_STATE), (await evaluate(SEL_STATE)) === 'shown');
+  await evaluate(`[...document.querySelectorAll('#selbar .sel-btn')].find((b) => b.textContent === '取消')?.click()`);
+  await sleep(100);
+  const afterCancel = await evaluate(SEL_STATE);
+  await evaluate(`document.dispatchEvent(new TouchEvent('touchend', { bubbles: true }))`);
+  await sleep(100);
+  const afterCancelTap = await evaluate(SEL_STATE);
+  step('g.cancelLeaves', `${afterCancel}, after a tap ${afterCancelTap}`, afterCancel === 'hidden' && afterCancelTap === 'hidden');
 
   if (process.env.SMOKE_VERBOSE) step('outline', `\n${await evaluate(OUTLINE)}`);
 } catch (err) {
