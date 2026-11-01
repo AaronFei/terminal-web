@@ -60,7 +60,7 @@ die() { echo "error: $*" >&2; exit 1; }
 case "${1:-}" in
   "")
     DRIVER="smoke.mjs"
-    EXPECTED_SESSIONS='smoke-a|smoke-b|smoke-a__b'
+    EXPECTED_SESSIONS='smoke-a|smoke-b|smoke-a__b|smoke-hidden|smoke-hidden2'
     ;;
   --passkey)
     DRIVER="passkey.mjs"
