@@ -38,12 +38,23 @@ import type { ServerMessage } from "./types.js";
 import { isClientMessage } from "./types.js";
 import { gateHttp, handleAuthApi, refuseUpgrade, hostAllowed, originAllowed } from "./auth.js";
 import { initAuthStore } from "./auth-store.js";
+import {
+  initTabRecord,
+  recordTab,
+  forgetTabs,
+  isRecorded,
+  recordedLabel,
+  observeSessions,
+} from "./tab-record.js";
 
 const config = loadConfig();
 // Before anything can run tmux: from here on every call goes to this socket.
 setTmuxSocket(config.tmuxSocket);
 // Sign-in sessions and passkeys, read once; requests only use the memory copy.
 initAuthStore(config.authToken);
+// Which sessions are tabs, kept outside tmux for a resurrect restore to be
+// re-tagged from (see listWebTabsFromTmux). Read once; follows HOME.
+initTabRecord();
 
 /**
  * The commit this process is running, for GET /api/health: tsx runs the source
@@ -543,7 +554,7 @@ let webTabsCache: { at: number; tabs: Promise<WebTab[] | null>; settled: WebTab[
 function cachedWebTabs(): Promise<WebTab[] | null> {
   const now = Date.now();
   if (webTabsCache && now - webTabsCache.at < WEB_TABS_TTL_MS) return webTabsCache.tabs;
-  const entry = { at: now, tabs: listWebTabs(), settled: null as WebTab[] | null };
+  const entry = { at: now, tabs: listWebTabsFromTmux(), settled: null as WebTab[] | null };
   void entry.tabs.then((tabs) => {
     entry.settled = tabs;
   });
@@ -553,6 +564,70 @@ function cachedWebTabs(): Promise<WebTab[] | null> {
 
 function invalidateWebTabs(): void {
   webTabsCache = null;
+}
+
+/** Bumped when a rename starts and when tmux has its label (see listWebTabsFromTmux). */
+let labelEpoch = 0;
+
+/**
+ * The tagged sessions, as tmux has them — after putting the tags back on any
+ * that lost them in a resurrect restore (see tab-record.ts).
+ *
+ * A session that exists, carries no @twtab, is not a second half, was not
+ * closed on purpose and is in the tab record is tagged again with its recorded
+ * label, and is in the list returned now rather than the next one. Every tagged
+ * session also goes into the record: tabs only attach when looked at, so most
+ * of them would otherwise never be recorded until after the restore that needs
+ * them. A list that can't be had (null) changes nothing in the record.
+ */
+async function listWebTabsFromTmux(): Promise<WebTab[] | null> {
+  const epoch = labelEpoch;
+  const [tagged, all] = await Promise.all([listWebTabs(), listTmuxSessions()]);
+  if (tagged === null || all === null) return tagged;
+  observeSessions(all);
+  const taggedNames = new Set(tagged.map((t) => t.name));
+  // A rename landed while this list was out: its labels may be the old ones,
+  // and must not overwrite (or be "restored" over) the new one in the record.
+  const labelsCurrent = epoch === labelEpoch;
+  // A tagged session showing no label of its own (displayName is then its
+  // name) while the record has one lost its label the same way: a connect or
+  // an adopt tagged it before any list could. That label goes back too —
+  // renaming a tab back to its own name records the name, so this can't undo
+  // a rename.
+  const relabelled: string[] = [];
+  const listed = tagged.map((t) => {
+    if (!labelsCurrent) {
+      recordTab(t.name);
+      return t;
+    }
+    const recorded = recordedLabel(t.name);
+    if (t.displayName === t.name && recorded !== undefined && recorded !== t.name) {
+      setWebTabLabel(t.name, recorded);
+      recordTab(t.name);
+      relabelled.push(t.name);
+      return { name: t.name, displayName: recorded };
+    }
+    recordTab(t.name, t.displayName);
+    return t;
+  });
+  if (relabelled.length) {
+    console.log(`[tabs] label restored from the tab record: ${relabelled.join(", ")}`);
+  }
+  const retagged: WebTab[] = [];
+  for (const name of all) {
+    if (taggedNames.has(name) || name.endsWith(MATE_SUFFIX)) continue;
+    if (isClosed(name)) continue;
+    const label = recordedLabel(name);
+    if (label === undefined) continue;
+    tagWebSession(name);
+    if (label !== name) setWebTabLabel(name, label);
+    recordTab(name, label);
+    retagged.push({ name, displayName: label });
+  }
+  if (retagged.length) {
+    console.log(`[tabs] re-tagged from the tab record: ${retagged.map((t) => t.name).join(", ")}`);
+  }
+  return [...listed, ...retagged];
 }
 
 /**
@@ -634,7 +709,20 @@ async function handleRenameSession(
   // The cached list goes now and again once tmux has the label: a list fetched
   // in between may still hold the old one.
   invalidateWebTabs();
-  setWebTabLabel(name, displayName, invalidateWebTabs);
+  labelEpoch++;
+  setWebTabLabel(name, displayName, () => {
+    labelEpoch++;
+    invalidateWebTabs();
+  });
+  // Into the tab record too, so a restore gets the label back. A name not
+  // already there goes in only if the session exists: a page re-states the
+  // labels of tabs it remembers whether or not their sessions survived.
+  if (isRecorded(name)) {
+    recordTab(name, displayName);
+  } else {
+    const alive = await listTmuxSessions();
+    if (alive?.includes(name)) recordTab(name, displayName);
+  }
   sendJsonHttp(res, 200, { ok: true });
 }
 
@@ -689,6 +777,7 @@ async function handleAdoptSessions(
     if (name.endsWith(MATE_SUFFIX)) continue;
     if (!alive.has(name) || adopted.includes(name)) continue;
     tagAsWebTab(name);
+    recordTab(name);
     adopted.push(name);
   }
   if (adopted.length) {
@@ -762,6 +851,9 @@ async function handleKillSession(
   }
   // Before anything that waits: a sleeping page could wake in the meantime.
   markClosed(names);
+  // Closed as a tab, so no restore should bring it back as one. Only here: a
+  // restart kills the session too, and it is still a tab after that.
+  forgetTabs(names);
   // Save first, and wait for it: this command has taken whole tmux servers down
   // with it (see snapshotBeforeKill). The tab is already gone in the browser —
   // it does not wait on this reply — so the second or two costs nothing. One
@@ -1565,6 +1657,7 @@ function attachSession(
   if (!session.endsWith(MATE_SUFFIX)) {
     liveSessions.add(session);
     if (!knownTagged(session)) tagWebSession(session);
+    recordTab(session);
   }
   addSessionClient(session, ws);
 
