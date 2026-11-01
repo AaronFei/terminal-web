@@ -342,9 +342,13 @@ git clone https://github.com/tmux-plugins/tmux-continuum ~/.tmux/plugins/tmux-co
 - **Restoring** is continuum's: when the tmux server starts after a reboot, it
   restores the last snapshot — windows, working directories, pane contents, and
   `claude` relaunched where it was running (`@resurrect-processes`).
-- **Tabs come back too.** A restore drops the tab markers, so a device that
-  still remembers its tabs asks the server to re-adopt the restored sessions
-  (`POST /api/sessions/adopt`).
+- **Tabs come back too.** A restore drops the tab markers and labels, so the
+  server also keeps a tab record (`~/.terminal-web/tabs.json`) and, the next
+  time the tab list is read, tags every restored session it has recorded as a
+  tab again, with its label — whether or not any device still remembers it. A
+  device that remembers its tabs also asks the server to re-adopt them
+  (`POST /api/sessions/adopt`). A tab leaves the record when it is closed, or
+  after 30 days without its session.
 
 Without the plugins everything works except surviving a reboot.
 
