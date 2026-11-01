@@ -441,6 +441,7 @@ Each tab is a tmux session.
 | What | Where it lives |
 |---|---|
 | Which sessions are tabs, and their labels | the tmux sessions themselves (`@twtab` / `@twlabel` options) |
+| A copy of that, to re-tag sessions a reboot restores without it (dropped 30 days after the session was last seen, or when the tab is closed) | `~/.terminal-web/tabs.json` |
 | Font size, key bar shown, the tab you were on (per device class: `touch` / `desktop`) | `~/.terminal-web/prefs.json`, via `GET`/`POST /api/prefs` |
 | Recently closed tab names (30 days) | `~/.terminal-web/closed.json` |
 | Sign-in sessions through Cloudflare: a SHA-256 of each session id (never the id or the token), how it was made, when it expires | `~/.terminal-web/auth-sessions.json` (0600) |

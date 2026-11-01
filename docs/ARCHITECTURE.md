@@ -16,6 +16,8 @@ invariant below needs the lead's sign-off first, and then an update here.
 | `src/auth-store.ts` | Sign-in sessions and passkeys: in memory, persisted to `~/.terminal-web/{auth-sessions,passkeys}.json` |
 | `src/passkeys.ts` | WebAuthn ceremonies (via `@simplewebauthn/server`) and their challenges |
 | `src/tmux.ts` | Every `tmux` invocation the server makes |
+| `src/tab-record.ts` | The tab record (`~/.terminal-web/tabs.json`): which sessions are web tabs, so a resurrect restore can be re-tagged |
+| `src/inventory.ts` | `GET /api/sessions/inventory`: every tmux session, tab or not, with its memory |
 | `src/config.ts` | Env vars and defaults |
 | `src/types.ts` | WebSocket control-message types |
 | `web/terminal.ts` | Client entry (bundled by `esbuild.mjs` to `public/dist/`): calls each module's `build*`/`init*` in a fixed order, then `init()` |
@@ -25,6 +27,7 @@ invariant below needs the lead's sign-off first, and then an update here.
 | `web/tabs.ts`, `api.ts` | Tab lifecycle and server sync; HTTP calls and prefs |
 | `web/overlays.ts`, `clipboard.ts`, `transfer.ts` | Dialogs and the paste box; copy and paste; upload and download |
 | `web/passkeys.ts` | The Passkeys panel (from help): list, add, delete, sign out |
+| `web/sessions-panel.ts` | The Sessions panel (⋯ sheet): every session with its memory; hidden ones can be opened as a tab or killed |
 | `web/ui/*.ts` | Top bar, key bar, selection bar, phone bar/drawer/sheet |
 | `public/` | `index.html`, `styles.css`, icons, manifest |
 | `tmux/web.tmux.conf` | tmux config the server's sessions load |
@@ -137,6 +140,72 @@ the recovery path.
 `~/.terminal-web/closed.json` remembers closed names for 30 days. A connect
 without `create=1` to a closed, absent name gets a `closed` reply, never a
 recreated session.
+
+### Tab membership survives a restore
+
+tmux is the source of truth for which sessions are tabs (`@twtab`, label in
+`@twlabel`), but tmux-resurrect restores sessions without user options. Before
+2026-11 a restored session became a tab again only if some device still had it
+cached and sent `/api/sessions/adopt`; the rest kept running, invisible and
+unkillable from the page (found on 2026-11-01: 8 of them, ~800 MB).
+
+`src/tab-record.ts` keeps `~/.terminal-web/tabs.json`:
+`{ "version": 1, "tabs": { "<name>": { "label": "<display name>", "lastSeen": <ms epoch> } } }`.
+
+- A name is added (or its label updated) whenever the server tags a session:
+  a connect, an adopt, a rename, a re-tag. Every tagged session seen in a tab
+  list from tmux is added too (with its tmux label), because most tabs are
+  never connected between a deploy and the next reboot. Second halves (`__b`)
+  are never in it.
+- A tagged session that shows no label of its own (displayName = name) while
+  the record holds a different one lost it the same way (a connect or adopt
+  tagged it before any list ran), so the recorded label is written back. A
+  rename that lands while a list is in flight (`labelEpoch`) keeps that list
+  from syncing labels either way.
+- A name is removed only when this server kills it as a closed tab
+  (`/api/sessions/kill`), or when it has not been seen alive in tmux for 30
+  days. A tmux server dying removes nothing, so a restore after a crash still
+  finds every name.
+- Whenever the tab list is fetched from tmux, any session that exists, carries
+  no `@twtab`, is not a second half, is not in `closed.json`, and is in the
+  record gets tagged again with its recorded label, and is in that same list.
+- Written like `closed.json`: temp file + rename, 0600, debounced; a corrupt or
+  missing file reads as empty and is never fatal.
+
+The record only ever adds tags to sessions that exist. It never creates or kills
+a session, and the tab list is still read from tmux.
+
+### Every session is visible somewhere
+
+The Sessions panel (⋯ sheet → Sessions and memory) lists every tmux session on
+the server's socket, from `GET /api/sessions/inventory`. Response:
+
+```
+{ "sessions": null }                       // tmux unreachable
+{ "sessions": [ {
+    "name": "work",
+    "displayName": "work",                 // label for tabs, else the name
+    "kind": "tab" | "hidden",              // "tab" = what /api/sessions lists
+    "mateOf": "work",                      // only on X__b whose X exists; kind follows X
+    "attached": 1,                         // tmux clients attached
+    "created": 1761800000,                 // unix seconds
+    "activity": 1761900000,                // unix seconds, last output
+    "command": "claude",                   // current command of the first pane
+    "rssKB": 351232 | null                 // RSS of every pane process and all its descendants; null if ps failed
+} ] }
+```
+
+`kind` is exactly what `/api/sessions` lists (both come from `currentWebTabs()`
+in server.ts: tagged, or a live socket; a second half is folded into its first
+half and never tagged by the server). So a second half `X__b` whose `X` exists
+carries `mateOf` and X's kind, unless `/api/sessions` itself lists `X__b` (it
+is tagged or connected while X is not a tab): then it is `tab` with no
+`mateOf`. An `X__b` with no `X` is normally `hidden` and offers only Kill
+(adopt skips second halves). A name outside `[A-Za-z0-9_-]{1,64}` (made from a
+shell) is listed with both buttons disabled, since adopt and kill refuse it. A hidden session offers "Open as
+tab" (`/api/sessions/adopt`) and "Kill" (`/api/sessions/kill`, after a confirm;
+it kills the mate too, and goes through the usual snapshot first). Memory is a
+sum of RSS, so shared pages are counted more than once; the panel says "about".
 
 ### Pinned dependencies
 

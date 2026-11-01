@@ -27,6 +27,8 @@ must keep.
   passkey-only mode). Each host registers its own passkeys (RP ID = request
   hostname). The cookie becomes a server-issued session id.
 
+- 2026-11-01: Closing a page never kills tmux (by design); only × → Close & kill does. But sessions restored by resurrect lose `@twtab`, and the ones no device re-adopted ran on, invisible: Mac `entry`, `web`; NUC `claude`, `ip`, `remote-chrome`, `rl6577`, `rl6855`, `rl6957` (~800 MB). The lead killed those 8 by hand with the user's OK (snapshot first). Fix: H1 keeps a tab record so a restore is re-tagged by the server itself; H2 adds a Sessions panel so a session that is not a tab can still be seen, opened or killed. See ARCHITECTURE "Tab membership survives a restore" and "Every session is visible somewhere".
+
 ## Tasks
 
 | ID | Scope | Depends on | Status |
@@ -40,6 +42,8 @@ must keep.
 | T7 | README, `.env.example`, `web.tmux.conf` comment | T1–T6 | done |
 | T8 | Split `web/terminal.ts` into modules | T5 | done |
 | P1 | Passkey sign-in (optional, alongside the token), server-issued session cookies | D | done (0261852), deployed f91c3dd |
+| H1 | Tab record `~/.terminal-web/tabs.json`; re-tag restored sessions on list | – | done (ba8aba3, merged b02f436) |
+| H2 | `GET /api/sessions/inventory` + Sessions panel in the ⋯ sheet | – (contract fixed in ARCHITECTURE) | done (d9efa2c, merged cc8a4a8) |
 | D | Deploy to both boxes, rotate tokens, clear `AUTH_TOKEN` from tmux's global env | all, plus user OK | done (9a281ec) |
 
 ## Done
@@ -57,7 +61,13 @@ must keep.
 
 - P1 `0261852`: `src/auth-store.ts` (sessions and passkeys, in memory, written 0600 via temp+rename), `src/passkeys.ts` (@simplewebauthn/server 14.0.3; challenges single-use, RP-bound, 5 min, max 100), `src/auth.ts` (session cookies, legacy cookie swapped on the fly, `/logout`, passkey sign-in endpoints Cloudflare-only, `/api/auth`, `/api/passkeys` list/delete also on the tailnet, register Cloudflare + signed-in only), a passkey button on the login page (inline script, token form unchanged), and a Passkeys panel from Help. engines raised to node >= 20 (the library needs it; both boxes run newer). `npm run smoke:passkey` drives Chrome's virtual authenticator with a fake cf-ray. Lead review: read the diff; accepted the topOrigin choice (the signature is still bound to our RP ID and the result only goes to our server) and the legacy swap creating a few sessions per page load. Lead checks on merged main: tsc, build, `npm run smoke` and `npm run smoke:passkey` (64 ok lines) pass; the real tmux is unchanged. Production check: cloudflared sends `X-Forwarded-Proto: https` (the live cookie carries Secure), so the expected origin will be https.
 
+- H1 `ba8aba3`: `src/tab-record.ts` keeps `~/.terminal-web/tabs.json` (temp+rename, 0600, 250 ms debounce, sync flush on exit; lastSeen written at most hourly). `cachedWebTabs` now goes through `listWebTabsFromTmux()`, which records every tagged session, re-tags recorded untagged ones (not `__b`, not closed) in the same response, writes back a lost label, and prunes names unseen for 30 days; a null list touches nothing. Kill forgets; restart does not. Two deviations accepted and written into ARCHITECTURE: recording every tagged session seen (otherwise unopened tabs are never recorded before the reboot that needs them), and restoring a lost label (`labelEpoch` keeps a racing rename from being overwritten). Lead check on a scratch socket: dropping `@twtab`/`@twlabel` → the next `/api/sessions` lists it with its label and tmux has both back; a shell-made session is not touched; kill removes it from the record; file 0600; real tmux unchanged.
+- H2 `d9efa2c`: `GET /api/sessions/inventory` (`src/inventory.ts`; tmux list-sessions/list-panes via new helpers at the end of `src/tmux.ts`, names through `#{q:}`; one `ps -A -o pid=,ppid=,rss=` with a 3 s timeout, summed over each pane's process tree); `handleListSessions` split into `currentWebTabs()`, which both use (the agent diffed `/api/sessions` against HEAD in 4 states: identical). `web/sessions-panel.ts` from ⋯ → ▤ Sessions and memory: total, Tabs and Not a tab groups by size, mate folded in, tap a tab to switch, Open as tab / Kill (confirm) for hidden ones; Refresh button; help line; README; smoke section (h). Deviations accepted: the mate-kind rule follows `/api/sessions` (ARCHITECTURE updated); names outside the allowed set are listed with disabled buttons; the app has no light theme, so no light variant.
+- Lead check on merged main (cc8a4a8), in a separate worktree so the live `public/dist` was not rebuilt: tsc, build, `npm run smoke` passed (sections a–h, real tmux unchanged); integration on a scratch socket: a session whose tag was dropped shows as `tab` in the inventory, a shell-made one as `hidden`. One import conflict in server.ts, resolved by keeping both.
+
 ## Found during review
+
+- 2026-11-01 (small): the smoke cleanup now prints `rm: …/home: Directory not empty` — the scratch server's exit flush of `tabs.json` can land while run-smoke.sh is removing the scratch HOME. Cosmetic; the test result is unaffected.
 
 - Left for later (small): the help and paste-box copy still says "tap Copy / tap Paste"; the phone title-bar dot has no idle state; a socket stuck in CONNECTING after a wake waits for the browser's own timeout.
 
