@@ -444,3 +444,103 @@ export function snapshotCollapsed(opts: {
   const collapsed = now - snapshot.savedAt < graceMs && baseline >= 2 && live * 2 <= baseline;
   return { collapsed, baseline };
 }
+
+// ---------------------------------------------------------------------------
+// The session inventory (see inventory.ts): every session on the socket, tab
+// or not, and every pane's process. Read-only.
+//
+// The name comes first and through `#{q:…}`, which backslash-escapes spaces
+// and other specials: a session made from a shell may well have a space in its
+// name, and this list, unlike listWebTabs, has to show those too. The label is
+// last, as there, and free text.
+// ---------------------------------------------------------------------------
+
+export interface TmuxSessionInfo {
+  name: string;
+  /** Carries @twtab = "1". */
+  tagged: boolean;
+  /** @twlabel, or "" when unset. */
+  label: string;
+  /** Clients attached right now. */
+  attached: number;
+  /** Unix seconds. */
+  created: number;
+  /** Unix seconds, last activity. */
+  activity: number;
+}
+
+export interface TmuxPaneInfo {
+  session: string;
+  pid: number;
+  command: string;
+}
+
+/** Split off a leading `#{q:…}` field: the unescaped value and what follows its space. */
+function takeQuoted(line: string): [string, string] {
+  let out = "";
+  let i = 0;
+  for (; i < line.length; i++) {
+    const c = line[i];
+    if (c === "\\" && i + 1 < line.length) {
+      out += line[++i];
+    } else if (c === " ") {
+      break;
+    } else {
+      out += c;
+    }
+  }
+  return [out, line.slice(i + 1)];
+}
+
+/** Every session with its tag, label, clients and times; null if tmux can't be asked. */
+export async function listSessionDetails(): Promise<TmuxSessionInfo[] | null> {
+  const fmt = [
+    "#{q:session_name}",
+    `#{${TAB_TAG}}`,
+    "#{session_attached}",
+    "#{session_created}",
+    "#{session_activity}",
+    `#{${TAB_LABEL}}`,
+  ].join(" ");
+  const out = await runTmux(["list-sessions", "-F", fmt]);
+  if (out === null) return null;
+  const rows: TmuxSessionInfo[] = [];
+  for (const line of out.split("\n")) {
+    if (!line) continue;
+    const [name, rest] = takeQuoted(line);
+    if (!name) continue;
+    // An unset @twtab is an empty field, so the split still lines up.
+    const parts = rest.split(" ");
+    if (parts.length < 4) continue;
+    rows.push({
+      name,
+      tagged: parts[0] === "1",
+      attached: Number(parts[1]) || 0,
+      created: Number(parts[2]) || 0,
+      activity: Number(parts[3]) || 0,
+      label: parts.slice(4).join(" ").trim(),
+    });
+  }
+  return rows;
+}
+
+/** Every pane on the server, in tmux's order (session, window, pane); null if tmux can't be asked. */
+export async function listAllPanes(): Promise<TmuxPaneInfo[] | null> {
+  const out = await runTmux([
+    "list-panes",
+    "-a",
+    "-F",
+    "#{q:session_name} #{pane_pid} #{pane_current_command}",
+  ]);
+  if (out === null) return null;
+  const rows: TmuxPaneInfo[] = [];
+  for (const line of out.split("\n")) {
+    if (!line) continue;
+    const [session, rest] = takeQuoted(line);
+    const sp = rest.indexOf(" ");
+    const pid = Number(sp < 0 ? rest : rest.slice(0, sp));
+    if (!session || !Number.isInteger(pid) || pid <= 0) continue;
+    rows.push({ session, pid, command: sp < 0 ? "" : rest.slice(sp + 1).trim() });
+  }
+  return rows;
+}

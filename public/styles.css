@@ -637,6 +637,103 @@ body {
   opacity: 0.5;
 }
 
+/* Sessions panel (web/sessions-panel.ts), opened from the ⋯ sheet */
+.sessions-box {
+  font-family: var(--mono);
+}
+.sp-total {
+  color: #fff;
+  font-size: 13px;
+  margin: -4px 0 6px;
+}
+.sp-total:empty {
+  display: none;
+}
+.sp-note,
+.sp-status {
+  color: #b8b8b8;
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 0 0 10px;
+}
+.sp-status:empty {
+  display: none;
+}
+.sp-status.sp-error {
+  color: #f14c4c;
+}
+.sp-group {
+  margin-bottom: 12px;
+}
+.sp-group-title {
+  color: #cfcfcf;
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.sp-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border-top: 1px solid #3a3a3a;
+}
+.sp-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  padding: 8px 4px;
+  border-bottom: 1px solid #3a3a3a;
+  font-size: 13px;
+  color: #d4d4d4;
+}
+.sp-list .sp-empty {
+  color: #8a8a8a;
+}
+.sp-list .sp-tab {
+  cursor: pointer;
+  border-radius: 4px;
+}
+.sp-list .sp-tab:hover,
+.sp-list .sp-tab:focus-visible {
+  background: #2f2f31;
+  outline: none;
+}
+.sp-text {
+  flex: 1 1 12em;
+  min-width: 0;
+}
+.sp-item-name {
+  color: #fff;
+  overflow-wrap: anywhere;
+}
+.sp-sub {
+  color: #8a8a8a;
+}
+.sp-meta {
+  color: #8a8a8a;
+  font-size: 11px;
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+}
+.sp-mem {
+  color: #d4d4d4;
+  font-size: 12px;
+  white-space: nowrap;
+  text-align: right;
+}
+.sp-actions {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+}
+.sp-actions .tb-btn {
+  white-space: nowrap;
+}
+.sessions-box .tb-btn:disabled {
+  opacity: 0.5;
+}
+
 /* --------------------------------------------------------------------------
    Mobile layout: a dedicated compact top bar + a bottom "Sessions" drawer and
    an "actions" sheet. All of this is built in JS but stays hidden until the

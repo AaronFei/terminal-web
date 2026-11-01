@@ -4,6 +4,7 @@ import { activeSession, activeTab, currentFont, sessions } from '../state.js';
 import { flashStatus } from '../status.js';
 import { openHelp } from '../overlays.js';
 import { openPasskeys } from '../passkeys.js';
+import { openSessionsPanel } from '../sessions-panel.js';
 import { promptDownload } from '../transfer.js';
 import { pasteFromClipboard } from '../clipboard.js';
 import { LAYOUT_BUTTONS, sheetLayoutButtons } from '../layout.js';
@@ -312,6 +313,10 @@ sheet.append(
   sheetRow('?', 'Help: copy / paste / files', () => {
     closeSheet();
     openHelp();
+  }),
+  sheetRow('▤', 'Sessions and memory', () => {
+    closeSheet();
+    openSessionsPanel();
   }),
   sheetRow('🔑', 'Passkeys and sign-out', () => {
     closeSheet();

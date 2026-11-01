@@ -382,7 +382,10 @@ history you browse is tmux's.
   (tap for the session drawer), `📎` (attach a file), `⌨`, `⋯`.
 - **`⋯` actions sheet** — font size (A− / A+), split view, restart,
   **📋 Paste**, **⧉ Copy the screen**, **✂ Select text by dragging**,
-  **📎 Attach a file**, download, fullscreen, help, passkeys.
+  **📎 Attach a file**, download, fullscreen, help, **▤ Sessions and memory**
+  (every tmux session on the server with roughly how much memory it uses,
+  including ones that are not a tab; tap a tab to switch to it, open a hidden
+  one as a tab or kill it), passkeys.
 - **Key bar** — `Esc` `Tab` `Ctrl` `Alt` `^C` `Enter`, then (on a phone,
   on its own row) `^End` `^X^S` `←` `↑` `↓` `→`.
   - `Ctrl` and `Alt` are **sticky**: tap to arm (they highlight), and the next
@@ -592,6 +595,7 @@ every route needs the sign-in cookie.
 | `POST /api/sessions/rename` | `{name, displayName}` — set a tab's label. |
 | `POST /api/sessions/kill` | `{name}` — close a tab: snapshot, then kill it and its `__b` half. |
 | `POST /api/sessions/adopt` | `{names: [...]}` — mark existing sessions as tabs again (after a restore); returns `{adopted}`. |
+| `GET /api/sessions/inventory` | Every tmux session, tab or not: `{sessions: [{name, displayName, kind: "tab"\|"hidden", mateOf?, attached, created, activity, command, rssKB}]}` (`rssKB` is the RSS of its panes' process trees, `null` if `ps` failed; `sessions: null` if tmux can't be asked). |
 | `GET /api/prefs?scope=touch\|desktop` | `{prefs: {fontSize, keybar, activeTab}}` for that device class. |
 | `POST /api/prefs` | `{scope, fontSize?, keybar?, activeTab?}` — merge into that device class's prefs. |
 | `GET\|HEAD /api/download?path=P&session=S` | Download any regular file the server's user can read. Relative `P` resolves against session `S`'s current directory, `~/…` against home. |

@@ -46,6 +46,7 @@ import {
   recordedLabel,
   observeSessions,
 } from "./tab-record.js";
+import { sessionInventory } from "./inventory.js";
 
 const config = loadConfig();
 // Before anything can run tmux: from here on every call goes to this socket.
@@ -652,18 +653,15 @@ function tagAsWebTab(name: string): void {
 }
 
 /**
- * Return the web tabs, sourced from tmux (sessions carrying the @twtab tag),
- * unioned with sessions that have a live WebSocket right now (covering the
- * brief window between a tab connecting and its tag write completing). When
- * tmux can't be queried, reply with `tabs: null` so the client keeps its
- * current tabs instead of wrongly clearing them.
+ * The web tabs, sourced from tmux (sessions carrying the @twtab tag), unioned
+ * with sessions that have a live WebSocket right now (covering the brief window
+ * between a tab connecting and its tag write completing). Null when tmux can't
+ * be queried. What /api/sessions answers with, and what the inventory
+ * (/api/sessions/inventory) calls a tab, so the two can never disagree.
  */
-async function handleListSessions(res: http.ServerResponse): Promise<void> {
+async function currentWebTabs(): Promise<WebTab[] | null> {
   const tagged = await cachedWebTabs();
-  if (tagged === null) {
-    sendJsonHttp(res, 200, { tabs: null }); // unknown -> client keeps its state
-    return;
-  }
+  if (tagged === null) return null;
   const byName = new Map(tagged.map((t) => [t.name, t]));
   for (const name of liveSessions) {
     if (!byName.has(name)) byName.set(name, { name, displayName: name });
@@ -677,7 +675,17 @@ async function handleListSessions(res: http.ServerResponse): Promise<void> {
       byName.delete(name);
     }
   }
-  sendJsonHttp(res, 200, { tabs: [...byName.values()] });
+  return [...byName.values()];
+}
+
+/**
+ * Reply with the web tabs (see currentWebTabs). When tmux can't be queried,
+ * reply with `tabs: null` so the client keeps its current tabs instead of
+ * wrongly clearing them.
+ */
+async function handleListSessions(res: http.ServerResponse): Promise<void> {
+  const tabs = await currentWebTabs();
+  sendJsonHttp(res, 200, { tabs }); // null: unknown -> client keeps its state
 }
 
 /** Persist a tab's display-name change ({ name, displayName }). */
@@ -1284,6 +1292,12 @@ const server = http.createServer((req, res) => {
 
       if (method === "GET" && requestUrl.pathname === "/api/sessions") {
         await handleListSessions(res);
+        return;
+      }
+
+      if (method === "GET" && requestUrl.pathname === "/api/sessions/inventory") {
+        // Every session on the socket, tabs or not (the Sessions panel).
+        sendJsonHttp(res, 200, { sessions: await sessionInventory(currentWebTabs) });
         return;
       }
 

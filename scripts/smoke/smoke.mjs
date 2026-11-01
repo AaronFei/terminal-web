@@ -9,8 +9,9 @@
 //
 // It loads the page, checks a terminal attaches, types a command and reads it
 // back out of tmux, opens a second tab, switches between tabs, opens a split,
-// narrows and widens the window, and turns touch select on and off from the ⋯
-// sheet. Each check prints one line; the exit code
+// narrows and widens the window, turns touch select on and off from the ⋯
+// sheet, and opens one session that is not a tab as a tab and kills another
+// from the Sessions panel. Each check prints one line; the exit code
 // is 0 only when every check passed and the page threw nothing.
 // SMOKE_VERBOSE=1 also prints an outline of the page's DOM.
 import { createRequire } from 'node:module';
@@ -31,6 +32,9 @@ const WebSocket = require('ws');
 // server when these are all it holds.
 const A = 'smoke-a';
 const B = 'smoke-b';
+// Made straight in tmux, so not tabs: for the Sessions panel (h).
+const H1 = 'smoke-hidden';
+const H2 = 'smoke-hidden2';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const tmux = (...args) =>
@@ -227,6 +231,51 @@ try {
   await sleep(100);
   const afterCancelTap = await evaluate(SEL_STATE);
   step('g.cancelLeaves', `${afterCancel}, after a tap ${afterCancelTap}`, afterCancel === 'hidden' && afterCancelTap === 'hidden');
+
+  // (h) the Sessions panel (⋯ sheet): two sessions made straight in tmux carry
+  // no tab tag, so the tab bar can't show them; the panel lists them under
+  // "Not a tab". One is opened as a tab, the other killed after the confirm.
+  await tmux('new-session', '-d', '-s', H1);
+  await tmux('new-session', '-d', '-s', H2);
+  const made = (await has(H1)) && (await has(H2));
+  step('h.hiddenSessionsMade', made, made);
+  const OPEN_PANEL = `(() => {
+    const row = [...document.querySelectorAll('.sheet-row')].find((r) => r.textContent.includes('Sessions and memory'));
+    if (!row) return 'no row';
+    row.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
+    return 'tapped';
+  })()`;
+  const HIDDEN_ROWS = `[...document.querySelectorAll('.sp-group')].filter((g) => g.querySelector('.sp-group-title')?.textContent.startsWith('Not a tab')).flatMap((g) => [...g.querySelectorAll('.sp-item')].map((li) => li.dataset.session)).join(' ')`;
+  const tappedPanel = await evaluate(OPEN_PANEL);
+  const listed = await waitFor(async () => {
+    const rows = (await evaluate(HIDDEN_ROWS)).split(' ');
+    return rows.includes(H1) && rows.includes(H2);
+  });
+  step('h.panelListsHidden', `${tappedPanel} -> ${await evaluate(HIDDEN_ROWS)}`, tappedPanel === 'tapped' && listed);
+  const panelTotal = await evaluate(`document.querySelector('.sp-total')?.textContent ?? ''`);
+  step('h.panelTotal', panelTotal, /^about .* in \d+ sessions/.test(panelTotal));
+
+  await click(`.sp-item[data-session="${H1}"] .sp-open`);
+  const tabbed = await waitFor(async () => (await evaluate(TAB_LIST)).split(' ').includes(`${H1}*`));
+  step('h.openAsTab', await evaluate(TAB_LIST), tabbed);
+  step('h.panelClosedAfterOpen', await evaluate(`!document.querySelector('.sessions-overlay')`), await evaluate(`!document.querySelector('.sessions-overlay')`));
+  const tagged = await waitFor(async () => (await tmux('show-options', '-v', '-t', `=${H1}:`, '@twtab')).out.trim() === '1');
+  step('h.openedIsTagged', tagged, tagged);
+
+  await evaluate(OPEN_PANEL);
+  const relisted = await waitFor(async () => (await evaluate(HIDDEN_ROWS)).split(' ').includes(H2));
+  step('h.panelReopened', await evaluate(HIDDEN_ROWS), relisted && !(await evaluate(HIDDEN_ROWS)).split(' ').includes(H1));
+  await click(`.sp-item[data-session="${H2}"] .sp-kill`);
+  await sleep(200);
+  const confirmText = await evaluate(`document.querySelector('.sp-confirm .paste-label')?.textContent ?? ''`);
+  step('h.killConfirmShown', confirmText, confirmText.includes(H2) && /can't be undone/.test(confirmText));
+  await click('.sp-confirm .tb-btn.danger');
+  const killed = await waitFor(async () => !(await has(H2)));
+  step('h.killedOnSocket', killed, killed);
+  const goneFromPanel = await waitFor(async () => !(await evaluate(HIDDEN_ROWS)).split(' ').includes(H2));
+  step('h.goneFromPanel', await evaluate(HIDDEN_ROWS), goneFromPanel);
+  step('h.firstStillThere', await has(H1), await has(H1));
+  await evaluate(`[...document.querySelectorAll('.sessions-box .paste-row button')].find((b) => b.textContent === 'Close')?.click()`);
 
   if (process.env.SMOKE_VERBOSE) step('outline', `\n${await evaluate(OUTLINE)}`);
 } catch (err) {
