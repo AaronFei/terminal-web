@@ -9,10 +9,15 @@
  * what lets the server tag them again itself (see cachedWebTabs in server.ts).
  *
  *   ~/.terminal-web/tabs.json
- *   { "version": 1, "tabs": { "<name>": { "label": "...", "lastSeen": <ms> } } }
+ *   { "version": 2, "tabs": [ { "name": "...", "label": "...", "lastSeen": <ms> } ] }
+ *
+ * The array order is the tab order every device shows (see currentWebTabs in
+ * server.ts). A version 1 file ({ "tabs": { "<name>": {...} } }) is still read,
+ * in its key order, and is written back as version 2.
  *
  * - A name goes in (or has its label updated) whenever the server tags a
- *   session. Second halves (`__b`) never do: their tab carries them.
+ *   session. A new name goes last; one already in keeps its place. Second
+ *   halves (`__b`) never go in: their tab carries them.
  * - A name comes out only when the server kills it as a closed tab, or when it
  *   has not been seen alive in tmux for RECORD_TTL_MS. A tmux server that dies
  *   removes nothing — the list it gives is "unknown", not "empty".
@@ -48,7 +53,10 @@ function recordFile(): string {
   return path.join(os.homedir(), ".terminal-web", "tabs.json");
 }
 
-/** name -> entry. */
+/**
+ * name -> entry, in tab order: a Map keeps insertion order, and set() on a key
+ * already there leaves it where it was.
+ */
 let tabs = new Map<string, Entry>();
 /** lastSeen of each name as last written, to tell whether a bump is worth a write. */
 const writtenLastSeen = new Map<string, number>();
@@ -70,28 +78,46 @@ function cleanLabel(name: string, label: string | undefined): string {
   return label.replace(/[\x00-\x1f]/g, " ").trim().slice(0, 64) || name;
 }
 
-function parse(raw: unknown): Map<string, Entry> {
+/** Add one entry as found in the file, unless it isn't a usable one. */
+function addParsed(out: Map<string, Entry>, name: unknown, value: unknown): void {
+  // A name listed twice keeps its first place.
+  if (typeof name !== "string" || !recordable(name) || out.has(name)) return;
+  if (!value || typeof value !== "object") return;
+  const e = value as { label?: unknown; lastSeen?: unknown };
+  if (typeof e.lastSeen !== "number" || !Number.isFinite(e.lastSeen)) return;
+  out.set(name, {
+    label: cleanLabel(name, typeof e.label === "string" ? e.label : undefined),
+    lastSeen: e.lastSeen,
+  });
+}
+
+/** The record in a file's contents, and whether that file is version 1. */
+function parse(raw: unknown): { tabs: Map<string, Entry>; v1: boolean } {
   const out = new Map<string, Entry>();
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { tabs: out, v1: false };
   const obj = raw as { version?: unknown; tabs?: unknown };
-  if (obj.version !== 1) return out;
-  if (!obj.tabs || typeof obj.tabs !== "object" || Array.isArray(obj.tabs)) return out;
-  for (const [name, value] of Object.entries(obj.tabs as Record<string, unknown>)) {
-    if (!recordable(name) || !value || typeof value !== "object") continue;
-    const e = value as { label?: unknown; lastSeen?: unknown };
-    if (typeof e.lastSeen !== "number" || !Number.isFinite(e.lastSeen)) continue;
-    out.set(name, {
-      label: cleanLabel(name, typeof e.label === "string" ? e.label : undefined),
-      lastSeen: e.lastSeen,
-    });
+  if (obj.version === 2) {
+    if (!Array.isArray(obj.tabs)) return { tabs: out, v1: false };
+    for (const value of obj.tabs) {
+      addParsed(out, (value as { name?: unknown } | null)?.name, value);
+    }
+    return { tabs: out, v1: false };
   }
-  return out;
+  if (obj.version !== 1) return { tabs: out, v1: false };
+  if (!obj.tabs || typeof obj.tabs !== "object" || Array.isArray(obj.tabs)) {
+    return { tabs: out, v1: false };
+  }
+  // Key order is the order version 1 wrote them in — except that JS objects
+  // put integer-like keys ("1", "42") first, so such names come out ahead.
+  for (const [name, value] of Object.entries(obj.tabs as Record<string, unknown>)) {
+    addParsed(out, name, value);
+  }
+  return { tabs: out, v1: true };
 }
 
 function serialize(): string {
-  const obj: Record<string, Entry> = {};
-  for (const [name, e] of tabs) obj[name] = { label: e.label, lastSeen: e.lastSeen };
-  return JSON.stringify({ version: 1, tabs: obj }, null, 2);
+  const list = [...tabs].map(([name, e]) => ({ name, label: e.label, lastSeen: e.lastSeen }));
+  return JSON.stringify({ version: 2, tabs: list }, null, 2);
 }
 
 function markWritten(): void {
@@ -162,9 +188,12 @@ export function initTabRecord(): void {
     }
     raw = undefined;
   }
-  tabs = parse(raw);
+  const parsed = parse(raw);
+  tabs = parsed.tabs;
   markWritten();
   process.once("exit", flushSync);
+  // A version 1 file is written back as version 2 now, not at the next change.
+  if (parsed.v1) scheduleWrite();
 }
 
 /**
@@ -196,6 +225,14 @@ export function forgetTabs(names: readonly string[]): void {
   let changed = false;
   for (const n of names) changed = tabs.delete(n) || changed;
   if (changed) scheduleWrite();
+}
+
+/**
+ * The recorded names in tab order: what /api/sessions is sorted by (see
+ * currentWebTabs in server.ts).
+ */
+export function recordedOrder(): string[] {
+  return [...tabs.keys()];
 }
 
 export function isRecorded(name: string): boolean {

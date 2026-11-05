@@ -44,6 +44,7 @@ import {
   forgetTabs,
   isRecorded,
   recordedLabel,
+  recordedOrder,
   observeSessions,
 } from "./tab-record.js";
 import { sessionInventory } from "./inventory.js";
@@ -369,7 +370,7 @@ async function serveIndexHtml(
   const title = `${escapeHtml(HOST_LABEL)} · terminal-web`;
   html = html.replace(/<title>[^<]*<\/title>/i, `<title>${title}</title>`);
 
-  const version = await assetVersion();
+  const version = await freshBuildStamp();
   if (version) {
     // Driven off the same list the stamp is computed from, so an asset added to
     // one can't be missed by the other.
@@ -675,17 +676,47 @@ async function currentWebTabs(): Promise<WebTab[] | null> {
       byName.delete(name);
     }
   }
-  return [...byName.values()];
+  // In the tab record's order, which every device follows: a new tab goes
+  // last, and a rename, re-tag or restore keeps its place. A name the record
+  // doesn't hold yet comes after the recorded ones, in the order tmux (or the
+  // socket set) gave it — the sort is stable.
+  const order = new Map(recordedOrder().map((name, i) => [name, i]));
+  const unrecorded = order.size;
+  return [...byName.values()].sort(
+    (a, b) => (order.get(a.name) ?? unrecorded) - (order.get(b.name) ?? unrecorded)
+  );
+}
+
+// The build stamp in /api/sessions. Every page polls that list every few
+// seconds, and assetVersion() stats three files each time, so requests within
+// BUILD_STAMP_TTL_MS share one (a stamp still being worked out is shared too).
+// index.html always computes it fresh and leaves it here, so the list can
+// never report a build older than the one a page was just served.
+const BUILD_STAMP_TTL_MS = 2000;
+let buildStampCache: { at: number; stamp: Promise<string> } | null = null;
+
+function freshBuildStamp(): Promise<string> {
+  const stamp = assetVersion();
+  buildStampCache = { at: Date.now(), stamp };
+  return stamp;
+}
+
+function cachedBuildStamp(): Promise<string> {
+  const c = buildStampCache;
+  if (c && Date.now() - c.at < BUILD_STAMP_TTL_MS) return c.stamp;
+  return freshBuildStamp();
 }
 
 /**
- * Reply with the web tabs (see currentWebTabs). When tmux can't be queried,
- * reply with `tabs: null` so the client keeps its current tabs instead of
- * wrongly clearing them.
+ * Reply with the web tabs (see currentWebTabs) and the build stamp of the
+ * client on disk (see assetVersion; "" when not built), which a page running
+ * an older one reloads for. When tmux can't be queried, reply with
+ * `tabs: null` so the client keeps its current tabs instead of wrongly
+ * clearing them.
  */
 async function handleListSessions(res: http.ServerResponse): Promise<void> {
-  const tabs = await currentWebTabs();
-  sendJsonHttp(res, 200, { tabs }); // null: unknown -> client keeps its state
+  const [tabs, build] = await Promise.all([currentWebTabs(), cachedBuildStamp()]);
+  sendJsonHttp(res, 200, { tabs, build }); // tabs null: unknown -> client keeps its state
 }
 
 /** Persist a tab's display-name change ({ name, displayName }). */
