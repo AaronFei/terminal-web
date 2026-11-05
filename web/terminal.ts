@@ -17,13 +17,8 @@ import { MAX_FONT, MIN_FONT, TOUCH_DEVICE } from './config.js';
 import { buildTopbarShell } from './dom.js';
 import { activeTab, currentFont, isActive, sessions, setCurrentFont } from './state.js';
 import { initDragDrop, initPasteUpload } from './transfer.js';
-import {
-  fetchServerPrefs,
-  fetchServerTabs,
-  initPrefsBeacon,
-  readoptTabs,
-  setPrefsReady,
-} from './api.js';
+import { fetchServerPrefs, fetchServerTabs, initPrefsBeacon, setPrefsReady } from './api.js';
+import { initVersionCheck } from './version.js';
 import type { SavedTab } from './api.js';
 import { initResizeHandling, isKeybarVisible } from './layout.js';
 import { buildSelBar } from './ui/selbar.js';
@@ -32,7 +27,6 @@ import {
   activateSession,
   addSession,
   cached,
-  defaultSessionName,
   removeLocalSession,
   setDefaultSessionName,
   setTabsReady,
@@ -54,6 +48,7 @@ buildMobile(); // the mobile bar, drawer and actions sheet onto <body>
 initResizeHandling(); // resize, viewport, frame and fullscreen listeners
 initPasteUpload(); // capture-phase paste: files upload
 initDragDrop(); // files dropped on #terminal upload
+initVersionCheck(); // reload onto a newer build once hidden or idle
 
 // ---------------------------------------------------------------------------
 // Init: restore tabs (or start one), restore prefs, activate.
@@ -62,31 +57,19 @@ async function init(): Promise<void> {
   // Both server round-trips start together; the prefs one is awaited further
   // down, just before the tabs are built.
   const prefsPromise = fetchServerPrefs();
-  // The server's list is authoritative; fall back to the local cache, then to
-  // a single default session when both are empty.
-  let server = await fetchServerTabs();
-  // Any tab this device remembers that the server does not list: hand over the
-  // names and let it re-adopt the ones whose sessions really exist. That is
-  // what a tmux-resurrect restore leaves behind — resurrect brings the sessions
-  // back but not their @twtab option, and with tabs only attaching when opened,
-  // nothing else would ever re-tag them. It happens for a partial restore too,
-  // where the server lists the sessions that survived and none of the rest, so
-  // this is not conditional on the list being empty.
-  const listed = new Set((server ?? []).map((t) => t.name));
-  const unlisted = cached.tabs.filter((t) => !listed.has(t.name));
-  if (unlisted.length) {
-    await readoptTabs(unlisted);
-    server = await fetchServerTabs();
-  }
-  let initialTabs: SavedTab[] =
-    server && server.length
-      ? server
-      : cached.tabs.length
-        ? cached.tabs.slice()
-        : [{ name: defaultSessionName, displayName: defaultSessionName }];
+  // The server's list, in its order, whenever it answers — even an empty one.
+  // This device's cache stands in only when the server can't be reached: a
+  // cached tab the server does not list is not a tab any more (re-tagging a
+  // restored session is the server's job, from its tab record).
+  const server = await fetchServerTabs();
+  let initialTabs: SavedTab[] = server ?? cached.tabs.slice();
   if (urlSession && !initialTabs.some((t) => t.name === urlSession)) {
     initialTabs = [{ name: urlSession, displayName: urlSession }, ...initialTabs];
   }
+  // Nothing at all: one tab, made on purpose. Never under a cached name the
+  // server just said is not a tab, or creating it would make it one again.
+  const fallback = initialTabs.length === 0;
+  if (fallback) initialTabs = [{ name: 'web', displayName: 'web' }];
   setDefaultSessionName(urlSession ?? initialTabs[0]?.name ?? 'web');
 
   // The stored prefs land before any tab is built, so a pane is created at the
@@ -122,9 +105,9 @@ async function init(): Promise<void> {
   for (const t of initialTabs) {
     const s = addSession(t.name, false, t.displayName);
     s.view = cachedViews.get(t.name) ?? 'one';
-    // Asked for by name in the URL, or the default on a first visit: both are
-    // tabs being made, not remembered, so they may create their session.
-    if (t.name === urlSession || (!server?.length && !cached.tabs.length)) s.intendCreate();
+    // Asked for by name in the URL, or the fallback when there are no tabs:
+    // both are tabs being made, not remembered, so they may create their session.
+    if (t.name === urlSession || fallback) s.intendCreate();
   }
 
   // This device's own last focus first, then what the server remembers for its
