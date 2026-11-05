@@ -11,7 +11,7 @@ import {
 } from './state.js';
 import { reflectActiveStatus } from './status.js';
 import { domPrompt } from './overlays.js';
-import { fetchServerTabs, loadTabs, readoptTabs, renameOnServer, saveTabs } from './api.js';
+import { fetchServerTabs, loadTabs, renameOnServer, saveTabs } from './api.js';
 import { layOutTab, refreshLayoutUI } from './layout.js';
 import { hideSelectionBar } from './ui/selbar.js';
 import { Session } from './session.js';
@@ -338,21 +338,35 @@ function dropTab(s: Session, idx: number): void {
   }
 }
 
-let syncing = false;
+// The sync in flight: its id and when it started (0: none). One that is still
+// marked running after SYNC_STUCK_MS no longer blocks the next; the id keeps a
+// late finisher from clearing the newer one's mark or applying its stale list.
+const SYNC_STUCK_MS = 15000;
+let syncRun = 0;
+let syncStartedAt = 0;
 // Set once init has built the tabs. Before that the strip is empty because it
 // has not been filled yet, not because every tab was closed — a sync landing
 // then (the interval, or the page gaining focus while init waits on the
 // server) would make a fallback tab, or race init in building the same ones.
 let tabsReady = false;
 
-// Reconcile our local tabs with the server's list: adopt sessions opened (or
-// renamed) on other devices, drop sessions closed elsewhere. The active tab is
-// per-device and never changed here unless its session disappeared.
+/**
+ * Make the strip the server's list: add tabs opened elsewhere, drop those it
+ * does not have, take its labels and its order. The exceptions are the guards:
+ * a tab built here moments ago stays (at the end), one closed here moments ago
+ * is not re-added. Re-tagging restored sessions is the server's job (its tab
+ * record), so nothing here asks it to adopt anything. The open tab is
+ * per-device and changes only if its tab went away.
+ */
 export async function syncFromServer(): Promise<void> {
-  if (syncing || !tabsReady) return;
-  syncing = true;
+  if (!tabsReady) return;
+  const startedAt = performance.now();
+  if (syncStartedAt && startedAt - syncStartedAt < SYNC_STUCK_MS) return;
+  const run = ++syncRun;
+  syncStartedAt = startedAt;
   try {
     const serverTabs = await fetchServerTabs();
+    if (run !== syncRun) return; // a newer sync took over while this one hung
     if (!serverTabs) return; // unreachable — keep what we have
     const byName = new Map(serverTabs.map((t) => [t.name, t]));
 
@@ -366,6 +380,7 @@ export async function syncFromServer(): Promise<void> {
     }
 
     // Add tabs opened elsewhere; adopt display-name changes from elsewhere.
+    const order: string[] = [];
     for (const t of serverTabs) {
       if (recentlyClosed.has(t.name)) continue; // don't resurrect a just-closed tab
       // The second session of a split belongs to its tab, not in the strip. The
@@ -373,9 +388,13 @@ export async function syncFromServer(): Promise<void> {
       // server that has not been updated yet. One whose first session is gone
       // is nobody's second half any more, and shows up as an ordinary tab.
       if (isMateName(t.name) && byName.has(primaryNameOf(t.name))) continue;
+      order.push(t.name);
       const existing = sessions.find((s) => s.name === t.name);
       if (!existing) {
         addSession(t.name, false, t.displayName);
+        // Listed, so the server knows it: the create guard is not for this one,
+        // and would keep it here after it is closed on another device.
+        recentlyCreated.delete(t.name);
       } else if (t.displayName && t.displayName !== existing.displayName) {
         setDisplayName(existing, t.displayName);
       }
@@ -383,37 +402,41 @@ export async function syncFromServer(): Promise<void> {
 
     // Remove tabs closed elsewhere. A tab we built moments ago is exempt: it
     // may not have attached yet, so the server would not list it either.
-    let missing = sessions.filter(
+    // A session that lost its tag in a restore is re-tagged by the server from
+    // its tab record before it answers, so absent here means not a tab.
+    const missing = sessions.filter(
       (s) => !byName.has(s.name) && !recentlyCreated.has(s.name) && !recentlyClosed.has(s.name)
     );
-    // Absent from the list is not the same as gone. The list is built from a
-    // tag the tmux session carries, and a session can lose it while this page
-    // is open — a tmux server that dies and comes back through resurrect brings
-    // every session back bare. While each tab held its own socket that fixed
-    // itself, because attaching is what writes the tag; with tabs attaching
-    // only when opened, the next sweep would take every unopened tab instead,
-    // five seconds later, with nothing to undo it.
-    //
-    // So offer the names back before dropping any of them. Only sessions that
-    // really exist get adopted, which leaves a tab closed on another device
-    // missing from the re-read as well — and it still goes.
-    if (missing.length) {
-      await readoptTabs(missing.map((s) => ({ name: s.name, displayName: s.displayName })));
-      const after = await fetchServerTabs();
-      if (!after) return; // unreachable now — keep every tab we have
-      const listed = new Set(after.map((t) => t.name));
-      missing = missing.filter((s) => !listed.has(s.name));
-    }
     for (const s of missing) {
       recentlyClosed.set(s.name, performance.now());
       removeLocalSession(s);
     }
 
     if (sessions.length === 0) addFallbackTab();
+    reorderTabs(order);
     saveTabs();
   } finally {
-    syncing = false;
+    if (run === syncRun) syncStartedAt = 0;
   }
+}
+
+/**
+ * Put `sessions` and the strip in the server's order (`order`, by name). A tab
+ * it does not list (one still under the create guard) goes after, keeping its
+ * place among those. Nothing is touched when the order is already right, so the
+ * sync every 5 seconds does not move the strip under the finger.
+ */
+function reorderTabs(order: string[]): void {
+  const rank = new Map(order.map((name, i) => [name, i]));
+  const listed = sessions
+    .filter((s) => rank.has(s.name))
+    .sort((a, b) => (rank.get(a.name) ?? 0) - (rank.get(b.name) ?? 0));
+  const want = [...listed, ...sessions.filter((s) => !rank.has(s.name))];
+  if (want.every((s, i) => s === sessions[i])) return;
+  sessions.splice(0, sessions.length, ...want);
+  for (const s of want) if (s.tabEl) tabsEl.insertBefore(s.tabEl, addBtn); // "+" stays last
+  refreshMobileUI();
+  activeTab?.tabEl?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
 }
 
 export function setTabsReady(ready: boolean): void {

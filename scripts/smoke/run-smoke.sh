@@ -5,6 +5,10 @@
 # Usage:  npm run smoke          (or: bash scripts/smoke/run-smoke.sh)
 #         bash scripts/smoke/run-smoke.sh --screenshots
 #         npm run smoke:passkey  (or: bash scripts/smoke/run-smoke.sh --passkey)
+#         bash scripts/smoke/run-smoke.sh --sync
+#
+# --sync runs sync.mjs: the cross-device tab sync, with several pages in
+# separate browser contexts standing in for devices.
 #
 # --screenshots runs screenshots.mjs instead of the test: it rewrites
 # docs/screenshot.png and docs/mobile.png from the same kind of scratch server,
@@ -70,7 +74,11 @@ case "${1:-}" in
     DRIVER="screenshots.mjs"
     EXPECTED_SESSIONS='api|web|logs'
     ;;
-  *) die "unknown option '$1' (usage: run-smoke.sh [--screenshots|--passkey])" ;;
+  --sync)
+    DRIVER="sync.mjs"
+    EXPECTED_SESSIONS='sync-a|sync-b|sync-c|sync-aa|sync-d|sync-hidden|web'
+    ;;
+  *) die "unknown option '$1' (usage: run-smoke.sh [--screenshots|--passkey|--sync])" ;;
 esac
 
 # --- prerequisites -----------------------------------------------------------

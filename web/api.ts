@@ -1,8 +1,12 @@
-// Server calls (tab list, adopt, rename, prefs) and the per-device tab cache.
+// Server calls (tab list, rename, prefs) and the per-device tab cache.
 
 import { TOUCH_DEVICE } from './config.js';
 import type { LayoutMode } from './config.js';
 import { activeTab, sessions } from './state.js';
+import { noteServerBuild } from './version.js';
+
+// How long a POST may take before it is given up on.
+const POST_TIMEOUT_MS = 8000;
 
 export interface SavedTab {
   name: string;
@@ -65,90 +69,68 @@ export function loadTabs(): { tabs: SavedTab[]; active: string | null } {
 // fallback + which tab this device last had focused).
 // ---------------------------------------------------------------------------
 
-// Fetch the server's tab list. Returns null (and we keep local state) if the
-// server is unreachable or slow, so a flaky network never blanks the tabs.
-export async function fetchServerTabs(timeoutMs = 2500): Promise<SavedTab[] | null> {
+/**
+ * fetch with a deadline: past `timeoutMs` the request, and the body being read
+ * in `read`, are aborted and this rejects. The tab list, rename and prefs
+ * calls go through here; one that never answered used to hold a sync open for
+ * good.
+ */
+export async function fetchWithTimeout<T>(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+  read: (res: Response) => Promise<T>,
+): Promise<T> {
   const ctrl = new AbortController();
   const timer = window.setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch('/api/sessions', { cache: 'no-store', signal: ctrl.signal });
-    if (!res.ok) return null;
-    const data = (await res.json()) as { tabs?: unknown };
-    if (!Array.isArray(data.tabs)) return null;
-    const out: SavedTab[] = [];
-    for (const item of data.tabs) {
-      if (item && typeof item === 'object' && typeof (item as SavedTab).name === 'string') {
-        const name = (item as SavedTab).name;
-        const dnRaw = (item as SavedTab).displayName;
-        const dn = typeof dnRaw === 'string' && dnRaw.trim() ? dnRaw : name;
-        out.push({ name, displayName: dn });
-      }
-    }
-    return out;
-  } catch {
-    return null;
+    return await read(await fetch(url, { ...init, signal: ctrl.signal }));
   } finally {
     window.clearTimeout(timer);
   }
 }
 
-// Best-effort: tell the server a tab was renamed so other devices pick it up.
-// The local label is already updated; a failure just delays cross-device sync.
-/**
- * Ask the server to re-adopt these sessions as web tabs. The tab list lives on
- * the tmux sessions (a @twtab option) and is written when a tab attaches —
- * which, now that a tab only attaches when you open it, would leave sessions
- * tmux-resurrect restored after a reboot untagged and about to be swept out of
- * the list by the next sync. The server only tags ones that really exist, so a
- * tab closed on another device is not resurrected by this device's cache.
- */
-async function adoptOnServer(names: string[]): Promise<void> {
+// Fetch the server's tab list, in the server's order. Returns null (and we keep
+// local state) if the server is unreachable or slow, so a flaky network never
+// blanks the tabs. The build stamp that comes with it goes to version.ts.
+export async function fetchServerTabs(timeoutMs = 2500): Promise<SavedTab[] | null> {
   try {
-    await fetch('/api/sessions/adopt', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ names }),
+    return await fetchWithTimeout('/api/sessions', { cache: 'no-store' }, timeoutMs, async (res) => {
+      if (!res.ok) return null;
+      const data = (await res.json()) as { tabs?: unknown; build?: unknown };
+      if (typeof data.build === 'string') noteServerBuild(data.build); // absent on an older server
+      if (!Array.isArray(data.tabs)) return null;
+      const out: SavedTab[] = [];
+      for (const item of data.tabs) {
+        if (item && typeof item === 'object' && typeof (item as SavedTab).name === 'string') {
+          const name = (item as SavedTab).name;
+          const dnRaw = (item as SavedTab).displayName;
+          const dn = typeof dnRaw === 'string' && dnRaw.trim() ? dnRaw : name;
+          out.push({ name, displayName: dn });
+        }
+      }
+      return out;
     });
   } catch {
-    /* ignore — the next sync will simply show what the server does know */
+    return null;
   }
 }
 
-function postRename(name: string, displayName: string): Promise<unknown> {
-  return fetch('/api/sessions/rename', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, displayName }),
-  }).catch(() => {
+// Best-effort: tell the server a tab was renamed so other devices pick it up.
+// The local label is already updated; a failure just delays cross-device sync.
+export function renameOnServer(name: string, displayName: string): void {
+  void fetchWithTimeout(
+    '/api/sessions/rename',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, displayName }),
+    },
+    POST_TIMEOUT_MS,
+    async () => undefined,
+  ).catch(() => {
     /* ignore — local UI already reflects the change */
   });
-}
-
-export function renameOnServer(name: string, displayName: string): void {
-  void postRename(name, displayName);
-}
-
-/**
- * Hand back the tabs the server does not list, and put their labels back with
- * them.
- *
- * Both the tab tag and the label are tmux session options, written when a tab
- * attaches or is renamed, and a session can be alive without either: resurrect
- * restores them after a reboot bare, and a tmux server that restarts under a
- * page that is already open does the same. Nothing re-tags them any more —
- * that used to be a side effect of every tab holding a socket.
- *
- * The label needs saying again because the list the server hands back is what
- * the tab strip shows: a tab adopted without it comes back named after its
- * session and overwrites the name you gave it.
- */
-export async function readoptTabs(tabs: SavedTab[]): Promise<void> {
-  await adoptOnServer(tabs.map((t) => t.name));
-  await Promise.all(
-    tabs
-      .filter((t) => t.displayName && t.displayName !== t.name)
-      .map((t) => postRename(t.name, t.displayName))
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -170,22 +152,16 @@ interface UiPrefs {
 }
 
 export async function fetchServerPrefs(timeoutMs = 2500): Promise<UiPrefs | null> {
-  const ctrl = new AbortController();
-  const timer = window.setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch(`/api/prefs?scope=${PREF_SCOPE}`, {
-      cache: 'no-store',
-      signal: ctrl.signal,
+    return await fetchWithTimeout(`/api/prefs?scope=${PREF_SCOPE}`, { cache: 'no-store' }, timeoutMs, async (res) => {
+      if (!res.ok) return null;
+      const data = (await res.json()) as { prefs?: unknown };
+      const prefs = data.prefs;
+      if (!prefs || typeof prefs !== 'object') return null;
+      return prefs as UiPrefs;
     });
-    if (!res.ok) return null;
-    const data = (await res.json()) as { prefs?: unknown };
-    const prefs = data.prefs;
-    if (!prefs || typeof prefs !== 'object') return null;
-    return prefs as UiPrefs;
   } catch {
     return null;
-  } finally {
-    window.clearTimeout(timer);
   }
 }
 
