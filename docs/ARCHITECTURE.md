@@ -221,6 +221,21 @@ the same as before; it also lets a reverse proxy mount the app under a sub-path
 (e.g. `/term/`) with the prefix stripped, with no server change. Don't add a
 leading-slash URL on the client.
 
+### Instances are fully separate
+
+`TERMINAL_WEB_INSTANCE=<name>` runs a second server that must never see the
+main one's sessions. Tab membership lives on the tmux sessions themselves
+(`@twtab`), so separate state files alone would not be enough: an instance
+gets its own tmux server (`-L tw-<name>`), and everything per-server lives
+under `~/.terminal-web/instances/<name>/` (`state-dir.ts`; uploads default to
+`uploads/` there). Its tmux server starts from a generated `tmux.conf` that sets
+`@resurrect-dir` to the instance's own directory before sourcing
+`web.tmux.conf`: otherwise tmux-continuum's auto-restore on a fresh server
+would restore the main instance's last snapshot into it. Snapshots are off for
+an instance (resurrect's save script would run against the default server).
+Every new per-server file must go under `stateDir()`, never `~/.terminal-web`
+directly.
+
 ### Asset cache-busting
 
 Every asset that `index.html` links to carries a `?v=` build stamp. Cloudflare

@@ -17,7 +17,8 @@ export interface Config {
   defaultSession: string;
   /** Absolute path to the project root. */
   repoRoot: string;
-  /** Absolute path to tmux/web.tmux.conf. */
+  /** Absolute path to the tmux config new tmux servers start with:
+   *  tmux/web.tmux.conf, or an instance's generated wrapper around it. */
   tmuxConfPath: string;
   /** Absolute path to the public/ directory (static root). */
   publicDir: string;
@@ -47,6 +48,16 @@ export interface Config {
   /** Extra dotted hostnames the Host check accepts on direct (non-Cloudflare)
    *  requests, lower-cased. See hostAllowed in auth.ts. */
   allowedHosts: string[];
+  /** TERMINAL_WEB_INSTANCE: a name for a second, fully separate terminal-web on
+   *  the same machine (its own tmux server, tabs, prefs, sign-ins, uploads and
+   *  resurrect dir). Empty = the main instance. */
+  instance: string;
+  /** Where the server keeps its own files (tabs.json, closed.json, prefs.json,
+   *  auth-sessions.json, passkeys.json): ~/.terminal-web, or
+   *  ~/.terminal-web/instances/<name> for an instance. */
+  stateDir: string;
+  /** The directory new tmux sessions start in (START_DIR; default: home). */
+  startDir: string;
 }
 
 /**
@@ -67,6 +78,8 @@ export const CONFIG_ENV_VARS = [
   "AUTH_TOKEN",
   "MAX_PTYS",
   "TERMINAL_WEB_TMUX_SOCKET",
+  "TERMINAL_WEB_INSTANCE",
+  "START_DIR",
   "ALLOWED_HOSTS",
 ] as const;
 
@@ -184,20 +197,44 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     );
   }
 
+  // An instance is a second terminal-web that must never see the main one's
+  // sessions or files: everything that is per-server moves under its own state
+  // dir, and it gets its own tmux server (socket `tw-<name>`).
+  const instance = (read("TERMINAL_WEB_INSTANCE") ?? "").trim();
+  if (instance && !NAME_RE.test(instance)) {
+    throw new Error(
+      `Invalid TERMINAL_WEB_INSTANCE "${instance}": must match [A-Za-z0-9_-]{1,64}.`
+    );
+  }
+  const stateDir = instance
+    ? path.join(os.homedir(), ".terminal-web", "instances", instance)
+    : path.join(os.homedir(), ".terminal-web");
+
   const uploadDirRaw = (read("UPLOAD_DIR") ?? "").trim();
   const uploadDir = uploadDirRaw
     ? path.resolve(uploadDirRaw)
-    : path.join(os.homedir(), "terminal-web-uploads");
+    : instance
+      ? path.join(stateDir, "uploads")
+      : path.join(os.homedir(), "terminal-web-uploads");
+
+  const startDirRaw = (read("START_DIR") ?? "").trim();
+  const startDir = startDirRaw ? path.resolve(startDirRaw) : os.homedir();
 
   // Refuse to start on a bad socket name rather than fall back to the default
   // socket: the only reason to set this is to stay off the user's real tmux
   // server, and a fallback would land a test right on it.
-  const tmuxSocket = (read("TERMINAL_WEB_TMUX_SOCKET") ?? "").trim();
-  if (tmuxSocket && !NAME_RE.test(tmuxSocket)) {
+  const socketGiven = (read("TERMINAL_WEB_TMUX_SOCKET") ?? "").trim();
+  if (socketGiven && !NAME_RE.test(socketGiven)) {
     throw new Error(
-      `Invalid TERMINAL_WEB_TMUX_SOCKET "${tmuxSocket}": must match [A-Za-z0-9_-]{1,64}.`
+      `Invalid TERMINAL_WEB_TMUX_SOCKET "${socketGiven}": must match [A-Za-z0-9_-]{1,64}.`
     );
   }
+  if (socketGiven && instance) {
+    throw new Error(
+      "Set TERMINAL_WEB_TMUX_SOCKET or TERMINAL_WEB_INSTANCE, not both: an instance picks its own socket."
+    );
+  }
+  const tmuxSocket = socketGiven || (instance ? `tw-${instance}` : "");
 
   return {
     port,
@@ -205,7 +242,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     hostFromTailscale,
     defaultSession,
     repoRoot: REPO_ROOT,
-    tmuxConfPath: path.join(REPO_ROOT, "tmux", "web.tmux.conf"),
+    // An instance's tmux server starts from a generated wrapper (see
+    // writeInstanceTmuxConf in server.ts), never from web.tmux.conf directly.
+    tmuxConfPath: instance
+      ? path.join(stateDir, "tmux.conf")
+      : path.join(REPO_ROOT, "tmux", "web.tmux.conf"),
     publicDir: path.join(REPO_ROOT, "public"),
     uploadDir,
     uploadRetentionHours: parseNonNegInt(read("UPLOAD_RETENTION_HOURS"), 72),
@@ -217,5 +258,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     tailscaleProbed: !hostGiven,
     tmuxSocket,
     allowedHosts: parseAllowedHosts(read("ALLOWED_HOSTS")),
+    instance,
+    stateDir,
+    startDir,
   };
 }

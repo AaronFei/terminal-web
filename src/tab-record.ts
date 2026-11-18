@@ -23,8 +23,8 @@
  */
 import fs from "node:fs";
 import fsp from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
+import { stateDir } from "./state-dir.js";
 
 import { sessionName } from "./tmux.js";
 
@@ -45,7 +45,7 @@ interface Entry {
 }
 
 function recordFile(): string {
-  return path.join(os.homedir(), ".terminal-web", "tabs.json");
+  return path.join(stateDir(), "tabs.json");
 }
 
 /** name -> entry. */

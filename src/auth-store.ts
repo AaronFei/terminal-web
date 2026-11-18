@@ -18,8 +18,8 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
+import { stateDir } from "./state-dir.js";
 
 /** Same lifetime as the cookie's Max-Age. */
 export const SESSION_TTL_MS = 365 * 24 * 60 * 60 * 1000;
@@ -32,7 +32,7 @@ const SESSION_ID_RE = /^[A-Za-z0-9_-]{43}$/;
 const B64URL_RE = /^[A-Za-z0-9_-]+$/;
 
 function dataDir(): string {
-  return path.join(os.homedir(), ".terminal-web");
+  return stateDir();
 }
 function sessionsFile(): string {
   return path.join(dataDir(), "auth-sessions.json");
