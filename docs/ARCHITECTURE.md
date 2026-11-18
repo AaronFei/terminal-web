@@ -221,8 +221,9 @@ Which tabs there are, their labels and their order all come from
 ### Pages follow the build
 
 `build` in `/api/sessions` is `assetVersion()`, the same stamp `index.html`
-puts on `/dist/terminal.js?v=`. The page reads its own stamp from that script
-tag. When both are non-empty and differ, the page is running a client older
+puts on `dist/terminal.js?v=`. The page reads its own stamp from that script
+tag, matched by its resolved path (`/dist/terminal.js` at the end), since the
+link is relative (see "Client URLs are relative"). When both are non-empty and differ, the page is running a client older
 than the server's and reloads itself: at once if it is hidden, otherwise the
 next time it is hidden, or after 2 minutes with no key, pointer or touch input
 while visible, with a status message saying so. A page reloads at most once
