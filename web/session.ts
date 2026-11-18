@@ -22,6 +22,7 @@ import {
   isMac,
   mateNameOf,
   wsProto,
+  basePath,
 } from './config.js';
 import type { LayoutMode } from './config.js';
 import { termArea } from './dom.js';
@@ -1151,7 +1152,7 @@ export class Session {
   // Ask the server to kill this tmux session for good (used on tab close).
   // Over HTTP, not this tab's socket: a tab that was never opened has none.
   kill(): void {
-    void fetch('/api/sessions/kill', {
+    void fetch('api/sessions/kill', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: this.name }),
@@ -1306,7 +1307,7 @@ export class Session {
     // resizes the window for every other client on that session, and a program
     // on the alternate screen loses everything that no longer fits.
     const url =
-      `${wsProto}://${window.location.host}/ws?session=${encodeURIComponent(this.name)}` +
+      `${wsProto}://${window.location.host}${basePath}ws?session=${encodeURIComponent(this.name)}` +
       `&cols=${this.term.cols}&rows=${this.term.rows}` +
       (performance.now() < this.createUntil ? '&create=1' : '');
     const socket = new WebSocket(url);

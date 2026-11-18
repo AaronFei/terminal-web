@@ -159,3 +159,11 @@ export const THEME = {
 };
 
 export const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+
+/**
+ * The directory the page was served from, with a trailing slash: `/` normally,
+ * `/term/` when a reverse proxy mounts the app under a sub-path. Every client
+ * URL (fetch, upload, download, the WebSocket) is relative to it, never to the
+ * host root, so the same bundle works either way.
+ */
+export const basePath = window.location.pathname.replace(/[^/]*$/, '');

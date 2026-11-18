@@ -45,7 +45,7 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => window.setTimeou
 /** The inventory; `null` = tmux unreachable, `undefined` = the request failed. */
 async function fetchInventory(): Promise<InventoryEntry[] | null | undefined> {
   try {
-    const res = await fetch('/api/sessions/inventory', { cache: 'no-store', credentials: 'same-origin' });
+    const res = await fetch('api/sessions/inventory', { cache: 'no-store', credentials: 'same-origin' });
     if (!res.ok) return undefined;
     const data = (await res.json()) as { sessions?: unknown };
     if (data.sessions === null) return null;
@@ -239,7 +239,7 @@ export function openSessionsPanel(): void {
   // --- actions ---------------------------------------------------------------
   const openAsTab = async (r: Row): Promise<void> => {
     const name = r.main.name;
-    const res = await postJson('/api/sessions/adopt', { names: [name] });
+    const res = await postJson('api/sessions/adopt', { names: [name] });
     const adopted = Array.isArray(res.body?.adopted) ? (res.body.adopted as unknown[]) : [];
     if (!res.ok || !adopted.includes(name)) {
       say(`Could not open "${name}" as a tab.`, true);
@@ -260,7 +260,7 @@ export function openSessionsPanel(): void {
     if (!(await confirmKill(r)) || !open) return;
     const name = r.main.name;
     say(`Killing "${name}"…`);
-    const res = await postJson('/api/sessions/kill', { name });
+    const res = await postJson('api/sessions/kill', { name });
     if (!res.ok) {
       say(String(res.body?.error ?? `Could not kill "${name}".`), true);
       await refresh();

@@ -580,6 +580,8 @@ these variables are passed on to the terminal's shell.
 | `UPLOAD_RETENTION_HOURS` | `72` | Delete uploads older than this (0 = never by age). |
 | `UPLOAD_MAX_FILES` | `100` | Keep at most this many uploads, newest first (0 = unlimited). |
 | `TERMINAL_WEB_TMUX_SOCKET` | _(empty)_ | Testing: run every tmux call as `tmux -L <name>` (a separate tmux server) and turn snapshots off. |
+| `TERMINAL_WEB_INSTANCE` | _(empty)_ | Run a second, fully separate terminal-web on the same machine (e.g. one embedded in another app): its own tmux server (`tmux -L tw-<name>`), its own tabs, prefs, sign-ins and uploads under `~/.terminal-web/instances/<name>/`, and its own resurrect dir. Snapshots are off for an instance. Give it its own `PORT`. Can't be combined with `TERMINAL_WEB_TMUX_SOCKET`. |
+| `START_DIR` | _(home)_ | Directory new sessions start in. |
 
 ---
 

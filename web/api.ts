@@ -95,7 +95,7 @@ export async function fetchWithTimeout<T>(
 // blanks the tabs. The build stamp that comes with it goes to version.ts.
 export async function fetchServerTabs(timeoutMs = 2500): Promise<SavedTab[] | null> {
   try {
-    return await fetchWithTimeout('/api/sessions', { cache: 'no-store' }, timeoutMs, async (res) => {
+    return await fetchWithTimeout('api/sessions', { cache: 'no-store' }, timeoutMs, async (res) => {
       if (!res.ok) return null;
       const data = (await res.json()) as { tabs?: unknown; build?: unknown };
       if (typeof data.build === 'string') noteServerBuild(data.build); // absent on an older server
@@ -120,7 +120,7 @@ export async function fetchServerTabs(timeoutMs = 2500): Promise<SavedTab[] | nu
 // The local label is already updated; a failure just delays cross-device sync.
 export function renameOnServer(name: string, displayName: string): void {
   void fetchWithTimeout(
-    '/api/sessions/rename',
+    'api/sessions/rename',
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -153,7 +153,7 @@ interface UiPrefs {
 
 export async function fetchServerPrefs(timeoutMs = 2500): Promise<UiPrefs | null> {
   try {
-    return await fetchWithTimeout(`/api/prefs?scope=${PREF_SCOPE}`, { cache: 'no-store' }, timeoutMs, async (res) => {
+    return await fetchWithTimeout(`api/prefs?scope=${PREF_SCOPE}`, { cache: 'no-store' }, timeoutMs, async (res) => {
       if (!res.ok) return null;
       const data = (await res.json()) as { prefs?: unknown };
       const prefs = data.prefs;
@@ -181,7 +181,7 @@ function prefsBody(): string {
 function flushPrefs(): void {
   window.clearTimeout(prefsTimer);
   if (!Object.keys(pendingPrefs).length) return;
-  void fetch('/api/prefs', {
+  void fetch('api/prefs', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: prefsBody(),
@@ -212,11 +212,11 @@ export function initPrefsBeacon(): void {
     const body = prefsBody();
     try {
       const blob = new Blob([body], { type: 'application/json' });
-      if (navigator.sendBeacon('/api/prefs', blob)) return;
+      if (navigator.sendBeacon('api/prefs', blob)) return;
     } catch {
       /* fall through to fetch */
     }
-    void fetch('/api/prefs', {
+    void fetch('api/prefs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body,

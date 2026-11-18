@@ -234,7 +234,7 @@ export function openPasskeys(): void {
         armed = 0;
         del.disabled = true;
         void (async () => {
-          const r = await postJson('/api/passkeys/delete', { id: p.id });
+          const r = await postJson('api/passkeys/delete', { id: p.id });
           if (r.ok) say(`Deleted "${p.name}".`);
           else say(String(r.body?.error ?? 'Could not delete it.'), true);
           await refresh();
@@ -254,7 +254,7 @@ export function openPasskeys(): void {
   const prefetch = (): void => {
     readyAt = Date.now();
     ready = (async () => {
-      const r = await postJson('/api/passkeys/register/options', {});
+      const r = await postJson('api/passkeys/register/options', {});
       if (!r.ok || !r.body) {
         if (r.body?.error) say(String(r.body.error), true);
         return null;
@@ -312,7 +312,7 @@ export function openPasskeys(): void {
           return;
         }
         const r = cred.response as AuthenticatorAttestationResponse;
-        const v = await postJson('/api/passkeys/register/verify', {
+        const v = await postJson('api/passkeys/register/verify', {
           challengeId: got.challengeId,
           name: nameInput.value.trim().slice(0, NAME_MAX) || undefined,
           response: {
@@ -348,8 +348,8 @@ export function openPasskeys(): void {
   // --- state ---------------------------------------------------------------
   const refresh = async (): Promise<void> => {
     const [auth, items] = await Promise.all([
-      getJson<AuthInfo>('/api/auth'),
-      getJson<PasskeyInfo[]>('/api/passkeys'),
+      getJson<AuthInfo>('api/auth'),
+      getJson<PasskeyInfo[]>('api/passkeys'),
     ]);
     if (!open) return;
     if (!auth || !Array.isArray(items)) {
