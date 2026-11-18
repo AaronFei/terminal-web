@@ -150,7 +150,12 @@ cached and sent `/api/sessions/adopt`; the rest kept running, invisible and
 unkillable from the page (found on 2026-11-01: 8 of them, ~800 MB).
 
 `src/tab-record.ts` keeps `~/.terminal-web/tabs.json`:
-`{ "version": 1, "tabs": { "<name>": { "label": "<display name>", "lastSeen": <ms epoch> } } }`.
+`{ "version": 2, "tabs": [ { "name": "<name>", "label": "<display name>", "lastSeen": <ms epoch> } ] }`.
+The array order is the tab order (see "The server owns the tab list and its
+order"). A version 1 file (`"tabs": { "<name>": {...} }`) is still read, in
+its key order, and is written back as version 2 at startup. A server older than this
+reads a version 2 file as empty; that only loses the order and the labels of
+restored tabs, so a rollback is safe.
 
 - A name is added (or its label updated) whenever the server tags a session:
   a connect, an adopt, a rename, a re-tag. Every tagged session seen in a tab
@@ -174,6 +179,57 @@ unkillable from the page (found on 2026-11-01: 8 of them, ~800 MB).
 
 The record only ever adds tags to sessions that exist. It never creates or kills
 a session, and the tab list is still read from tmux.
+
+Re-tagging is the server's job only. Since 2026-11 the page no longer sends
+`/api/sessions/adopt` for tabs it remembers (it used to, at init and before
+every sweep): with the record doing it, a page's stale cache could only pull
+back sessions that are not tabs any more, so a page that had been open for days
+merged its old tab set into everyone's. `/api/sessions/adopt` stays for the
+Sessions panel's "Open as tab", which is an explicit user action.
+
+### The server owns the tab list and its order
+
+Which tabs there are, their labels and their order all come from
+`GET /api/sessions`. Response:
+
+```
+{ "tabs": [ { "name": "work", "displayName": "work" }, ... ] | null,   // null: tmux unreachable
+  "build": "<asset stamp>" }                                           // "" when not built
+```
+
+- Order: the tab record's order. A name new to the record is appended, so a
+  new tab goes last on every device. A rename, a re-tag or a restore keeps its
+  place. A name the record does not hold yet (a live socket whose tag has not
+  landed) comes after the recorded ones, in the order tmux lists it.
+- A page's sync makes its strip equal to that list: it adds what is missing,
+  drops what the list does not have, takes the server's labels and reorders
+  its tabs (`sessions` and the DOM) to the server's order. The only exceptions
+  are the existing guards: a tab built on this page in the last
+  `CREATE_GUARD_MS` that the list does not show yet stays (at the end), and a
+  tab closed on this page in the last `CLOSE_GUARD_MS` is not re-added. The
+  open tab is per device and changes only if its tab went away.
+- At init, a list that came back is used even when it is empty (then the
+  fallback tab `web` is made, never a cached name). The per-device cache
+  (`tw.tabs`) stands in for the list only when the server could not be
+  reached; otherwise it only supplies each listed tab's split view and this
+  device's last open tab. Labels always come from the server.
+- Every fetch on the init and sync path (tab list, prefs, rename) has a
+  timeout (`fetchWithTimeout` in `web/api.ts`), and a sync that is somehow still
+  marked running after `SYNC_STUCK_MS` (15 s) no longer blocks the next one.
+  Before this, one hung request left a page that never synced again.
+
+### Pages follow the build
+
+`build` in `/api/sessions` is `assetVersion()`, the same stamp `index.html`
+puts on `/dist/terminal.js?v=`. The page reads its own stamp from that script
+tag. When both are non-empty and differ, the page is running a client older
+than the server's and reloads itself: at once if it is hidden, otherwise the
+next time it is hidden, or after 2 minutes with no key, pointer or touch input
+while visible, with a status message saying so. A page reloads at most once
+per server build (remembered in `sessionStorage`), so a mismatch that a reload
+does not fix (a proxy serving an old bundle) never loops. tmux holds the
+sessions, so a reload costs only a re-attach. Clients from before this cannot
+reload themselves; each needs one manual reload.
 
 ### Every session is visible somewhere
 
