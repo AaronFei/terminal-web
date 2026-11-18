@@ -212,6 +212,15 @@ sum of RSS, so shared pages are counted more than once; the panel says "about".
 `node-pty` stays at `1.2.0-beta.14`, which fixes the macOS fd leak. Do not
 upgrade it.
 
+### Client URLs are relative
+
+Every URL the client builds — `fetch`, upload, download, the WebSocket, and the
+links in `index.html` and the manifest — is relative to the page's directory
+(`basePath` in `web/config.ts`), never to the host root. Served at `/` this is
+the same as before; it also lets a reverse proxy mount the app under a sub-path
+(e.g. `/term/`) with the prefix stripped, with no server change. Don't add a
+leading-slash URL on the client.
+
 ### Asset cache-busting
 
 Every asset that `index.html` links to carries a `?v=` build stamp. Cloudflare

@@ -374,7 +374,9 @@ async function serveIndexHtml(
     // Driven off the same list the stamp is computed from, so an asset added to
     // one can't be missed by the other.
     for (const rel of STAMPED_ASSETS) {
-      const href = new RegExp(`(["'])(/${rel.replace(/\./g, "\\.")})\\1`, "g");
+      // Leading slash optional: index.html uses relative URLs so the app can
+      // also be mounted under a sub-path by a reverse proxy.
+      const href = new RegExp(`(["'])(/?${rel.replace(/\./g, "\\.")})\\1`, "g");
       html = html.replace(href, `$1$2?v=${version}$1`);
     }
   }

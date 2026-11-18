@@ -71,7 +71,7 @@ export async function fetchServerTabs(timeoutMs = 2500): Promise<SavedTab[] | nu
   const ctrl = new AbortController();
   const timer = window.setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch('/api/sessions', { cache: 'no-store', signal: ctrl.signal });
+    const res = await fetch('api/sessions', { cache: 'no-store', signal: ctrl.signal });
     if (!res.ok) return null;
     const data = (await res.json()) as { tabs?: unknown };
     if (!Array.isArray(data.tabs)) return null;
@@ -104,7 +104,7 @@ export async function fetchServerTabs(timeoutMs = 2500): Promise<SavedTab[] | nu
  */
 async function adoptOnServer(names: string[]): Promise<void> {
   try {
-    await fetch('/api/sessions/adopt', {
+    await fetch('api/sessions/adopt', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ names }),
@@ -115,7 +115,7 @@ async function adoptOnServer(names: string[]): Promise<void> {
 }
 
 function postRename(name: string, displayName: string): Promise<unknown> {
-  return fetch('/api/sessions/rename', {
+  return fetch('api/sessions/rename', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name, displayName }),
@@ -173,7 +173,7 @@ export async function fetchServerPrefs(timeoutMs = 2500): Promise<UiPrefs | null
   const ctrl = new AbortController();
   const timer = window.setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch(`/api/prefs?scope=${PREF_SCOPE}`, {
+    const res = await fetch(`api/prefs?scope=${PREF_SCOPE}`, {
       cache: 'no-store',
       signal: ctrl.signal,
     });
@@ -205,7 +205,7 @@ function prefsBody(): string {
 function flushPrefs(): void {
   window.clearTimeout(prefsTimer);
   if (!Object.keys(pendingPrefs).length) return;
-  void fetch('/api/prefs', {
+  void fetch('api/prefs', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: prefsBody(),
@@ -236,11 +236,11 @@ export function initPrefsBeacon(): void {
     const body = prefsBody();
     try {
       const blob = new Blob([body], { type: 'application/json' });
-      if (navigator.sendBeacon('/api/prefs', blob)) return;
+      if (navigator.sendBeacon('api/prefs', blob)) return;
     } catch {
       /* fall through to fetch */
     }
-    void fetch('/api/prefs', {
+    void fetch('api/prefs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body,

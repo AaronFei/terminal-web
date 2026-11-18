@@ -35,7 +35,7 @@ export function uploadFile(file: Blob, name?: string): Promise<void> {
     showStatus(`uploading ${label}… 0%`);
 
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', '/upload' + (name ? `?name=${encodeURIComponent(name)}` : ''));
+    xhr.open('POST', 'upload' + (name ? `?name=${encodeURIComponent(name)}` : ''));
     xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
 
     xhr.upload.onprogress = (e): void => {
@@ -100,7 +100,7 @@ async function downloadFromHost(rawPath: string): Promise<void> {
   // that terminal's current working directory (no absolute path needed).
   const sess = activeSession?.name;
   const url =
-    '/api/download?path=' + encodeURIComponent(p) + (sess ? '&session=' + encodeURIComponent(sess) : '');
+    'api/download?path=' + encodeURIComponent(p) + (sess ? '&session=' + encodeURIComponent(sess) : '');
   showStatus(`preparing ${p}…`);
   let head: Response;
   try {
