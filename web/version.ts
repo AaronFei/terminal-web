@@ -14,12 +14,17 @@ const IDLE_RELOAD_MS = 2 * 60 * 1000;
 const RELOADED_KEY = 'tw.reloadedForBuild';
 
 // Read once, at load: the stamp of the bundle that is running. '' (no ?v=, as
-// on an unbuilt or dev page) means never compare.
+// on an unbuilt or dev page) means never compare. index.html links the bundle
+// relative to the page ("dist/terminal.js", see "Client URLs are relative"),
+// so match on the resolved path (el.src is absolute): that finds it with or
+// without a leading slash, and under a sub-path such as /term/.
 const ownBuild = ((): string => {
   try {
-    const el = document.querySelector<HTMLScriptElement>('script[type="module"][src*="/dist/terminal.js"]');
-    if (!el) return '';
-    return new URL(el.src, location.href).searchParams.get('v') ?? '';
+    for (const el of document.querySelectorAll<HTMLScriptElement>('script[type="module"][src]')) {
+      const url = new URL(el.src, location.href);
+      if (/\/dist\/terminal\.js$/.test(url.pathname)) return url.searchParams.get('v') ?? '';
+    }
+    return '';
   } catch {
     return '';
   }

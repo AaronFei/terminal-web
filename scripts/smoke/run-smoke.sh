@@ -193,7 +193,10 @@ REAL_CHANGED=0
 # --- scratch server ----------------------------------------------------------
 # (passkey.mjs starts its own, with the same environment.)
 if [ "${DRIVER}" != "passkey.mjs" ]; then
+  # TERMINAL_WEB_INSTANCE would refuse the explicit socket; START_DIR would put
+  # the test's shells in a real directory instead of the scratch HOME.
   env -u TMUX -u TMUX_PANE -u AUTH_TOKEN -u ALLOWED_HOSTS -u DEFAULT_SESSION -u UPLOAD_DIR \
+    -u TERMINAL_WEB_INSTANCE -u START_DIR \
     HOME="${SCR}/home" TERMINAL_WEB_TMUX_SOCKET="${SOCK}" HOST=127.0.0.1 PORT="${PORT}" \
     node_modules/.bin/tsx src/server.ts >"${SCR}/server.log" 2>&1 &
   SERVER_PID=$!

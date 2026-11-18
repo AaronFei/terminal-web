@@ -362,8 +362,17 @@ try {
   const vis = {};
   for (const dev of [A, B, C, D]) vis[dev.label] = await dev.evaluate('document.visibilityState');
   step('6.visibility', vis, vis.D === 'visible');
-  const own = await D.evaluate(`new URL(document.querySelector('script[type="module"][src*="/dist/terminal.js"]').src).searchParams.get('v') ?? ''`);
-  step('6.ownBuild', own, own.length > 0);
+  // index.html links the bundle relative to the page (dist/terminal.js), so
+  // find it by its resolved path, as version.ts does.
+  const own = await D.evaluate(`(() => {
+    for (const el of document.querySelectorAll('script[type="module"][src]')) {
+      const u = new URL(el.src, location.href);
+      if (/\\/dist\\/terminal\\.js$/.test(u.pathname)) return u.searchParams.get('v') ?? '';
+    }
+    return '';
+  })()`);
+  const serverBuild = (await serverList()).build;
+  step('6.ownBuild', `${own} (server ${serverBuild})`, own.length > 0 && own === serverBuild);
   const loads0 = D.loads;
   let fake = 'fakebuild-1';
   await interceptSessions(D, (json) => ({ ...json, build: fake }));
